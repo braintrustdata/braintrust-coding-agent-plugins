@@ -117,10 +117,9 @@ fn transcript_session_id(path: &Path) -> Option<String> {
         let Some(session_id) = record.get("sessionId").and_then(Value::as_str) else {
             continue;
         };
-        if validate_session_id(session_id).is_err() {
-            return None;
+        if validate_session_id(session_id).is_ok() && filename_matches(path, session_id) {
+            return Some(session_id.to_owned());
         }
-        return filename_matches(path, session_id).then(|| session_id.to_owned());
     }
     None
 }
@@ -155,23 +154,44 @@ pub(super) fn envelopes(
     if records.len() != record_end_offsets.len() {
         bail!("Claude transcript record offsets do not match parsed records");
     }
-    let session_id = records
-        .iter()
-        .find_map(|record| string_at(record, "/sessionId"))
-        .unwrap_or_else(|| file_session_id(path));
-    let source_version = records
+    let filename_id = file_session_id(path);
+    let own_start = records.iter().position(|record| {
+        record.get("sessionId").and_then(Value::as_str) == Some(filename_id.as_str())
+    });
+    if uuid::Uuid::parse_str(&filename_id).is_ok()
+        && own_start.is_none()
+        && records
+            .iter()
+            .any(|record| string_at(record, "/sessionId").is_some())
+    {
+        bail!(
+            "Claude transcript {} does not contain its filename session id",
+            path.display()
+        );
+    }
+    let session_id = own_start.map(|_| filename_id).unwrap_or_else(|| {
+        records
+            .iter()
+            .find_map(|record| string_at(record, "/sessionId"))
+            .unwrap_or_else(|| file_session_id(path))
+    });
+    let inherited_prefix = own_start.unwrap_or(0);
+    let own_records = &records[inherited_prefix..];
+    let source_version = own_records
         .iter()
         .find_map(|record| string_at(record, "/version"));
-    let cwd = records.iter().find_map(|record| string_at(record, "/cwd"));
-    let (start_ms, end_ms) = timestamp_bounds(records);
+    let cwd = own_records
+        .iter()
+        .find_map(|record| string_at(record, "/cwd"));
+    let (start_ms, end_ms) = timestamp_bounds(own_records);
     let transcript_path = path.to_string_lossy().into_owned();
-    let subagents = subagents(path, records)?;
+    let subagents = subagents(path, own_records)?;
     let mut subagent_events = subagents
         .iter()
         .flat_map(|subagent| {
             [
-                (subagent.start_index, true, subagent),
-                (subagent.record_index, false, subagent),
+                (subagent.start_index + inherited_prefix, true, subagent),
+                (subagent.record_index + inherited_prefix, false, subagent),
             ]
         })
         .collect::<Vec<_>>();
@@ -187,15 +207,20 @@ pub(super) fn envelopes(
             "hook_event_name": "SessionStart",
             "transcript_path": transcript_path,
             "cwd": cwd,
-            "source": "import"
+            "source": "import",
+            "_bt_import_inherited_history": inherited_prefix > 0
         }),
-        0,
+        inherited_prefix
+            .checked_sub(1)
+            .map_or(0, |index| record_end_offsets[index]),
     )];
 
     let user_indexes: Vec<usize> = records
         .iter()
         .enumerate()
-        .filter_map(|(index, record)| is_real_user(record).then_some(index))
+        .filter_map(|(index, record)| {
+            (index >= inherited_prefix && is_real_user(record)).then_some(index)
+        })
         .collect();
     for (turn, &index) in user_indexes.iter().enumerate() {
         let next = user_indexes.get(turn + 1).copied().unwrap_or(records.len());

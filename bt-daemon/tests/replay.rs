@@ -485,6 +485,52 @@ async fn imports_multiple_transcripts_in_one_invocation() {
 }
 
 #[tokio::test]
+async fn importing_claude_desktop_fork_preserves_context_without_recounting_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent.jsonl");
+    let fork = tmp.path().join("fork.jsonl");
+    let old = vec![
+        json!({"type":"user","timestamp":"2026-01-01T00:00:01Z","sessionId":"parent","message":{"role":"user","content":"old question"}}),
+        json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","sessionId":"parent","message":{"id":"old-call","model":"claude-test","role":"assistant","content":[{"type":"text","text":"old answer"}],"usage":{"input_tokens":2,"output_tokens":1}}}),
+    ];
+    write_jsonl(&parent, &old);
+    let mut fork_records = old;
+    fork_records.extend([
+        json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","sessionId":"fork","message":{"role":"user","content":"new question"}}),
+        json!({"type":"assistant","timestamp":"2026-01-01T00:00:04Z","sessionId":"fork","message":{"id":"new-call","model":"claude-test","role":"assistant","content":[{"type":"text","text":"new answer"}],"usage":{"input_tokens":3,"output_tokens":1}}}),
+    ]);
+    write_jsonl(&fork, &fork_records);
+    let output = tmp.path().join("spans");
+    let summaries = import_transcripts(
+        &[parent, fork],
+        ImportSource::Claude,
+        import_daemon::target(&output, None).await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["parent", "fork"]
+    );
+    assert_ne!(summaries[0].root_span_id, summaries[1].root_span_id);
+    let fork_rows = rows(&output.join("fork.ndjson"));
+    assert_eq!(inserted(&fork_rows, "task"), 2);
+    assert_eq!(inserted(&fork_rows, "llm"), 1);
+    let llm = fork_rows
+        .iter()
+        .filter_map(|row| row.get("Insert"))
+        .find(|row| row.get("span_type").and_then(Value::as_str) == Some("llm"));
+    // The fork's model input contains the copied conversation as context.
+    assert!(llm
+        .expect("fork model call")
+        .to_string()
+        .contains("old answer"));
+}
+
+#[tokio::test]
 async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("claude-parent.jsonl");
