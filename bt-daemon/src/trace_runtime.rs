@@ -111,16 +111,6 @@ fn unconfirmed_auth_diagnostic(
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TraceHostServices: Send + Sync {
-    /// Whether route flags were explicitly supplied on the command line.
-    fn has_explicit_route_selection(&self) -> bool {
-        false
-    }
-
-    /// Route values explicitly supplied on the command line, excluding defaults.
-    fn explicit_route_selection(&self) -> HostRouteSelection {
-        HostRouteSelection::default()
-    }
-
     /// Resolve only the host-owned auth and default project selections.
     /// Setup and managed run require a project and may prompt for auth;
     /// hooks use the current selection without prompting. The trace runtime
@@ -662,14 +652,11 @@ async fn run_setup_command(
     mut args: crate::SetupArgs,
     host: &TraceHostContext,
     configuration: Option<&'static str>,
+    explicit: &HostRouteSelection,
 ) -> anyhow::Result<()> {
     if args.scope == SettingsScope::Project {
         return print_output(
-            crate::setup::run_project_setup(
-                args,
-                host.services.explicit_route_selection(),
-                configuration.is_some(),
-            )?,
+            crate::setup::run_project_setup(args, explicit.clone(), configuration.is_some())?,
             host.output_format,
         );
     }
@@ -722,14 +709,44 @@ fn enable_needs_setup(configured: bool, args: &crate::EnableArgs, explicit_route
 
 /// Execute the complete mounted trace command.
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
+    run_trace_with_matches(args, host, None).await
+}
+
+/// Run mounted commands with the host's parsed arguments and their value sources.
+pub async fn run_trace_with_matches(
+    args: TraceArgs,
+    host: TraceHostContext,
+    matches: Option<&clap::ArgMatches>,
+) -> anyhow::Result<()> {
+    fn explicit(matches: &clap::ArgMatches, id: &str) -> Option<String> {
+        if matches.try_contains_id(id).is_ok()
+            && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            return matches.try_get_one::<String>(id).ok().flatten().cloned();
+        }
+        matches
+            .subcommand()
+            .and_then(|(_, child)| explicit(child, id))
+    }
+    let selection = HostRouteSelection {
+        auth: AuthSelection {
+            profile: matches.and_then(|m| explicit(m, "profile")),
+            org_name: matches.and_then(|m| explicit(m, "org_name")),
+            ..AuthSelection::default()
+        },
+        project_name: matches.and_then(|m| explicit(m, "project")),
+    };
+    let has_explicit = selection.auth.profile.is_some()
+        || selection.auth.org_name.is_some()
+        || selection.project_name.is_some();
     match args.command {
-        TraceCommand::Setup(args) => run_setup_command(args, &host, None).await,
+        TraceCommand::Setup(args) => run_setup_command(args, &host, None, &selection).await,
         TraceCommand::Enable(args) => {
             if args.scope == SettingsScope::Project {
                 if args.additional_metadata.is_some()
                     || !args.tags.is_empty()
                     || !args.plugin.is_empty()
-                    || host.services.has_explicit_route_selection()
+                    || has_explicit
                 {
                     let setup = crate::SetupArgs {
                         scope: args.scope,
@@ -738,7 +755,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                         tags: args.tags,
                         plugin: args.plugin,
                     };
-                    return run_setup_command(setup, &host, Some("updated")).await;
+                    return run_setup_command(setup, &host, Some("updated"), &selection).await;
                 }
                 return print_output(
                     crate::setup::run_scoped_toggle(args.agent, args.scope, true)?,
@@ -746,11 +763,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                 );
             }
             let configured = crate::setup::has_saved_setup(args.agent)?;
-            if !enable_needs_setup(
-                configured,
-                &args,
-                host.services.has_explicit_route_selection(),
-            ) {
+            if !enable_needs_setup(configured, &args, has_explicit) {
                 print_output(run_enable(args.agent)?, host.output_format)
             } else {
                 let setup = crate::SetupArgs {
@@ -775,6 +788,7 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     setup,
                     &host,
                     Some(if configured { "updated" } else { "created" }),
+                    &selection,
                 )
                 .await
             }

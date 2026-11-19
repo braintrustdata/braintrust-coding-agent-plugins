@@ -87,7 +87,8 @@ pub use trace_command::{
     StopArgs, TraceArgs, TraceCommand, UpdateArgs,
 };
 pub use trace_runtime::{
-    run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
+    run_trace, run_trace_with_matches, HostRouteSelection, RouteRequirements, TraceHostContext,
+    TraceHostServices,
 };
 pub use transcript_import::{import_transcript, import_transcripts, run_import, ImportTarget};
 pub use translate::{
