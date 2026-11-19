@@ -201,6 +201,21 @@ pub(super) fn retain_references(identity: &mut RedactedEnvelope, previous: &Reda
                 payload.insert(key.into(), value.clone());
             }
         }
+        if let Some(old_children) = old
+            .get("_bt_claude_children")
+            .and_then(serde_json::Value::as_object)
+        {
+            let children = payload
+                .entry("_bt_claude_children")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(children) = children.as_object_mut() {
+                for (agent, observation) in old_children {
+                    children
+                        .entry(agent.clone())
+                        .or_insert_with(|| observation.clone());
+                }
+            }
+        }
     }
 }
 
@@ -213,6 +228,29 @@ pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
             .filter_map(|key| Some(((*key).into(), event.payload.get(*key)?.clone())))
             .collect(),
     );
+    if event.source == "claude-code"
+        && matches!(event.event.as_str(), "SubagentStop" | "TranscriptUpdate")
+    {
+        if let (Some(agent), Some(path)) = (
+            event
+                .payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str),
+            event
+                .payload
+                .get("agent_transcript_path")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            let through = event
+                .payload
+                .get("_bt_claude_transcript_mirrors")
+                .and_then(|m| m.get(path))
+                .and_then(|m| m.get("through"))
+                .cloned();
+            identity.payload["_bt_claude_children"] =
+                serde_json::json!({agent: {"path": path, "through": through}});
+        }
+    }
     identity
 }
 

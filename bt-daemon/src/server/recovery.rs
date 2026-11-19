@@ -186,9 +186,21 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
                             tracing::warn!(session_id = %key.session_id, "Claude transcript observation has no transcript path");
                             continue;
                         };
-                        let changed = tokio::fs::metadata(path)
+                        let mut changed = tokio::fs::metadata(path)
                             .await
                             .is_ok_and(|metadata| observation.through != Some(metadata.len()));
+                        for child in observation.children.values() {
+                            if let Some(path) = child
+                                .template
+                                .payload
+                                .get("agent_transcript_path")
+                                .and_then(Value::as_str)
+                            {
+                                changed |= tokio::fs::metadata(path)
+                                    .await
+                                    .is_ok_and(|metadata| child.through != Some(metadata.len()));
+                            }
+                        }
                         if !changed {
                             daemon.claude_transcripts.lock().remove(&key);
                         }
