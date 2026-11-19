@@ -127,15 +127,18 @@ describe("BraintrustPlugin", () => {
 
   it("lets project tracing override the user default and managed runs override both", async () => {
     const global = join(directory, ".config", "opencode");
-    const project = join(directory, ".opencode");
+    const project = directory;
     mkdirSync(global, { recursive: true });
     mkdirSync(project, { recursive: true });
     writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
-    writeFileSync(join(project, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(join(project, ".braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
     const { BraintrustPlugin } = await import("./index");
     expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
     writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
-    writeFileSync(join(project, "braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false }),
+    );
     const paused = await BraintrustPlugin(createInput(directory));
     expect(paused.event).toBeUndefined();
     expect(paused.tool).toBeDefined();
@@ -146,9 +149,26 @@ describe("BraintrustPlugin", () => {
     expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
   });
 
-  it("recursively merges project metadata and replaces arrays", async () => {
+  it("does not bypass a project opt-out when its plugin list is invalid", async () => {
     const global = join(directory, ".config", "opencode");
-    const project = join(directory, ".opencode");
+    mkdirSync(global, { recursive: true });
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(
+      join(directory, ".braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false, route: { span_plugins: [null] } }),
+    );
+    const { BraintrustPlugin } = await import("./index");
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeUndefined();
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "run" } },
+    });
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+  });
+
+  it("recursively merges project metadata and appends arrays", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = directory;
     mkdirSync(global, { recursive: true });
     mkdirSync(project, { recursive: true });
     writeFileSync(
@@ -162,7 +182,7 @@ describe("BraintrustPlugin", () => {
       }),
     );
     writeFileSync(
-      join(project, "braintrust.json"),
+      join(project, ".braintrust.json"),
       JSON.stringify({
         trace_to_braintrust: true,
         route: { additional_metadata: { nested: { b: 3 }, list: [4] } },
@@ -172,12 +192,12 @@ describe("BraintrustPlugin", () => {
     const { loadConfig } = await import("./config");
     const config = loadConfig(await readPluginConfig({ directory }));
     expect(config.tracingEnabled).toBe(true);
-    expect(config.route.additional_metadata).toEqual({ nested: { a: 1, b: 3 }, list: [4] });
+    expect(config.route.additional_metadata).toEqual({ nested: { a: 1, b: 3 }, list: [1, 2, 4] });
   });
 
   it("inherits the user route while applying explicit project selections", async () => {
     const global = join(directory, ".config", "opencode");
-    const project = join(directory, ".opencode");
+    const project = directory;
     mkdirSync(global, { recursive: true });
     mkdirSync(project, { recursive: true });
     mkdirSync(join(directory, ".git"));
@@ -195,7 +215,7 @@ describe("BraintrustPlugin", () => {
       }),
     );
     writeFileSync(
-      join(project, "braintrust.json"),
+      join(project, ".braintrust.json"),
       JSON.stringify({
         project: "local",
         profile: "new",
@@ -212,7 +232,16 @@ describe("BraintrustPlugin", () => {
       org_name: "org",
     });
     expect(config.route.auth?.profile_id).toBeUndefined();
-    expect(config.route.span_plugins).toEqual(["trusted.js"]);
+    expect(config.route.span_plugins).toEqual(["trusted.js", join(directory, "untrusted.js")]);
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({
+        inherit_plugins: false,
+        route: { span_plugins: ["project.js"] },
+      }),
+    );
+    const replaced = loadConfig(await readPluginConfig({ directory: nested }));
+    expect(replaced.route.span_plugins).toEqual([join(directory, "project.js")]);
   });
 
   it("provides a trace-only managed entrypoint without data tools", async () => {

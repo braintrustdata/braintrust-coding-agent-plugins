@@ -312,8 +312,11 @@ pub struct RunArgs {
     /// Tag applied to each root span for this invocation. May be repeated or comma-separated.
     #[arg(long = "tag", env = "BRAINTRUST_TAGS", value_delimiter = ',')]
     pub tags: Vec<String>,
-    /// JavaScript span transform for this invocation. Repeat to compose an
-    /// isolated transform chain; persistent setup plugins are not included.
+    /// Replace inherited span plugins instead of appending to them.
+    #[arg(long)]
+    pub no_inherit_plugins: bool,
+    /// JavaScript span transform for this invocation. With --inherit, these
+    /// follow inherited plugins unless --no-inherit-plugins is supplied.
     #[arg(long, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
     /// Arguments forwarded verbatim to the coding agent.

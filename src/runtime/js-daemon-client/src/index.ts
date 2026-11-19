@@ -1,6 +1,6 @@
 import { spawnBackground } from "./background-process.ts"
 import { createHash } from "node:crypto"
-import { existsSync } from "node:fs"
+import { existsSync, realpathSync } from "node:fs"
 import { createConnection, type Socket } from "node:net"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -29,23 +29,23 @@ export interface DaemonTraceSettings {
 }
 
 /** Find project settings at the Git root, or in the starting directory outside Git. */
-export function projectSettingsPath(directory: string, configDir: string): string {
+export function projectSettingsPath(directory: string): string {
   const start = resolve(directory)
   let current = start
   while (true) {
-    if (existsSync(join(current, ".git"))) return join(current, configDir, "braintrust.json")
+    if (existsSync(join(current, ".git"))) return join(current, ".braintrust.json")
     const parent = dirname(current)
-    if (parent === current) return join(start, configDir, "braintrust.json")
+    if (parent === current) return join(start, ".braintrust.json")
     current = parent
   }
 }
 
-/** Recursively overlay objects while replacing arrays and scalar values. */
+/** Recursively overlay objects and append arrays; scalar values replace. */
 export function mergeConfigObjects(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
   const result = { ...base }
   for (const [key, value] of Object.entries(overlay)) {
     const prior = Object.hasOwn(result, key) ? result[key] : undefined
-    const merged = prior !== null && typeof prior === "object" && !Array.isArray(prior) && value !== null && typeof value === "object" && !Array.isArray(value)
+    const merged = Array.isArray(prior) && Array.isArray(value) ? [...prior, ...value] : prior !== null && typeof prior === "object" && !Array.isArray(prior) && value !== null && typeof value === "object" && !Array.isArray(value)
       ? mergeConfigObjects(prior as Record<string, unknown>, value as Record<string, unknown>)
       : value
     Object.defineProperty(result, key, { value: merged, enumerable: true, writable: true, configurable: true })
@@ -53,12 +53,23 @@ export function mergeConfigObjects(base: Record<string, unknown>, overlay: Recor
   return result
 }
 
-/** Merge a repository route without allowing it to introduce executable plugins. */
-export function mergeProjectRoute(base: DaemonSessionRoute | undefined, overlay: DaemonSessionRoute | undefined): DaemonSessionRoute | undefined {
-  if (!overlay) return base
-  const { span_plugins: plugins, ...fields } = overlay
-  const safe = plugins?.length === 0 ? { ...fields, span_plugins: [] } : fields
+/** Apply project-relative span plugins after inherited user plugins. */
+export function mergeProjectRoute(base: DaemonSessionRoute | undefined, overlay: DaemonSessionRoute | undefined, configPath: string, inheritPlugins = true): DaemonSessionRoute | undefined {
+  if (!base && !overlay) return undefined
+  if (!overlay && inheritPlugins) return base
   const original = structuredClone(base ?? { destination: undefined }) as DaemonSessionRoute
+  if (!inheritPlugins) original.span_plugins = []
+  if (!overlay) return original
+  const safe = structuredClone(overlay)
+  if (safe.span_plugins !== undefined) {
+    if (!Array.isArray(safe.span_plugins) || !safe.span_plugins.every((plugin) => typeof plugin === "string" && plugin.length > 0)) {
+      throw new TypeError("project span_plugins must be an array of paths")
+    }
+    safe.span_plugins = safe.span_plugins.map((plugin) => {
+      const absolute = resolve(dirname(configPath), plugin)
+      try { return realpathSync(absolute) } catch { return absolute }
+    })
+  }
   if (safe.auth?.profile && !safe.auth.profile_id && original.auth) {
     delete original.auth.profile_id
     original.auth.source = "saved_profile"

@@ -86,7 +86,7 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("event is missing its session route"))?;
         if requested_route.destination.is_none() {
             anyhow::bail!(
-                "session route is missing its trace destination; select a project or destination during `bt trace setup` or `bt trace run`"
+                "session route is missing its trace destination; select a project or destination during `bt trace install` or `bt trace run`"
             );
         }
         let requested_key = DeliveryKey::new(&env.source, &env.session_id, &requested_route)?;

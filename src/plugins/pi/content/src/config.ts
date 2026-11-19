@@ -8,7 +8,6 @@ import {
   mergeProjectRoute,
   resolveDaemonTraceSettings,
 } from "./runtime/daemon-client.ts";
-import { runningPiPackage } from "./pi-package.ts";
 
 export interface PiConfig {
   enabled: boolean;
@@ -22,8 +21,6 @@ export interface PiConfig {
 }
 
 type ConfigRecord = Record<string, unknown>;
-
-const PROJECT_CONFIG_DIR_NAME = runningPiPackage().configDir;
 
 function record(value: unknown): ConfigRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -89,7 +86,7 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
 
   const additionalMetadata = record(source.additional_metadata);
   if (Array.isArray(source.tags) && source.tags.every((tag) => typeof tag === "string")) {
-    config.route.tags = source.tags;
+    config.route.tags = [...new Set([...(config.route.tags ?? []), ...source.tags])];
   }
   if (profile || orgName) {
     config.route.auth = {
@@ -122,22 +119,41 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
 
   const userConfig = readConfig(join(homedir(), ".pi", "agent", "braintrust.json"));
   applyConfig(config, userConfig);
-  const projectConfig =
-    readConfig(projectSettingsPath(cwd, PROJECT_CONFIG_DIR_NAME)) ??
-    (PROJECT_CONFIG_DIR_NAME === ".pi" ? undefined : readConfig(projectSettingsPath(cwd, ".pi")));
+  const projectPath = projectSettingsPath(cwd);
+  const projectConfig = readConfig(projectPath);
   if (projectConfig) {
-    // Repository settings must not select executable span plugins.
-    const { route: projectRoute, ...safeProjectConfig } = projectConfig;
-    if (record(projectRoute)) {
-      config.route =
-        mergeProjectRoute(config.route, projectRoute as DaemonSessionRoute) ?? config.route;
-      applyConfig(config, { route: config.route });
+    try {
+      const {
+        route: projectRoute,
+        inherit_plugins: inheritPlugins,
+        ...safeProjectConfig
+      } = projectConfig;
+      if (projectRoute !== undefined && !record(projectRoute))
+        throw new TypeError("project route must be an object");
+      if (inheritPlugins !== undefined && typeof inheritPlugins !== "boolean")
+        throw new TypeError("inherit_plugins must be a boolean");
+      if (record(projectRoute) || inheritPlugins === false) {
+        config.route =
+          mergeProjectRoute(
+            config.route,
+            projectRoute as DaemonSessionRoute | undefined,
+            projectPath,
+            inheritPlugins !== false,
+          ) ?? config.route;
+        applyConfig(config, { route: config.route });
+        if (config.route.additional_metadata)
+          config.additionalMetadata = config.route.additional_metadata;
+      }
+      if (nonEmptyString(safeProjectConfig.profile) && config.route.auth) {
+        delete config.route.auth.profile_id;
+        config.route.auth.source = "saved_profile";
+      }
+      applyConfig(config, safeProjectConfig);
+    } catch {
+      config.enabled = false;
     }
-    if (nonEmptyString(safeProjectConfig.profile) && config.route.auth) {
-      delete config.route.auth.profile_id;
-      config.route.auth.source = "saved_profile";
-    }
-    applyConfig(config, safeProjectConfig);
+  } else if (existsSync(projectPath)) {
+    config.enabled = false;
   }
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;

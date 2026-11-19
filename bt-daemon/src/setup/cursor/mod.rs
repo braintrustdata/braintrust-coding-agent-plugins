@@ -130,7 +130,7 @@ impl Setup for Cursor {
 
     fn activation_warning(&self) -> Option<&'static str> {
         (!capture_hooks_are_installed_at(&paths::cursor_config_dir()))
-            .then_some("Cursor user capture hooks are missing; run `bt trace setup cursor`")
+            .then_some("Cursor user capture hooks are missing; run `bt trace install cursor`")
     }
 }
 
@@ -271,14 +271,14 @@ fn remove_plugin_at(plugin_dir: &Path) -> anyhow::Result<()> {
 
 fn update_plugin_at(runner: &mut dyn CommandRunner, plugin_dir: &Path) -> anyhow::Result<()> {
     const NOT_INSTALLED: &str =
-        "Cursor tracing plugin is not installed; run `bt trace setup cursor`";
+        "Cursor tracing plugin is not installed; run `bt trace install cursor`";
     if !plugin_dir.exists() {
         bail!(NOT_INSTALLED);
     }
     ensure_ours(
         plugin_dir,
         NOT_INSTALLED,
-        "Cursor tracing plugin is not the Braintrust plugin; run `bt trace setup cursor`",
+        "Cursor tracing plugin is not the Braintrust plugin; run `bt trace install cursor`",
     )?;
     install_plugin_at(runner, plugin_dir)
 }

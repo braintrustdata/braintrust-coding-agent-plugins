@@ -79,7 +79,7 @@ fn update_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Resul
         });
     if !installed {
         bail!(
-            "Google Antigravity tracing plugin is not installed; run `bt trace setup antigravity`"
+            "Google Antigravity tracing plugin is not installed; run `bt trace install antigravity`"
         );
     }
     runner.run_in_home("agy", &["plugin", "install", PLUGIN_SOURCE], home)

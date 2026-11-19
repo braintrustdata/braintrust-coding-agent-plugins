@@ -39,27 +39,28 @@ pub(crate) fn repository_root(start: &Path) -> anyhow::Result<PathBuf> {
         })
 }
 
-/// Agent-local project configuration directories with supported project capture.
-pub(crate) fn project_config_dir(source: &str) -> Option<&'static str> {
-    match source {
-        "claude" | "claude-code" => Some(".claude"),
-        "cursor" => Some(".cursor"),
-        "opencode" => Some(".opencode"),
-        "pi" => Some(".pi"),
-        "codex" => Some(".codex"),
-        "muse" | "muse-code" => Some(".muse"),
-        "grok" => Some(".grok"),
-        "antigravity" => Some(".gemini"),
-        _ => None,
-    }
+/// Whether a source can load shared repository tracing settings.
+pub(crate) fn supports_project_settings(source: &str) -> bool {
+    matches!(
+        source,
+        "claude"
+            | "claude-code"
+            | "cursor"
+            | "opencode"
+            | "pi"
+            | "codex"
+            | "muse"
+            | "muse-code"
+            | "grok"
+            | "antigravity"
+    )
 }
 
 pub(crate) fn project_settings_path(source: &str, start: &Path) -> anyhow::Result<PathBuf> {
-    let directory = project_config_dir(source)
-        .ok_or_else(|| anyhow::anyhow!("project scope is not supported for {source}"))?;
-    Ok(repository_root(start)?
-        .join(directory)
-        .join("braintrust.json"))
+    if !supports_project_settings(source) {
+        anyhow::bail!("project scope is not supported for {source}");
+    }
+    Ok(repository_root(start)?.join(".braintrust.json"))
 }
 
 /// Resolve the socket path: explicit `override` → `$BRAINTRUST_DAEMON_SOCKET` →

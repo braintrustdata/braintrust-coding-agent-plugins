@@ -29,7 +29,7 @@ fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
 impl Setup for Grok {
     fn enable(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
         let plugins = list_plugins(runner)?;
-        // `bt trace setup grok` is the user's trust boundary. Grok's `--trust`
+        // `bt trace install grok` is the user's trust boundary. Grok's `--trust`
         // applies to this plugin installation and does not change folder trust.
         match installed_plugin(&plugins) {
             Some(plugin) if is_published(plugin) => {
@@ -54,11 +54,11 @@ impl Setup for Grok {
     fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
         let plugins = list_plugins(runner)?;
         let plugin = installed_plugin(&plugins).ok_or_else(|| {
-            anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace setup grok`")
+            anyhow::anyhow!("Grok tracing plugin is not installed; run `bt trace install grok`")
         })?;
         if !is_published(plugin) {
             bail!(
-                "Grok tracing plugin is not the published Braintrust plugin; run `bt trace setup grok`"
+                "Grok tracing plugin is not the published Braintrust plugin; run `bt trace install grok`"
             );
         }
         runner.run("grok", &["plugin", "update", PLUGIN])

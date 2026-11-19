@@ -33,7 +33,7 @@ Authenticate and install the published tracing plugin:
 
 ```bash
 bt login
-bt trace setup claude --project my-coding-agent
+bt trace install claude --project my-coding-agent
 ```
 
 Setup adds the marketplace and installs or enables `trace-claude-code`.
@@ -41,7 +41,7 @@ The plugin forwards lifecycle events locally; `bt` owns authentication,
 trace construction, and delivery.
 
 Use `--profile` or `--org` when needed. Setup stores only non-secret routing
-settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
+settings under `~/.claude/braintrust.json`. Restart Claude Code after installation.
 
 Every registered lifecycle event is forwarded synchronously to
 `bt trace hook --source claude-code`, preserving per-session ordering. Hook
@@ -66,7 +66,7 @@ Braintrust. Redaction cannot remove data that has already been delivered.
 
 ## Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace setup claude
+For a persistent route, pass a JSON object to `bt trace install claude
 --additional-metadata '<JSON>'` to tag the root span of every Claude Code
 session. Standard session metadata takes precedence if keys conflict.
 
@@ -82,7 +82,7 @@ route. Tags can be persisted with setup, supplied to one invocation, or added
 while importing a transcript:
 
 ```bash
-bt trace setup claude --tag ci --tag release-validation
+bt trace install claude --tag ci --tag release-validation
 bt trace run claude --tag ci -- "review this change"
 bt trace import claude session-id --tag historical-import
 ```

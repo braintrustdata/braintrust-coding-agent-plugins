@@ -15,7 +15,7 @@ Install OpenCode and the
 
 ```bash
 bt login
-bt trace setup opencode --project my-coding-agent
+bt trace install opencode --project my-coding-agent
 opencode
 ```
 
@@ -73,7 +73,7 @@ at the top level: a project `route` replaces the global `route`.
 | `debug` | `false` | Enable debug logging; override with `BRAINTRUST_DEBUG` |
 
 Older files can still use top-level `profile`, `org_name`, `project`, and
-`additional_metadata`. For new files, use `bt trace setup` or the nested
+`additional_metadata`. For new files, use `bt trace install` or the nested
 `route` format above. Include a destination when supplying a route.
 
 Only `enable_tools` and `debug` read environment variables directly. Tracing

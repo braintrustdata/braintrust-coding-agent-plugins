@@ -98,6 +98,14 @@ pub(crate) fn run_scoped_toggle(
     }))
 }
 
+/// Remove the shared repository configuration without touching user installations.
+pub(crate) fn run_project_uninstall(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
+    let path = scoped_path(agent, SettingsScope::Project)?;
+    crate::settings::with_settings_lock(&path, || remove_tracing_settings(&path))?;
+    let id = agent.identity();
+    Ok(TraceCommandOutput::uninstall(id.id, id.display_name, path).with_scope("project"))
+}
+
 pub(crate) fn run_project_setup(
     args: SetupArgs,
     selection: crate::HostRouteSelection,
@@ -121,8 +129,38 @@ fn write_project_setup_at(
     args: &SetupArgs,
     selection: &crate::HostRouteSelection,
 ) -> anyhow::Result<()> {
-    if !args.plugin.is_empty() {
-        anyhow::bail!("project configuration cannot select executable span plugins");
+    let root = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("project settings path has no parent"))?;
+    let root = root.canonicalize()?;
+    let plugins = args
+        .plugin
+        .iter()
+        .map(|plugin| {
+            let absolute = if plugin.is_absolute() {
+                plugin.clone()
+            } else {
+                root.join(plugin)
+            };
+            let absolute = absolute
+                .canonicalize()
+                .with_context(|| format!("could not resolve span plugin {}", absolute.display()))?;
+            let relative = absolute.strip_prefix(&root).map_err(|_| {
+                anyhow::anyhow!(
+                    "project span plugin {} must be inside the repository",
+                    absolute.display()
+                )
+            })?;
+            Ok((absolute.clone(), relative.to_path_buf()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if !plugins.is_empty() {
+        crate::span_processor::validate(
+            &plugins
+                .iter()
+                .map(|(absolute, _)| absolute.clone())
+                .collect::<Vec<_>>(),
+        )?;
     }
     common::edit_object(path, FileAccess::OwnerOnly, |settings, _| {
         settings.insert("trace_to_braintrust".into(), Value::Bool(!args.disable));
@@ -134,6 +172,33 @@ fn write_project_setup_at(
             if let Some(value) = value {
                 settings.insert(key.into(), Value::String(value.to_owned()));
             }
+        }
+        if args.no_inherit_plugins {
+            settings.insert("inherit_plugins".into(), Value::Bool(false));
+        }
+        if args.inherit_plugins {
+            settings.insert("inherit_plugins".into(), Value::Bool(true));
+        }
+        if !plugins.is_empty() {
+            let route = settings
+                .entry("route")
+                .or_insert_with(|| Value::Object(Default::default()));
+            let route = route
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("project route must be an object"))?;
+            route.insert(
+                "span_plugins".into(),
+                serde_json::to_value(
+                    plugins
+                        .iter()
+                        .map(|(_, relative)| {
+                            relative
+                                .to_string_lossy()
+                                .replace(std::path::MAIN_SEPARATOR, "/")
+                        })
+                        .collect::<Vec<_>>(),
+                )?,
+            );
         }
         if let Some(metadata) = args.additional_metadata.as_deref() {
             let parsed: Value = serde_json::from_str(metadata)?;
@@ -156,7 +221,7 @@ pub fn run_setup(args: SetupArgs, route: SessionRoute) -> anyhow::Result<TraceCo
     let agent = adapter(args.agent);
     agent.enable(&mut SystemCommandRunner)?;
     let identity = agent.identity();
-    let settings_path = enable_tracing(identity.id, route, !args.disable)?;
+    let settings_path = enable_tracing(identity.id, route, !args.disable, args.no_inherit_plugins)?;
     Ok(
         TraceCommandOutput::setup(identity.id, identity.display_name, settings_path)
             .with_enabled(!args.disable),
@@ -211,7 +276,7 @@ pub fn run_enable(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
 fn enable_existing_at(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!(
-            "tracing is not configured at {}; run `bt trace setup` first",
+            "tracing is not configured at {}; run `bt trace install` first",
             path.display()
         );
     }
@@ -222,7 +287,7 @@ fn enable_existing_at(path: &Path) -> anyhow::Result<()> {
                 .is_some_and(Value::is_boolean)
         {
             anyhow::bail!(
-                "tracing is not configured at {}; run `bt trace setup` first",
+                "tracing is not configured at {}; run `bt trace install` first",
                 path.display()
             );
         }
@@ -276,9 +341,14 @@ pub fn run_update(agent: SetupAgent) -> anyhow::Result<TraceCommandOutput> {
     ))
 }
 
-fn enable_tracing(source: &str, route: SessionRoute, enabled: bool) -> anyhow::Result<PathBuf> {
+fn enable_tracing(
+    source: &str,
+    route: SessionRoute,
+    enabled: bool,
+    replace_plugins: bool,
+) -> anyhow::Result<PathBuf> {
     let path = paths::agent_settings_path(source, None);
-    write_tracing_at(&path, route, enabled)?;
+    write_tracing_at(&path, route, enabled, replace_plugins)?;
     Ok(path)
 }
 
@@ -287,10 +357,15 @@ fn enable_tracing(source: &str, route: SessionRoute, enabled: bool) -> anyhow::R
 /// keys from earlier settings formats.
 #[cfg(test)]
 fn enable_tracing_at(path: &Path, route: SessionRoute) -> anyhow::Result<()> {
-    write_tracing_at(path, route, true)
+    write_tracing_at(path, route, true, false)
 }
 
-fn write_tracing_at(path: &Path, mut route: SessionRoute, enabled: bool) -> anyhow::Result<()> {
+fn write_tracing_at(
+    path: &Path,
+    mut route: SessionRoute,
+    enabled: bool,
+    replace_plugins: bool,
+) -> anyhow::Result<()> {
     let mut settings = load_object(path)?;
     if route.additional_metadata.is_none() {
         route.additional_metadata = settings
@@ -314,7 +389,7 @@ fn write_tracing_at(path: &Path, mut route: SessionRoute, enabled: bool) -> anyh
             })
             .unwrap_or_default();
     }
-    if route.span_plugins.is_empty() {
+    if route.span_plugins.is_empty() && !replace_plugins {
         route.span_plugins = settings
             .get("route")
             .and_then(|route| route.get("span_plugins"))
@@ -380,8 +455,10 @@ mod tests {
     #[test]
     fn project_setup_writes_only_explicit_values_and_preserves_existing_fields() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(".claude/braintrust.json");
+        let path = temp.path().join(".braintrust.json");
         let mut args = SetupArgs {
+            no_inherit_plugins: false,
+            inherit_plugins: false,
             disable: false,
             scope: SettingsScope::Project,
             agent: SetupAgent::Claude,
@@ -404,6 +481,24 @@ mod tests {
             value,
             serde_json::json!({"trace_to_braintrust": true,"project":"project","tags":["team"],"additional_metadata":{"ci":true}})
         );
+        let plugins = temp.path().join("plugins");
+        std::fs::create_dir(&plugins).unwrap();
+        std::fs::write(plugins.join("redact.mjs"), "export default span => span").unwrap();
+        args.plugin.push("plugins/redact.mjs".into());
+        args.no_inherit_plugins = true;
+        write_project_setup_at(&path, &args, &selection).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["route"]["span_plugins"],
+            serde_json::json!(["plugins/redact.mjs"])
+        );
+        assert_eq!(value["inherit_plugins"], false);
+        args.no_inherit_plugins = false;
+        args.inherit_plugins = true;
+        write_project_setup_at(&path, &args, &selection).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["inherit_plugins"], true);
+        args.plugin.clear();
         args.plugin.push("bad.js".into());
         assert!(write_project_setup_at(&path, &args, &selection).is_err());
         assert_eq!(

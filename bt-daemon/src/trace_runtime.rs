@@ -574,7 +574,7 @@ async fn doctor_output_at(
 
     if !settings_present {
         warnings.push(format!(
-            "settings file is missing; run `bt trace setup {source}`"
+            "settings file is missing; run `bt trace install {source}`"
         ));
     } else if !enabled {
         warnings.push(format!(
@@ -754,6 +754,8 @@ fn enable_needs_setup(configured: bool, args: &crate::EnableArgs, explicit_route
         || args.additional_metadata.is_some()
         || !args.tags.is_empty()
         || !args.plugin.is_empty()
+        || args.no_inherit_plugins
+        || args.inherit_plugins
 }
 
 /// Execute the complete mounted trace command.
@@ -795,9 +797,13 @@ pub async fn run_trace_with_matches(
                 if args.additional_metadata.is_some()
                     || !args.tags.is_empty()
                     || !args.plugin.is_empty()
+                    || args.no_inherit_plugins
+                    || args.inherit_plugins
                     || has_explicit
                 {
                     let setup = crate::SetupArgs {
+                        no_inherit_plugins: args.no_inherit_plugins,
+                        inherit_plugins: args.inherit_plugins,
                         disable: false,
                         scope: args.scope,
                         agent: args.agent,
@@ -817,6 +823,8 @@ pub async fn run_trace_with_matches(
                 print_output(run_enable(args.agent)?, host.output_format)
             } else {
                 let setup = crate::SetupArgs {
+                    no_inherit_plugins: args.no_inherit_plugins,
+                    inherit_plugins: args.inherit_plugins,
                     disable: false,
                     scope: args.scope,
                     agent: args.agent,
@@ -855,10 +863,14 @@ pub async fn run_trace_with_matches(
             }
         }
         TraceCommand::Uninstall(args) => {
-            if args.scope != SettingsScope::User {
-                anyhow::bail!("uninstall applies only to user scope");
+            if args.scope == SettingsScope::Project {
+                print_output(
+                    crate::setup::run_project_uninstall(args.agent)?,
+                    host.output_format,
+                )
+            } else {
+                print_output(crate::run_uninstall(args.agent)?, host.output_format)
             }
-            print_output(crate::run_uninstall(args.agent)?, host.output_format)
         }
         TraceCommand::Update(update_args) => {
             let codex = matches!(update_args.agent, SetupAgent::Codex);
@@ -1027,7 +1039,11 @@ pub async fn run_trace_with_matches(
                 }
                 route.additional_metadata = Some(metadata);
             }
+            let inherited_tags = run_args.inherit.then(|| route.tags.clone());
             apply_tags(&mut route, &run_args.tags)?;
+            if let Some(tags) = inherited_tags {
+                route.tags.extend(tags);
+            }
             let hook_command = child_command(&host.command, "hook");
             let status =
                 run_traced_with_host(run_args, hook_command, route, host_info(&host)).await?;
@@ -1086,6 +1102,8 @@ mod tests {
     #[test]
     fn enable_uses_setup_only_when_missing_or_explicitly_changed() {
         let mut args = crate::EnableArgs {
+            no_inherit_plugins: false,
+            inherit_plugins: false,
             scope: SettingsScope::User,
             agent: SetupAgent::Pi,
             additional_metadata: None,
@@ -1110,6 +1128,8 @@ mod tests {
         const CHILD_ENV: &str = "BRAINTRUST_TEST_RESUME_EXISTING";
         if std::env::var_os(CHILD_ENV).is_some() {
             let args = crate::EnableArgs {
+                no_inherit_plugins: false,
+                inherit_plugins: false,
                 scope: SettingsScope::User,
                 agent: SetupAgent::Pi,
                 additional_metadata: None,
@@ -1156,6 +1176,8 @@ mod tests {
         if let Ok(mode) = std::env::var(CHILD_ENV) {
             let services = Arc::new(RecordingHost::new(None, None));
             let args = crate::EnableArgs {
+                no_inherit_plugins: false,
+                inherit_plugins: false,
                 scope: SettingsScope::User,
                 agent: SetupAgent::OpenCode,
                 additional_metadata: None,
@@ -1397,6 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn setup_and_run_request_a_destination_only_when_needed() {
         let run = RunArgs {
+            no_inherit_plugins: false,
             inherit: false,
             source: RunSource::Codex,
             parent: None,
@@ -1415,6 +1438,8 @@ mod tests {
         for (command, persistent_auth, destination_required) in [
             (
                 TraceCommand::Setup(SetupArgs {
+                    no_inherit_plugins: false,
+                    inherit_plugins: false,
                     disable: false,
                     scope: SettingsScope::User,
                     agent: SetupAgent::OpenCode,
@@ -1458,6 +1483,7 @@ mod tests {
         )
         .unwrap();
         let args = RunArgs {
+            no_inherit_plugins: false,
             inherit: false,
             source: RunSource::Claude,
             parent: Some(parent),
@@ -1750,7 +1776,7 @@ mod tests {
             _: AuthResolveReason,
         ) -> anyhow::Result<AuthLease> {
             anyhow::bail!(
-                "saved profile ID 'daemon-only' no longer exists; run `bt trace setup` to select a profile"
+                "saved profile ID 'daemon-only' no longer exists; run `bt trace install` to select a profile"
             )
         }
     }

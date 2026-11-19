@@ -27,7 +27,7 @@ pub enum TraceCommand {
     Enable(EnableArgs),
     /// Disable tracing while preserving the plugin and its configuration.
     Disable(DisableArgs),
-    /// Uninstall the tracing plugin and remove its saved configuration.
+    /// Uninstall the tracing plugin or remove the shared project configuration.
     Uninstall(DisableArgs),
     /// Update an already installed Braintrust tracing plugin without changing its configuration.
     Update(UpdateArgs),
@@ -118,6 +118,12 @@ pub struct SetupArgs {
     /// Tag applied to each root span. May be repeated or comma-separated.
     #[arg(long = "tag", global = true, value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// Replace inherited span plugins instead of appending to them.
+    #[arg(long, global = true, conflicts_with = "inherit_plugins")]
+    pub no_inherit_plugins: bool,
+    /// Restore inheritance of user-level span plugins.
+    #[arg(long, global = true)]
+    pub inherit_plugins: bool,
     /// JavaScript span transform to persist for this agent. Repeat to compose
     /// transforms in order.
     #[arg(long, global = true, value_name = "PATH")]
@@ -137,6 +143,12 @@ pub struct EnableArgs {
     /// Tag applied to each root span. May be repeated or comma-separated.
     #[arg(long = "tag", global = true, value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// Replace inherited span plugins instead of appending to them.
+    #[arg(long, global = true, conflicts_with = "inherit_plugins")]
+    pub no_inherit_plugins: bool,
+    /// Restore inheritance of user-level span plugins.
+    #[arg(long, global = true)]
+    pub inherit_plugins: bool,
     /// JavaScript span transform to persist. May be repeated.
     #[arg(long, global = true, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
@@ -430,7 +442,7 @@ mod tests {
 
     #[test]
     fn scoped_commands_accept_project_before_or_after_agent() {
-        for command in ["install", "setup", "enable", "disable"] {
+        for command in ["install", "setup", "enable", "disable", "uninstall"] {
             for args in [
                 vec!["bt", command, "--scope", "project", "claude"],
                 vec!["bt", command, "claude", "--scope", "project"],
@@ -439,12 +451,46 @@ mod tests {
                 let scope = match parsed.trace.command {
                     TraceCommand::Setup(args) => args.scope,
                     TraceCommand::Enable(args) => args.scope,
-                    TraceCommand::Disable(args) => args.scope,
+                    TraceCommand::Disable(args) | TraceCommand::Uninstall(args) => args.scope,
                     _ => panic!("wrong command"),
                 };
                 assert_eq!(scope, SettingsScope::Project);
             }
         }
+    }
+
+    #[test]
+    fn project_plugin_inheritance_flags_are_exclusive() {
+        assert!(Cli::try_parse_from([
+            "bt",
+            "install",
+            "claude",
+            "--scope",
+            "project",
+            "--no-inherit-plugins"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "bt",
+            "enable",
+            "claude",
+            "--scope",
+            "project",
+            "--inherit-plugins"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "bt",
+            "install",
+            "claude",
+            "--no-inherit-plugins",
+            "--inherit-plugins"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["bt", "run", "codex", "--inherit", "--no-inherit-plugins"])
+                .is_ok()
+        );
     }
 
     #[test]

@@ -62,10 +62,16 @@ pub struct SetupCommandOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration: Option<&'static str>,
     pub scope: &'static str,
+    #[serde(skip_serializing_if = "is_false")]
+    pub applies_to_all_agents: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,6 +185,7 @@ pub struct DoctorCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Doctor(Box<DoctorCommandOutput>),
+    #[serde(rename = "install")]
     Setup(SetupCommandOutput),
     Enable(SetupCommandOutput),
     Disable(SetupCommandOutput),
@@ -210,6 +217,7 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            applies_to_all_agents: false,
             enabled: None,
             warnings: Vec::new(),
         })
@@ -227,6 +235,7 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: Some("reused"),
             scope: "user",
+            applies_to_all_agents: false,
             enabled: None,
             warnings: Vec::new(),
         })
@@ -240,6 +249,10 @@ impl TraceCommandOutput {
         let mut output = Self::setup(source, display_name, settings_path).with_scope("project");
         if let Self::Setup(setup) = &mut output {
             setup.warnings.push("Settings not specified here must be supplied by each user's configuration. Each user needs a user-level installation and usable Braintrust credentials for their sessions to be captured.".into());
+            setup.warnings.push(
+                "This shared project configuration applies to all coding agents in the repository."
+                    .into(),
+            );
         }
         output
     }
@@ -249,7 +262,10 @@ impl TraceCommandOutput {
             Self::Setup(output)
             | Self::Enable(output)
             | Self::Disable(output)
-            | Self::Uninstall(output) => output.scope = scope,
+            | Self::Uninstall(output) => {
+                output.scope = scope;
+                output.applies_to_all_agents = scope == "project";
+            }
             _ => {}
         }
         self
@@ -295,6 +311,7 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            applies_to_all_agents: false,
             enabled: None,
             warnings: Vec::new(),
         })
@@ -312,6 +329,7 @@ impl TraceCommandOutput {
             restart_required: true,
             configuration: None,
             scope: "user",
+            applies_to_all_agents: false,
             enabled: None,
             warnings: Vec::new(),
         })
@@ -405,6 +423,13 @@ impl TraceCommandOutput {
                 }
                 Ok(rendered)
             }
+            Self::Enable(enable) if enable.scope == "project" => Ok(format!(
+                "Braintrust tracing is enabled for all coding agents in this repository. Project configuration {} at {}.",
+                enable.configuration.unwrap_or("reused"), enable.settings_path.display()
+            )),
+            Self::Disable(disable) if disable.scope == "project" => Ok(format!(
+                "Braintrust tracing is disabled for all coding agents in this repository at {}.", disable.settings_path.display()
+            )),
             Self::Enable(setup) if setup.configuration.is_some_and(|value| value != "reused") => Ok(format!(
                 "Braintrust tracing configuration {} for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
                 setup.configuration.unwrap_or_default(), setup.display_name, setup.scope, setup.settings_path.display()
@@ -427,6 +452,9 @@ impl TraceCommandOutput {
                 disable.display_name,
                 disable.scope,
                 disable.settings_path.display()
+            )),
+            Self::Uninstall(uninstall) if uninstall.scope == "project" => Ok(format!(
+                "The shared repository tracing configuration was removed from {}. User-level settings now apply to all agents in this repository.", uninstall.settings_path.display()
             )),
             Self::Uninstall(uninstall) => Ok(format!(
                 "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
@@ -540,7 +568,7 @@ mod tests {
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["command"], "setup");
+        assert_eq!(value["command"], "install");
         assert_eq!(value["source"], "opencode");
         assert_eq!(value["restart_required"], true);
         assert!(!rendered.contains("installed for"));

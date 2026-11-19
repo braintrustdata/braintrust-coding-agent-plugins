@@ -40,7 +40,7 @@ Install Pi and the
 
 ```bash
 bt login
-bt trace setup pi --project my-coding-agent
+bt trace install pi --project my-coding-agent
 pi
 ```
 
@@ -50,7 +50,7 @@ The footer shows tracing status and a link to the trace when available.
 
 To install the npm extension separately, use
 `pi install npm:@braintrust/pi-extension`, then configure tracing with
-`bt trace setup pi`.
+`bt trace install pi`.
 
 For one invocation without changing global tracing configuration:
 
@@ -115,7 +115,7 @@ Example:
 | `show_trace_link` | `true` | Show the trace link; override with `BRAINTRUST_SHOW_TRACE_LINK` |
 
 Older files can still use top-level `profile`, `org_name`, `project`, and
-`additional_metadata`. For new files, use `bt trace setup` or the nested
+`additional_metadata`. For new files, use `bt trace install` or the nested
 `route` format above. Include a destination when supplying a route.
 
 Only the display settings read environment variables directly. Tracing settings

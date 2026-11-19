@@ -19,7 +19,7 @@ export async function readPluginConfig(input: {
     const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
     const configPaths = [
       path.join(configHome, "opencode", "braintrust.json"),
-      projectSettingsPath(input.directory, ".opencode"),
+      projectSettingsPath(input.directory),
     ];
     for (const [index, configPath] of configPaths.entries()) {
       try {
@@ -28,14 +28,34 @@ export async function readPluginConfig(input: {
           if (index === 0) {
             pluginConfig = parsed;
           } else {
-            // Project files cannot select executable span plugins.
-            const { route: projectRoute, ...safe } = parsed;
-            const userRoute = mergeProjectRoute(pluginConfig?.route, projectRoute);
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+              throw new TypeError("project settings must be an object");
+            const { route: projectRoute, inherit_plugins: inheritPlugins, ...safe } = parsed;
+            if (
+              projectRoute !== undefined &&
+              (!projectRoute || typeof projectRoute !== "object" || Array.isArray(projectRoute))
+            )
+              throw new TypeError("project route must be an object");
+            if (inheritPlugins !== undefined && typeof inheritPlugins !== "boolean")
+              throw new TypeError("inherit_plugins must be a boolean");
+            const userRoute = mergeProjectRoute(
+              pluginConfig?.route,
+              projectRoute,
+              configPath,
+              inheritPlugins !== false,
+            );
+            if (safe.tags) {
+              safe.tags = [
+                ...new Set([...(userRoute?.tags ?? pluginConfig?.tags ?? []), ...safe.tags]),
+              ];
+            }
             if (safe.additional_metadata) {
               safe.additional_metadata = mergeConfigObjects(
                 userRoute?.additional_metadata ?? pluginConfig?.additional_metadata ?? {},
                 safe.additional_metadata,
               );
+            } else if (projectRoute?.additional_metadata) {
+              safe.additional_metadata = userRoute?.additional_metadata;
             }
             const auth = userRoute?.auth;
             const projectAuth =
@@ -70,7 +90,8 @@ export async function readPluginConfig(input: {
           }
         }
       } catch {
-        // Malformed optional config is fail-open; continue to the next layer.
+        // Do not bypass a project opt-out when its settings cannot be read.
+        if (index === 1) pluginConfig = { ...pluginConfig, trace_to_braintrust: false };
       }
     }
   } catch {

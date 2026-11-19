@@ -27,11 +27,11 @@ afterEach(() => {
 
 it("applies the project opt-out to OpenCode 2 and permits a managed run", async () => {
   const global = join(directory, "config", "opencode");
-  const project = join(directory, ".opencode");
+  const project = directory;
   mkdirSync(global, { recursive: true });
   mkdirSync(project, { recursive: true });
   writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
-  writeFileSync(join(project, "braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
+  writeFileSync(join(project, ".braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
   const hook = vi.fn(async () => {});
   const subscribe = vi.fn(async function* () {});
   const ctx = {

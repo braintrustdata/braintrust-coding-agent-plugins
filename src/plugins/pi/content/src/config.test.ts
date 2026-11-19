@@ -82,7 +82,7 @@ describe("loadConfig", () => {
       project: "global-project",
       additional_metadata: { source: "global" },
     });
-    writeJson(join(cwd, ".pi", "braintrust.json"), {
+    writeJson(join(cwd, ".braintrust.json"), {
       profile: "project",
       project: "project-project",
       show_trace_link: false,
@@ -105,7 +105,7 @@ describe("loadConfig", () => {
     });
   });
 
-  it("merges nested project metadata and replaces arrays", () => {
+  it("merges nested project metadata and appends arrays", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), {
       trace_to_braintrust: false,
       route: {
@@ -113,15 +113,48 @@ describe("loadConfig", () => {
         additional_metadata: { nested: { a: 1, b: 2 }, list: [1, 2] },
       },
     });
-    writeJson(join(cwd, ".pi", "braintrust.json"), {
+    writeJson(join(cwd, ".braintrust.json"), {
       trace_to_braintrust: true,
       route: { additional_metadata: { nested: { b: 3 }, list: [4] } },
     });
     expect(loadConfig(cwd).route.additional_metadata).toEqual({
       nested: { a: 1, b: 3 },
-      list: [4],
+      list: [1, 2, 4],
     });
     expect(loadConfig(cwd).enabled).toBe(true);
+  });
+
+  it("finds the shared repository file from a nested directory", () => {
+    mkdirSync(join(cwd, ".git"));
+    const nested = join(cwd, "src", "nested");
+    mkdirSync(nested, { recursive: true });
+    writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: true, project: "repo" });
+    expect(loadConfig(nested)).toMatchObject({ enabled: true, projectName: "repo" });
+  });
+
+  it("appends repository plugins relative to the shared configuration and can replace user plugins", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: false,
+      route: {
+        destination: { type: "project_logs", project_name: "global" },
+        span_plugins: ["user.mjs"],
+      },
+    });
+    const path = join(cwd, ".braintrust.json");
+    writeJson(path, {
+      trace_to_braintrust: true,
+      route: { span_plugins: ["scripts/project.mjs"] },
+    });
+    expect(loadConfig(cwd).route.span_plugins).toEqual([
+      "user.mjs",
+      join(cwd, "scripts/project.mjs"),
+    ]);
+    writeJson(path, {
+      trace_to_braintrust: true,
+      inherit_plugins: false,
+      route: { span_plugins: ["scripts/project.mjs"] },
+    });
+    expect(loadConfig(cwd).route.span_plugins).toEqual([join(cwd, "scripts/project.mjs")]);
   });
 
   it("prefers a canonical route over stale top-level routing", () => {
@@ -181,12 +214,26 @@ describe("loadConfig", () => {
     expect(loadConfig(cwd)).toEqual(DEFAULT_CONFIG);
   });
 
+  it("does not bypass a project opt-out when its plugin list is invalid", () => {
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: true });
+    writeJson(join(cwd, ".braintrust.json"), {
+      trace_to_braintrust: false,
+      route: { span_plugins: [null] },
+    });
+    expect(loadConfig(cwd).enabled).toBe(false);
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "run" } },
+    });
+    expect(loadConfig(cwd).enabled).toBe(true);
+  });
+
   it("lets project tracing override the user default, and managed runs override both", () => {
     writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: false });
-    writeJson(join(cwd, ".pi", "braintrust.json"), { trace_to_braintrust: true });
+    writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: true });
     expect(loadConfig(cwd).enabled).toBe(true);
     writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: true });
-    writeJson(join(cwd, ".pi", "braintrust.json"), { trace_to_braintrust: false });
+    writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: false });
     expect(loadConfig(cwd).enabled).toBe(false);
     process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
       trace_to_braintrust: true,

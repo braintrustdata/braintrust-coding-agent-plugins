@@ -64,7 +64,7 @@ impl Setup for Claude {
 
     fn update(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
         if installed_plugin(&list_plugins(runner)?).is_none() {
-            bail!("Claude Code tracing plugin is not installed; run `bt trace setup claude`");
+            bail!("Claude Code tracing plugin is not installed; run `bt trace install claude`");
         }
         MARKETPLACE.refresh_published(runner, "Claude Code", "claude")?;
         runner.run("claude", &["plugin", "update", PLUGIN])
@@ -260,7 +260,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "Claude Code tracing marketplace is not the published Braintrust marketplace; run `bt trace setup claude`"
+            "Claude Code tracing marketplace is not the published Braintrust marketplace; run `bt trace install claude`"
         );
         assert!(!runner.called("claude plugin marketplace update braintrust-claude-plugin"));
     }

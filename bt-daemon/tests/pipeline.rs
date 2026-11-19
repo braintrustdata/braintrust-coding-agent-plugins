@@ -2952,6 +2952,7 @@ esac
     let run = |session_id: &str, mode: &str| {
         run_traced(
             RunArgs {
+                no_inherit_plugins: false,
                 inherit: false,
                 source: RunSource::Codex,
                 parent: None,
@@ -3056,6 +3057,7 @@ async fn muse_managed_run_preserves_saved_settings_and_foreign_hooks() {
     let binary = env!("CARGO_BIN_EXE_bt-daemon");
     let status = run_traced(
         RunArgs {
+            no_inherit_plugins: false,
             inherit: false,
             source: RunSource::Muse,
             parent: None,
@@ -3160,6 +3162,7 @@ async fn muse_managed_run_starts_its_isolated_daemon_before_sanitized_hooks() {
         let binary = env!("CARGO_BIN_EXE_bt-daemon");
         let status = run_traced(
             RunArgs {
+                no_inherit_plugins: false,
                 inherit: false,
                 source: RunSource::Muse,
                 parent: None,

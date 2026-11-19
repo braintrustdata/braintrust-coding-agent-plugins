@@ -310,9 +310,8 @@ fn project_settings_control_hook_capture_from_native_payload() {
             serde_json::json!({"workspacePaths":[repo],"session_id":"s","hook_event_name":"Stop"}),
         ),
     ] {
-        let config_dir = repo.join(dir);
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config = config_dir.join("braintrust.json");
+        let _ = dir;
+        let config = repo.join(".braintrust.json");
         let run = |enabled: bool| {
             std::fs::write(
                 &config,

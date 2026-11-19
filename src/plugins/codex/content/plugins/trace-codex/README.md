@@ -37,7 +37,7 @@ falling back. The marketplace hook definition stays unchanged.
 Install and configure the published plugin with the Braintrust CLI:
 
 ```bash
-bt trace setup codex --project my-coding-agent
+bt trace install codex --project my-coding-agent
 ```
 
 Use `--profile` or `--org` when needed. Setup activates Braintrust tracing in
@@ -60,7 +60,7 @@ the daemon cannot accept an event, Codex reports the hook failure and continues.
 
 ## Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace setup codex
+For a persistent route, pass a JSON object to `bt trace install codex
 --additional-metadata '<JSON>'` to tag the root span of every Codex session.
 Standard session metadata takes precedence if keys conflict.
 
@@ -75,7 +75,7 @@ Use repeatable `--tag` flags for filterable root-span tags. Inspect the effectiv
 configuration with `doctor` and delivery state with `status`:
 
 ```bash
-bt trace setup codex --tag coding-agent --tag development
+bt trace install codex --tag coding-agent --tag development
 bt trace doctor codex
 bt trace status
 ```

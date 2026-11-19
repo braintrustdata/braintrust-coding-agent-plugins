@@ -115,9 +115,11 @@ async fn run_traced_inner(
     if let Some(components) = args.parent {
         route.destination = Some(wire::TraceDestination::ParentSpan { components });
     }
-    if !args.inherit || !args.plugin.is_empty() {
-        apply_run_span_plugins(&mut route, &args.plugin)?;
-    }
+    apply_run_span_plugins(
+        &mut route,
+        &args.plugin,
+        args.inherit && !args.no_inherit_plugins,
+    )?;
     let name = args.source.identity().id;
     let agent = registrar()
         .run
@@ -307,8 +309,17 @@ impl ManagedRunRuntime {
     }
 }
 
-fn apply_run_span_plugins(route: &mut SessionRoute, plugins: &[PathBuf]) -> anyhow::Result<()> {
-    route.span_plugins = resolve_span_plugin_paths(plugins)?;
+fn apply_run_span_plugins(
+    route: &mut SessionRoute,
+    plugins: &[PathBuf],
+    append: bool,
+) -> anyhow::Result<()> {
+    let resolved = resolve_span_plugin_paths(plugins)?;
+    if append {
+        route.span_plugins.extend(resolved);
+    } else {
+        route.span_plugins = resolved;
+    }
     Ok(())
 }
 
@@ -367,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_run_plugins_replace_inherited_plugins() {
+    fn managed_run_plugins_append_or_replace_inherited_plugins() {
         let temp = tempfile::tempdir().unwrap();
         let plugin = temp.path().join("run.mjs");
         std::fs::write(&plugin, "export default span => span").unwrap();
@@ -376,11 +387,19 @@ mod tests {
             ..SessionRoute::default()
         };
 
-        apply_run_span_plugins(&mut route, &[]).unwrap();
-        assert!(route.span_plugins.is_empty());
+        apply_run_span_plugins(&mut route, std::slice::from_ref(&plugin), true).unwrap();
+        assert_eq!(
+            route.span_plugins,
+            [
+                PathBuf::from("persisted.mjs"),
+                plugin.canonicalize().unwrap()
+            ]
+        );
 
-        apply_run_span_plugins(&mut route, std::slice::from_ref(&plugin)).unwrap();
+        apply_run_span_plugins(&mut route, std::slice::from_ref(&plugin), false).unwrap();
         assert_eq!(route.span_plugins, [plugin.canonicalize().unwrap()]);
+        apply_run_span_plugins(&mut route, &[], false).unwrap();
+        assert!(route.span_plugins.is_empty());
     }
 
     fn test_run_hook_command() -> RunHookCommand {
@@ -394,6 +413,7 @@ mod tests {
     async fn managed_run_rejects_a_missing_destination_before_launch() {
         let error = run_traced(
             RunArgs {
+                no_inherit_plugins: false,
                 inherit: false,
                 source: RunSource::Codex,
                 parent: None,
@@ -415,6 +435,7 @@ mod tests {
     async fn codex_managed_run_rejects_global_hook_trust_bypass_before_launch() {
         let error = run_traced(
             RunArgs {
+                no_inherit_plugins: false,
                 inherit: false,
                 source: RunSource::Codex,
                 parent: None,

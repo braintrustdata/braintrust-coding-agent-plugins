@@ -27,7 +27,7 @@ Install the plugin and choose where traces are sent:
 
 ```bash
 bt login
-bt trace setup antigravity --project my-coding-agent
+bt trace install antigravity --project my-coding-agent
 ```
 
 Setup installs the hooks and saves non-secret routing settings in

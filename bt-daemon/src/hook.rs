@@ -189,7 +189,7 @@ pub(crate) async fn run_hook_with_route(
 pub(crate) fn read_project_hook_payload(
     args: &HookArgs,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    if crate::paths::project_config_dir(&args.source).is_some() {
+    if crate::paths::supports_project_settings(&args.source) {
         use std::io::Read;
         let mut raw = String::new();
         std::io::stdin().read_to_string(&mut raw)?;

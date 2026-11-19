@@ -20,7 +20,7 @@ the Braintrust VS Code extension for Cursor.
 Use `/add-plugin` in Cursor and search for **Braintrust**, or install from the
 [Cursor Marketplace](https://cursor.com/marketplace). The plugin registers the
 Braintrust MCP server and tracing hooks. For tracing, install and authenticate
-the `bt` CLI, then run `bt trace setup cursor --project my-coding-agent`.
+the `bt` CLI, then run `bt trace install cursor --project my-coding-agent`.
 
 The Braintrust MCP server uses `https://api.braintrust.dev/mcp`. Configure its
 `BRAINTRUST_API_KEY` variable in Cursor's plugin settings. MCP access and tracing
@@ -36,7 +36,7 @@ server named `braintrust`; use one MCP installation to avoid duplicates.
 
 The plugin works with Cursor CLI and desktop.
 Its hooks invoke `bt trace hook`, so the Braintrust CLI must be on
-Cursor's `PATH` when hooks run. `bt trace setup cursor` also installs capture
+Cursor's `PATH` when hooks run. `bt trace install cursor` also installs capture
 hooks in `~/.cursor/hooks.json`. These user hooks work with third-party imports
 disabled and when a marketplace installation takes precedence over the local
 plugin. Plugin hooks skip capture for events covered by these user hooks.
@@ -49,13 +49,13 @@ Authenticate and enable tracing:
 
 ```bash
 bt login
-bt trace setup cursor --project my-coding-agent
+bt trace install cursor --project my-coding-agent
 ```
 
 Setup uses Git to install or refresh the local `braintrust` plugin from the latest
 published [distribution](https://github.com/braintrustdata/braintrust-cursor-extension),
 configures the hooks needed to trace Cursor sessions, and saves the selected route in
-`~/.cursor/braintrust.json`. If Git is not installed or not on `PATH`, setup and
+`~/.cursor/braintrust.json`. If Git is not installed or not on `PATH`, install and
 `bt trace update cursor` install the plugin bundled with your `bt` build and print
 a warning that it may be older. Install Git and run `bt trace update cursor` to
 get the latest published version. Other download failures preserve the previous
@@ -83,7 +83,7 @@ that must not be sent to Braintrust.
 Add a JSON object to the root span of every Cursor session:
 
 ```bash
-bt trace setup cursor --project my-coding-agent \
+bt trace install cursor --project my-coding-agent \
   --additional-metadata '{"team":"platform","environment":"dev"}'
 ```
 
@@ -94,7 +94,7 @@ Standard session metadata takes precedence if keys conflict.
 Use repeatable `--tag` options for filterable tags on root spans:
 
 ```bash
-bt trace setup cursor --tag ci --tag release-validation
+bt trace install cursor --tag ci --tag release-validation
 bt trace run cursor --tag ci
 bt trace import cursor SESSION_ID --tag historical-import
 ```

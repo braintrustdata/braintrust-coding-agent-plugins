@@ -19,15 +19,18 @@ describe("project route overlay", () => {
     const merged = mergeConfigObjects({ nested: { keep: 1, list: [1, 2] } }, overlay)
     assert.equal(Object.getPrototypeOf(merged), Object.prototype)
     assert.deepEqual(merged["__proto__"], { polluted: true })
-    assert.deepEqual(merged.nested, { keep: 1, list: [3] })
+    assert.deepEqual(merged.nested, { keep: 1, list: [1, 2, 3] })
   })
-  test("replaces arrays without accepting executable project plugins", () => {
+  test("appends project plugins and can replace the inherited chain", () => {
     const base = { destination: { type: "project_logs", project_name: "global" }, span_plugins: ["trusted"], tags: ["global"] }
-    const cleared = mergeProjectRoute(base, { destination: base.destination, span_plugins: [], tags: [] })!
-    assert.deepEqual(cleared.span_plugins, [])
-    assert.deepEqual(cleared.tags, [])
-    const blocked = mergeProjectRoute(base, { destination: base.destination, span_plugins: ["untrusted"] })!
-    assert.deepEqual(blocked.span_plugins, ["trusted"])
+    const projectPath = join(tmpdir(), "example", ".braintrust.json")
+    const overlay = { destination: base.destination, span_plugins: ["project.mjs"], tags: ["project"] }
+    const appended = mergeProjectRoute(base, overlay, projectPath)!
+    assert.deepEqual(appended.span_plugins, ["trusted", join(tmpdir(), "example", "project.mjs")])
+    assert.deepEqual(appended.tags, ["global", "project"])
+    const replaced = mergeProjectRoute(base, overlay, projectPath, false)!
+    assert.deepEqual(replaced.span_plugins, [join(tmpdir(), "example", "project.mjs")])
+    assert.deepEqual(base.span_plugins, ["trusted"])
   })
 })
 
