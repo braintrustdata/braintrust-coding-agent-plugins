@@ -371,6 +371,11 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 });
             result_records.insert(agent_id, (index, call_id));
         }
+        // API request blobs can repeat an earlier assistant message after the
+        // tool result. Only the original assistant record is a launch event.
+        if record.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
         let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
