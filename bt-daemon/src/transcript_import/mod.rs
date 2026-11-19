@@ -1056,6 +1056,49 @@ mod tests {
     }
 
     #[test]
+    fn claude_desktop_fork_uses_filename_and_excludes_parent_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fork.jsonl");
+        let records = vec![
+            json!({"type":"user","sessionId":"parent","message":{"content":"old"}}),
+            json!({"type":"assistant","sessionId":"parent","message":{"id":"old-call","content":[{"type":"text","text":"old answer"}]}}),
+            json!({"type":"user","sessionId":"fork","message":{"content":"new"}}),
+            json!({"type":"assistant","sessionId":"fork","message":{"id":"new-call","content":[{"type":"text","text":"new answer"}]}}),
+        ];
+        let mut offsets = Vec::new();
+        let mut data = String::new();
+        for record in &records {
+            data.push_str(&format!("{record}\n"));
+            offsets.push(data.len() as u64);
+        }
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(
+            claude::layout(vec![root]).discover().unwrap(),
+            vec![path.clone()]
+        );
+        let events = claude::envelopes(&path, &records, &offsets, data.len() as u64).unwrap();
+        assert!(events.iter().all(|event| event.session_id == "fork"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "UserPromptSubmit")
+                .count(),
+            1
+        );
+        assert_eq!(events[0].payload["_bt_import_through_offset"], offsets[1]);
+        let native_path = temp
+            .path()
+            .join("f716ae0f-06bd-4fe9-96c5-e831a5f77ced.jsonl");
+        let err =
+            claude::envelopes(&native_path, &records[..2], &offsets[..2], offsets[1]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not contain its filename session id"));
+    }
+
+    #[test]
     fn claude_import_keeps_delayed_child_and_native_handback_under_launching_turn() {
         use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
 

@@ -1484,7 +1484,25 @@ impl AgentTranslator for ClaudeTranslator {
         self.git.enrich_rows(self.current_cwd.as_deref(), &mut ops);
         let mut event_op_start = ops.len();
         match event.event.as_str() {
-            "SessionStart" => {}
+            "SessionStart" => {
+                if event
+                    .payload
+                    .get("_bt_import_inherited_history")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    if let Some(cursor) = self
+                        .main_transcript
+                        .as_ref()
+                        .and_then(|path| self.transcripts.get_mut(path))
+                    {
+                        let records = std::mem::take(&mut cursor.buffered);
+                        self.main_history =
+                            parse_transcript(&records, std::mem::take(&mut self.main_history))
+                                .history;
+                    }
+                }
+            }
             "UserPromptSubmit" => {
                 self.flush_previous_turn_rows(&mut ops);
                 event_op_start = ops.len();
