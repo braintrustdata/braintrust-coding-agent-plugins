@@ -232,6 +232,9 @@ struct Producer {
     state: State,
     publication: Option<Publication>,
     phase: Boundary,
+    buffered: Vec<SpanOp>,
+    buffered_events: usize,
+    defer_commit: bool,
 }
 
 impl Producer {
@@ -269,6 +272,9 @@ impl Producer {
             state,
             publication: None,
             phase: Boundary::Journal,
+            buffered: Vec::new(),
+            buffered_events: 0,
+            defer_commit: false,
         })
     }
 
@@ -528,6 +534,8 @@ impl Producer {
         if self.translator.is_some() {
             return Ok(());
         }
+        self.buffered.clear();
+        self.buffered_events = 0;
         let continuation = self.options.storage.continuation().await?;
         self.committed = self.options.storage.status().await?.translated_through;
         self.roots = Roots::restore(self.options.storage.root_candidates().await?);
@@ -615,7 +623,25 @@ impl Producer {
         }
         self.phase = Boundary::Journal;
         while let Some(entry) = self.next_input(through).await? {
+            // A control must observe a fully committed prefix, especially Retire,
+            // whose continuation intentionally precedes terminal updates.
+            if matches!(&entry.event, SourceEvent::Control(_)) && self.buffered_events > 0 {
+                self.defer_commit = false;
+                self.publication = Some(Publication {
+                    input: self.position,
+                    observation: true,
+                    capture: self.capture.clone(),
+                    ops: None,
+                    built: Vec::new(),
+                    complete: true,
+                    continuation: None,
+                });
+                self.publish().await?;
+            }
             let input = entry.position.through;
+            self.defer_commit = matches!(&entry.event, SourceEvent::Event(_))
+                && input < through
+                && self.buffered_events < 15;
             let observation = !matches!(&entry.event,SourceEvent::Control(control) if matches!(control.kind,ControlKind::Retire));
             let mut continuation = None;
             let (first, capture) = match entry.event {
@@ -700,6 +726,19 @@ impl Producer {
             self.phase = Boundary::Journal;
             self.position = input;
         }
+        if self.buffered_events > 0 {
+            self.defer_commit = false;
+            self.publication = Some(Publication {
+                input: self.position,
+                observation: true,
+                capture: self.capture.clone(),
+                ops: None,
+                built: Vec::new(),
+                complete: true,
+                continuation: None,
+            });
+            self.publish().await?;
+        }
         if self.position < through {
             // Every stored record through `through` is consumed. The rest of
             // the range is what a legacy journal reserved without importing a
@@ -783,6 +822,17 @@ impl Producer {
                 pending.complete = pending.ops.is_none();
             }
             if publish {
+                if self.defer_commit {
+                    self.buffered.append(&mut pending.built);
+                    self.buffered_events += 1;
+                    self.position = pending.input;
+                    return Ok(());
+                }
+                if self.buffered_events > 0 {
+                    self.buffered.append(&mut pending.built);
+                    pending.built = std::mem::take(&mut self.buffered);
+                    self.buffered_events = 0;
+                }
                 self.phase = Boundary::Journal;
                 let state = match &pending.continuation {
                     Some(state) => state.clone(),
@@ -1240,6 +1290,41 @@ pub(crate) mod tests {
         covered.sort();
         covered.dedup();
         assert_eq!(covered, Registry::default_agents().sources());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_retains_inputs_and_restart_replays_without_duplicates() {
+        let mut f = SourceFixture::new("claude-code").await;
+        let (events, _) = sdk897_backlog_events(&f.options.data_dir, 16, 128);
+        let mut tail = 0;
+        for event in &events {
+            tail = f.write(event, false).await;
+        }
+        let db = f.db();
+        db.inject(Fault::Handoff).unwrap();
+        f.source.advance(tail).await.unwrap();
+        assert!(f.source.barrier().await.is_err());
+        assert_eq!(db.count(Table::Events), 32);
+        assert_eq!(db.count(Table::Ops), 0);
+        assert!(f.options.storage.continuation().await.unwrap().is_none());
+        f.source.shutdown().await;
+        db.clear(Fault::Handoff).unwrap();
+        f.reopen().await;
+        f.source.advance(tail).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f.source.barrier().await.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.count(Table::Events), 0);
+        let rows = db.op_records();
+        assert!(!rows.is_empty());
+        f.reopen().await;
+        f.process(tail).await;
+        assert_eq!(db.op_records(), rows);
+        f.source.shutdown().await;
     }
 
     #[tokio::test]

@@ -256,12 +256,7 @@ pub async fn forward_envelope(
     host: &HostInfo,
     no_spawn: bool,
 ) -> anyhow::Result<()> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        DaemonClient::new(socket, host, no_spawn).log(env),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("daemon did not accept the event within 5 seconds"))?
+    DaemonClient::new(socket, host, no_spawn).log(env).await
 }
 
 /// One reusable connection to a current daemon. It starts the daemon or hands
@@ -272,6 +267,7 @@ pub(crate) struct DaemonClient {
     host: HostInfo,
     no_spawn: bool,
     conn: Option<Conn>,
+    upgrade_after_capture: bool,
 }
 
 impl DaemonClient {
@@ -281,12 +277,18 @@ impl DaemonClient {
             host: host.clone(),
             no_spawn,
             conn: None,
+            upgrade_after_capture: false,
         }
     }
 
     /// Connect and initialize. `Ok(false)` is a transient failure to retry
     /// while a replacement daemon takes over.
-    async fn open(&mut self, init: &serde_json::Value, retrying: bool) -> anyhow::Result<bool> {
+    async fn open(
+        &mut self,
+        init: &serde_json::Value,
+        retrying: bool,
+        capture: bool,
+    ) -> anyhow::Result<bool> {
         const MAX_HANDOVER_ATTEMPTS: usize = 3;
         let mut handover_attempts = 0;
         loop {
@@ -303,6 +305,14 @@ impl DaemonClient {
             };
             let initialized: wire::InitializeResult = serde_json::from_value(initialized)?;
             if !daemon_needs_upgrade(&initialized.daemon_version, &self.host.version) {
+                self.conn = Some(conn);
+                return Ok(true);
+            }
+            // Capture with the running daemon before requesting handover. Its
+            // event.log acknowledgement is the durable boundary; an upgrade
+            // must never delay or abandon an event that has not reached it.
+            if capture && !self.no_spawn {
+                self.upgrade_after_capture = true;
                 self.conn = Some(conn);
                 return Ok(true);
             }
@@ -331,16 +341,10 @@ impl DaemonClient {
     /// Capture one event. Returns once the daemon has durably accepted it.
     pub(crate) async fn log(&mut self, env: &Envelope) -> anyhow::Result<()> {
         let init = initialize_params(env, &self.host.version);
-        let mut retry_deadline: Option<tokio::time::Instant> = None;
+        let mut retrying = false;
         loop {
-            if retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                anyhow::bail!(
-                    "replacement daemon did not accept the event at {}",
-                    self.socket.display()
-                );
-            }
             let reused = self.conn.is_some();
-            if !reused && !self.open(&init, retry_deadline.is_some()).await? {
+            if !reused && !self.open(&init, retrying, true).await? {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 continue;
             }
@@ -351,11 +355,9 @@ impl DaemonClient {
                 Ok(result) => result,
                 // A reused connection may belong to a daemon that has since
                 // exited; reconnect once before treating this as a failure.
-                Err(_) if reused || retry_deadline.is_some() => {
+                Err(_) if reused || retrying => {
                     self.conn = None;
-                    retry_deadline.get_or_insert_with(|| {
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(5)
-                    });
+                    retrying = true;
                     continue;
                 }
                 Err(error) => {
@@ -365,13 +367,22 @@ impl DaemonClient {
             };
             let result: wire::EventLogResult = serde_json::from_value(result)?;
             if result.accepted {
+                if self.upgrade_after_capture {
+                    // This timeout only bounds maintenance after durable capture.
+                    // Failure leaves the accepted event with the old daemon.
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        conn.request(method::DAEMON_SHUTDOWN, serde_json::json!({})),
+                    )
+                    .await;
+                    self.upgrade_after_capture = false;
+                    self.conn = None;
+                }
                 return Ok(());
             }
             // A quiescing daemon is handing over; capture with its replacement.
             self.conn = None;
-            retry_deadline.get_or_insert_with(|| {
-                tokio::time::Instant::now() + std::time::Duration::from_secs(5)
-            });
+            retrying = true;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -391,7 +402,7 @@ impl DaemonClient {
                     "pid": std::process::id()
                 }
             });
-            self.open(&init, false).await?;
+            self.open(&init, false, false).await?;
         }
         let conn = self
             .conn

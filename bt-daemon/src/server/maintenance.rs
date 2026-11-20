@@ -581,8 +581,15 @@ mod tests {
             )
             .await;
             assert!(
-                !matches!(result, Ok(Ok(()))),
-                "an unacknowledged event must not be reported as captured"
+                matches!(result, Ok(Ok(()))),
+                "hook must capture before handover"
+            );
+            let storage = crate::collections::SessionStorage::open(tmp.path(), "debug", "handover")
+                .await
+                .unwrap();
+            assert!(
+                storage.status().await.unwrap().event_tail > 0,
+                "capture must be durable before recovery finishes"
             );
             let returned = result.is_ok();
             println!("hook.handover: returned_before_recovery={returned}");
