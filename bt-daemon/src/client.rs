@@ -256,7 +256,12 @@ pub async fn forward_envelope(
     host: &HostInfo,
     no_spawn: bool,
 ) -> anyhow::Result<()> {
-    DaemonClient::new(socket, host, no_spawn).log(env).await
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        DaemonClient::new(socket, host, no_spawn).log(env),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("daemon did not accept the event within 5 seconds"))?
 }
 
 /// One reusable connection to a current daemon. It starts the daemon or hands

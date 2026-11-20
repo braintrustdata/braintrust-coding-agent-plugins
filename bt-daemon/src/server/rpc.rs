@@ -316,7 +316,6 @@ pub(super) async fn handle_request(
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);
-            daemon.settle_ingress().await;
             Response::serialized(id, daemon.status(p))
         }
         method::AUTH_DIAGNOSE => {
@@ -327,7 +326,6 @@ pub(super) async fn handle_request(
             if !client_may_shutdown(client.as_ref(), &daemon.version) {
                 return Response::serialized(id, ShutdownResult { ok: false });
             }
-            drain_all(daemon).await;
             Response::serialized(id, ShutdownResult { ok: true })
         }
         other => Response::err(
