@@ -447,6 +447,89 @@ mod tests {
         )
     }
 
+    /// Exercise startup with a persisted Claude backlog and live control RPCs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual recovery responsiveness diagnostic"]
+    async fn sdk897_actual_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let turns = std::env::var("SDK897_TURNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1200);
+        let (events, transcript_bytes) =
+            crate::pipeline::translation::tests::sdk897_backlog_events(tmp.path(), turns, 2048);
+        let storage =
+            crate::collections::SessionStorage::open(tmp.path(), "claude-code", "checkpoint")
+                .await
+                .unwrap();
+        let route = SessionRoute {
+            destination: Some(crate::wire::TraceDestination::ProjectLogs {
+                project_id: Some("project".into()),
+                project_name: None,
+            }),
+            ..Default::default()
+        };
+        for mut event in events {
+            event.route = Some(route.clone());
+            storage.append(&event, None).await.unwrap().unwrap();
+        }
+        let initial = storage.status().await.unwrap();
+        assert!(initial.event_tail > initial.translated_through);
+        let socket = tmp.path().join("daemon.sock");
+        let args = crate::args::ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(tmp.path().into()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+            retention: None,
+        };
+        let mut options = debug_serve_options("test", tmp.path());
+        options.auth_provider = Some(Arc::new(TestAuth));
+        let started = Instant::now();
+        let server = tokio::spawn(super::super::run_serve(args, options));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !socket.exists() {
+                tokio::task::yield_now().await;
+            }
+            while storage.status().await.unwrap().translated_through == initial.translated_through {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery did not start");
+        let before = storage.status().await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::run_status(crate::args::StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            }),
+        )
+        .await;
+        let after = storage.status().await.unwrap();
+        println!("actual_recovery turns={turns} transcript_bytes={transcript_bytes} event_tail={} before={} after={} status_returned={} elapsed_ms={}", initial.event_tail, before.translated_through, after.translated_through, status.is_ok(), started.elapsed().as_millis());
+        if status.is_err() {
+            assert!(
+                after.translated_through > before.translated_through,
+                "recovery made no progress during status request"
+            );
+        }
+        let shutdown =
+            tokio::time::timeout(Duration::from_secs(2), crate::shutdown_daemon(&socket)).await;
+        println!(
+            "shutdown_returned={} elapsed_ms={}",
+            shutdown.is_ok(),
+            started.elapsed().as_millis()
+        );
+        let result = tokio::time::timeout(Duration::from_secs(300), server)
+            .await
+            .expect("daemon did not finish")
+            .unwrap();
+        result.unwrap();
+        println!("daemon_finished_ms={}", started.elapsed().as_millis());
+    }
+
     /// Run with `cargo test --lib sdk897_control_plane -- --ignored --nocapture`.
     /// Holding the recovery gate makes the control RPC behavior deterministic.
     #[tokio::test]

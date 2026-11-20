@@ -994,28 +994,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Run explicitly with `cargo test --lib sdk897_claude_backlog -- --ignored --nocapture`.
-    /// This diagnostic preloads a real SQLite event backlog and translates it
-    /// through the production Claude translator and checkpoint transaction.
-    #[tokio::test]
-    #[ignore = "manual replay performance diagnostic"]
-    async fn sdk897_claude_backlog() {
+    pub(crate) fn sdk897_backlog_events(
+        root: &std::path::Path,
+        turns: usize,
+        body_bytes: usize,
+    ) -> (Vec<crate::wire::Envelope>, usize) {
         use crate::wire::Envelope;
         use serde_json::json;
-        use std::time::{Duration, Instant};
-
-        let turns = std::env::var("SDK897_TURNS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(300);
-        let body_bytes = std::env::var("SDK897_BODY_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(2048);
-        let interval = (turns / 3).max(1);
-        assert!(turns > 0, "SDK897_TURNS must be positive");
-        let f = SourceFixture::new("claude-code").await;
-        let transcript = f.options.data_dir.join("claude-replay.jsonl");
+        let transcript = root.join("claude-replay.jsonl");
         let mut contents = Vec::new();
         let mut events = Vec::new();
         for turn in 0..turns {
@@ -1053,11 +1039,52 @@ pub(crate) mod tests {
             }
         }
         std::fs::write(&transcript, &contents).unwrap();
+        (events, contents.len())
+    }
+
+    /// Run explicitly with `cargo test --lib sdk897_claude_backlog -- --ignored --nocapture`.
+    /// This diagnostic preloads a real SQLite event backlog and translates it
+    /// through the production Claude translator and checkpoint transaction.
+    #[tokio::test]
+    #[ignore = "manual replay performance diagnostic"]
+    async fn sdk897_claude_backlog() {
+        use std::time::{Duration, Instant};
+
+        let turns = std::env::var("SDK897_TURNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300);
+        let body_bytes = std::env::var("SDK897_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2048);
+        let interval = (turns / 3).max(1);
+        assert!(turns > 0, "SDK897_TURNS must be positive");
+        let f = SourceFixture::new("claude-code").await;
+        let (events, transcript_bytes) =
+            sdk897_backlog_events(&f.options.data_dir, turns, body_bytes);
         let mut boundaries = Vec::new();
         for event in &events {
             boundaries.push(f.write(event, false).await);
         }
         assert_eq!(f.db().count(Table::Events), (turns * 2) as u64);
+        let db_path = crate::collections::inspect::session_path(
+            &f.options.data_dir,
+            &f.options.source,
+            &f.options.session_id,
+        );
+        let storage_bytes = || {
+            let db = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            let wal_path = format!("{}-wal", db_path.display());
+            let wal = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
+            (db, wal)
+        };
+        let (db_bytes, wal_bytes) = storage_bytes();
+        println!(
+            "preloaded_events={} transcript_bytes={} db_bytes={db_bytes} wal_bytes={wal_bytes}",
+            events.len(),
+            transcript_bytes
+        );
         let mut replay_time = Duration::ZERO;
         for completed in (interval..=turns)
             .step_by(interval)
@@ -1079,12 +1106,16 @@ pub(crate) mod tests {
             for _ in 0..10 {
                 std::hint::black_box(translator.save_state().unwrap());
             }
+            let mean_save_us = serial_start.elapsed().as_micros() / 10;
+            let (db_bytes, wal_bytes) = storage_bytes();
+            let status = f.options.storage.status().await.unwrap();
             println!(
-                "turns={completed} events={} continuation_bytes={} replay_ms={} mean_save_us={}",
+                "turns={completed} events={} continuation_bytes={} replay_ms={} mean_save_us={} remaining_event_bytes={} db_bytes={db_bytes} wal_bytes={wal_bytes}",
                 completed * 2,
                 continuation.len(),
                 replay_time.as_millis(),
-                serial_start.elapsed().as_micros() / 10
+                mean_save_us,
+                status.event_tail.saturating_sub(status.translated_through),
             );
         }
         if let Ok(budget) = std::env::var("SDK897_MAX_REPLAY_MS") {
@@ -1097,6 +1128,9 @@ pub(crate) mod tests {
             );
         }
         f.source.shutdown().await;
+        if std::env::var_os("SDK897_KEEP_DATA").is_some() {
+            println!("retained_data_dir={}", f._dir.keep().display());
+        }
     }
 
     #[test]
