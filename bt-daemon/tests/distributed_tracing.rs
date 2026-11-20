@@ -2280,13 +2280,29 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
         .truncate(1);
     child_events[0].capture.as_mut().unwrap().truncated = true;
     forward(child_events.remove(0), &socket, &host).await;
-    let status = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: Some("partial-child".into()),
+    // Status is a passive snapshot; capture acknowledgement does not wait
+    // for routing. Observe the eventual session without forcing a flush.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("partial-child".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "partial-child")
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("captured session must become visible");
     let accepted = status
         .sessions
         .iter()
@@ -2555,13 +2571,29 @@ async fn unconfirmed_child_is_visible_and_delivered_without_more_events() {
         prompt.capture = child_events[0].capture.clone();
         forward(child_events.remove(0), &socket, &host).await;
         forward(prompt, &socket, &host).await;
-        let status = run_status(StatusArgs {
-            socket: Some(socket.clone()),
-            session_id: Some("bounded-child".into()),
+        // Status is a passive snapshot; capture acknowledgement does not wait
+        // for routing. Observe the eventual session without forcing a flush.
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = run_status(StatusArgs {
+                    socket: Some(socket.clone()),
+                    session_id: Some("bounded-child".into()),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                if status
+                    .sessions
+                    .iter()
+                    .any(|s| s.session_id == "bounded-child")
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
         .await
-        .unwrap()
-        .unwrap();
+        .expect("captured session must become visible");
         let child = status
             .sessions
             .iter()
