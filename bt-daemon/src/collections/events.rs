@@ -20,10 +20,11 @@ use std::{
 const READ_RECORDS: usize = 32;
 const READ_BYTES: usize = 256 * 1024;
 /// Payload fields the daemon adds to record what it captured alongside an event.
-const CAPTURE_REFERENCES: [&str; 3] = [
+const CAPTURE_REFERENCES: [&str; 4] = [
     "_bt_claude_transcript_mirrors",
     "_bt_transcript_mirror",
     "_bt_transcript_replay",
+    "_bt_claude_parent_agent_id",
 ];
 /// Payload fields that identify on-disk state the session still references.
 const IDENTITY_PAYLOAD: [&str; 3] = [

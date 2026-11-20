@@ -857,6 +857,138 @@ fn claude_captures_subagent_model_call_appended_after_stop() {
 }
 
 #[test]
+fn claude_deferred_subagent_without_stop_is_emitted_at_session_end() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "nested-interrupted");
+    let ctx = SessionCtx {
+        session_id: "nested-interrupted".into(),
+        config: None,
+    };
+    let mut ops = Vec::new();
+    for event in [
+        claude_event(
+            &ctx.session_id,
+            "UserPromptSubmit",
+            1000,
+            json!({"prompt":"delegate"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2000,
+            json!({"agent_id":"outer","agent_type":"outer"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "PreToolUse",
+            2100,
+            json!({"agent_id":"outer","tool_name":"Agent","tool_use_id":"spawn","tool_input":{}}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2200,
+            json!({"agent_id":"child","agent_type":"inner"}),
+        ),
+        claude_event(&ctx.session_id, "SessionEnd", 3000, json!({})),
+    ] {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
+    }
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, SpanOp::Insert(row) if row.name == "subagent: inner"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn claude_nested_agents_keep_native_parent_with_concurrent_launches() {
+    let registry = Registry::default_agents();
+    let mut translator = registry.create("claude-code", "nested-live");
+    let ctx = SessionCtx {
+        session_id: "nested-live".into(),
+        config: None,
+    };
+    let events = [
+        claude_event(
+            &ctx.session_id,
+            "UserPromptSubmit",
+            1000,
+            json!({"prompt":"delegate"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2000,
+            json!({"agent_id":"outer-a","agent_type":"a"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2100,
+            json!({"agent_id":"outer-b","agent_type":"b"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "PreToolUse",
+            2200,
+            json!({"agent_id":"outer-a","tool_name":"Agent","tool_use_id":"spawn-a","tool_input":{}}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "PreToolUse",
+            2300,
+            json!({"agent_id":"outer-b","tool_name":"Agent","tool_use_id":"spawn-b","tool_input":{}}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2400,
+            json!({"agent_id":"child-b","agent_type":"inner-b"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStart",
+            2500,
+            json!({"agent_id":"child-a","agent_type":"inner-a"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStop",
+            3000,
+            json!({"agent_id":"child-a","agent_type":"inner-a","_bt_claude_parent_agent_id":"outer-a"}),
+        ),
+        claude_event(
+            &ctx.session_id,
+            "SubagentStop",
+            3100,
+            json!({"agent_id":"child-b","agent_type":"inner-b","_bt_claude_parent_agent_id":"outer-b"}),
+        ),
+    ];
+    let mut ops = Vec::new();
+    for event in events {
+        ops.extend(translator.handle(&event, &ctx).unwrap());
+        while let Some(batch) = translator.drain_pending(&ctx).unwrap() {
+            ops.extend(batch);
+        }
+    }
+    let rows = reduce(ops);
+    let named = |name: &str| rows.values().find(|row| row.name == name).unwrap();
+    assert_eq!(
+        named("subagent: inner-a").parent_span_ids,
+        vec![named("subagent: a").span_id.clone()]
+    );
+    assert_eq!(
+        named("subagent: inner-b").parent_span_ids,
+        vec![named("subagent: b").span_id.clone()]
+    );
+}
+
+#[test]
 fn claude_subagent_stop_recovers_handback_from_transcript_without_post_tool_hook() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("agent-worker.jsonl");
