@@ -1896,6 +1896,9 @@ mod tests {
             crate::forward_envelope(&env, &self.socket, &host, true)
                 .await
                 .unwrap();
+            // Status is a nonblocking snapshot. Wait explicitly when a test
+            // needs the result of processing a just-captured event.
+            let _ = crate::flush_session(session_id, &self.socket, 100).await;
         }
 
         async fn stop(self) {

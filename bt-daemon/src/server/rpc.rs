@@ -145,7 +145,15 @@ pub(super) async fn serve_connection(
             }
             .await;
             if shutdown_after_response {
-                daemon.trigger_shutdown();
+                // Keep accepting connections during the drain so late hooks
+                // receive a handover response and retry with the replacement.
+                // The shutdown acknowledgement itself must not wait for it.
+                daemon.begin_quiesce();
+                let draining = daemon.clone();
+                tokio::spawn(async move {
+                    drain_all(&draining).await;
+                    draining.trigger_shutdown();
+                });
             }
             write_result?;
             if stop_after_response {
@@ -316,7 +324,6 @@ pub(super) async fn handle_request(
         }
         method::STATUS_GET => {
             let p = parse!(StatusParams);
-            daemon.settle_ingress().await;
             Response::serialized(id, daemon.status(p))
         }
         method::AUTH_DIAGNOSE => {
@@ -327,7 +334,6 @@ pub(super) async fn handle_request(
             if !client_may_shutdown(client.as_ref(), &daemon.version) {
                 return Response::serialized(id, ShutdownResult { ok: false });
             }
-            drain_all(daemon).await;
             Response::serialized(id, ShutdownResult { ok: true })
         }
         other => Response::err(

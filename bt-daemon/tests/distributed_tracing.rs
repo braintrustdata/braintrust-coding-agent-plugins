@@ -2280,13 +2280,30 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
         .truncate(1);
     child_events[0].capture.as_mut().unwrap().truncated = true;
     forward(child_events.remove(0), &socket, &host).await;
-    let status = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: Some("partial-child".into()),
+    // Status is a passive snapshot; capture acknowledgement does not wait
+    // for routing. Wait past the resolved-but-not-dispatched snapshot without
+    // forcing a flush; other errors still reach the assertion below.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("partial-child".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.iter().any(|s| {
+                s.session_id == "partial-child"
+                    && s.last_error.as_deref()
+                        != Some("correlation resolved; journaled events awaiting delivery")
+            }) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("captured session must become visible");
     let accepted = status
         .sessions
         .iter()
@@ -2294,7 +2311,7 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
         .expect("incomplete first capture must be accepted immediately");
     assert!(
         accepted.last_error.is_none(),
-        "incomplete evidence must not defer delivery"
+        "incomplete evidence must not defer delivery: {accepted:?}"
     );
     forward_all(&mut child_events, &socket, &host).await;
     forward(
@@ -2555,13 +2572,29 @@ async fn unconfirmed_child_is_visible_and_delivered_without_more_events() {
         prompt.capture = child_events[0].capture.clone();
         forward(child_events.remove(0), &socket, &host).await;
         forward(prompt, &socket, &host).await;
-        let status = run_status(StatusArgs {
-            socket: Some(socket.clone()),
-            session_id: Some("bounded-child".into()),
+        // Status is a passive snapshot; capture acknowledgement does not wait
+        // for routing. Observe the eventual session without forcing a flush.
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = run_status(StatusArgs {
+                    socket: Some(socket.clone()),
+                    session_id: Some("bounded-child".into()),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                if status
+                    .sessions
+                    .iter()
+                    .any(|s| s.session_id == "bounded-child")
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
         .await
-        .unwrap()
-        .unwrap();
+        .expect("captured session must become visible");
         let child = status
             .sessions
             .iter()
@@ -2958,37 +2991,49 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let saved_database = std::fs::read(&backup).unwrap();
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
-        // Restore the accepted-but-undelivered checkpoint, as after an abrupt
-        // process exit. Shutdown itself is covered separately above.
+        // Restore the crash image into a new directory. Windows cannot unlink
+        // SQLite files while an exiting task still owns a connection. Backup
+        // the other databases through SQLite, preserving their committed WAL.
+        let restored_dir = tmp.path().join("restored-data");
+        let mut dirs = vec![(data_dir.clone(), restored_dir.clone())];
+        let child_database = journal_store::path(&data_dir, "claude-code", "bounded-child");
+        while let Some((from, to)) = dirs.pop() {
+            tokio::fs::create_dir_all(&to).await.unwrap();
+            let mut entries = tokio::fs::read_dir(&from).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let source = entry.path();
+                let target = to.join(entry.file_name());
+                if entry.file_type().await.unwrap().is_dir() {
+                    dirs.push((source, target));
+                } else if source.extension().is_some_and(|ext| ext == "sqlite") {
+                    if source != child_database {
+                        bt_daemon::storage_inspect::Inspector::open(&source)
+                            .unwrap()
+                            .backup(&target)
+                            .unwrap();
+                    }
+                } else if !source.to_string_lossy().ends_with("-wal")
+                    && !source.to_string_lossy().ends_with("-shm")
+                {
+                    tokio::fs::copy(&source, &target).await.unwrap();
+                }
+            }
+        }
+        let path = restored_dir.join(path.strip_prefix(&data_dir).unwrap());
+        let journal_path = restored_dir.join(journal_path.strip_prefix(&data_dir).unwrap());
+        let data_dir = restored_dir;
         tokio::fs::create_dir_all(journal_path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&journal_path, journal).await.unwrap();
-        // This crash fixture rolls back source persistence as well as delivery.
-        let id = journal_path
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .rsplit("--")
-            .next()
-            .unwrap();
-        for suffix in [".sqlite", ".sqlite-wal", ".sqlite-shm"] {
-            let path = data_dir.join("pipeline").join(format!("{id}{suffix}"));
-            if path.exists() {
-                tokio::fs::remove_file(path).await.unwrap();
-            }
-        }
         if format == "current" {
-            // A current-version crash preserves the SQLite collection and its
-            // exact IDs, rather than manufacturing a legacy NDJSON replacement.
-            tokio::fs::remove_file(&journal_path).await.unwrap();
             tokio::fs::write(
                 journal_store::path(&data_dir, "claude-code", "bounded-child"),
                 saved_database,
             )
             .await
             .unwrap();
+        } else {
+            tokio::fs::write(&journal_path, journal).await.unwrap();
         }
         let mut legacy_route = original_route.clone();
         legacy_route.destination = Some(external_parent());
@@ -3110,29 +3155,35 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
 }
 
 async fn stored_pending_child(data_dir: &Path, session: &str) -> (PathBuf, serde_json::Value) {
-    let mut entries = tokio::fs::read_dir(data_dir.join("correlation"))
-        .await
-        .unwrap();
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        if entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("json")
-        {
-            continue;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(data_dir.join("correlation"))
+                .await
+                .unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                if entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("json")
+                {
+                    continue;
+                }
+                let state: serde_json::Value =
+                    serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
+                if state["events"].as_array().is_some_and(|events| {
+                    events
+                        .iter()
+                        .any(|event| event["env"]["session_id"] == session)
+                }) {
+                    return (entry.path(), state);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let state: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
-        if state["events"].as_array().is_some_and(|events| {
-            events
-                .iter()
-                .any(|event| event["env"]["session_id"] == session)
-        }) {
-            return (entry.path(), state);
-        }
-    }
-    panic!("no persisted pending event for {session}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no persisted pending event for {session}"))
 }
 
 fn test_host() -> HostInfo {
