@@ -585,9 +585,7 @@ impl Producer {
             return Ok(None);
         };
         let event = match entry.record {
-            EventRecord::Event(event) => {
-                SourceEvent::Event(Box::new(crate::journal::envelope_from_redacted(event)))
-            }
+            EventRecord::Event(event) => SourceEvent::Event(Box::new(event.into_envelope())),
             EventRecord::Control(control) => SourceEvent::Control(control),
         };
         Ok(Some(SourceRecord {

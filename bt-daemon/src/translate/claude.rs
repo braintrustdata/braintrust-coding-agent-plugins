@@ -9,8 +9,8 @@
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{
-    add_tool_approval, explicit_skill_metadata, insert_skill_metadata, nonempty_error_text,
-    prompt_skill_names, push_unique, skill_file_load, skill_md_paths, SkillLoad, ToolApproval,
+    add_tool_approval, explicit_skill_metadata, nonempty_error_text, prompt_skill_names,
+    push_unique, skill_file_load, skill_md_paths, SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -2541,10 +2541,7 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         let Some(reference) = mirrors.get(path) else {
             return Vec::new();
         };
-        let Some(mirror) = reference.mirror.as_deref() else {
-            return Vec::new();
-        };
-        let Some(through) = reference.through else {
+        let Some((mirror, through)) = reference.captured_prefix() else {
             return Vec::new();
         };
         let through = if fields.transcript_path.as_deref() == Some(path) {
@@ -2555,14 +2552,9 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         return read_file_bounded(mirror, offset, None, Some(through));
     }
 
-    let mirror = fields
-        .mirror
-        .as_ref()
-        .filter(|mirror| mirror.path.as_deref() == Some(path));
+    let mirror = fields.matching_mirror(path);
     if let Some(mirror) = mirror {
-        let mirror_path = mirror.mirror.as_deref();
-        let through = mirror.through;
-        if let (Some(mirror_path), Some(through)) = (mirror_path, through) {
+        if let Some((mirror_path, through)) = mirror.captured_prefix() {
             // The mirror is byte-identical to the source prefix, so offsets
             // are interchangeable between them. An import offset is the
             // tighter bound when present.
@@ -2575,11 +2567,7 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
     }
 
     // Journals written before transcript mirroring carry the whole file.
-    let snapshot = fields
-        .snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.path == path)
-        .map(|snapshot| snapshot.contents.as_str());
+    let snapshot = fields.snapshot_for(path);
     match (snapshot, import_through_offset) {
         (Some(contents), through @ Some(_)) => {
             read_snapshot_bounded(contents, offset, None, through)
@@ -2619,7 +2607,7 @@ fn tool_metadata(
         }
     }
     if let Some(skill) = skill {
-        insert_skill_metadata(&mut metadata, skill, requested_skills);
+        skill.insert_metadata(&mut metadata, requested_skills);
     }
     Value::Object(metadata)
 }
@@ -2743,10 +2731,7 @@ fn command_output(cwd: &str, command: &str, args: &[&str]) -> Option<String> {
 
 fn tool_span_name(tool: &str, input: &Value, skill: Option<&SkillLoad>) -> String {
     if let Some(skill) = skill {
-        return skill
-            .name
-            .as_ref()
-            .map_or_else(|| "skill".into(), |name| format!("skill: {name}"));
+        return skill.display_name();
     }
     match tool {
         "Read" | "Write" | "Edit" | "MultiEdit" => string_field(input, "file_path")

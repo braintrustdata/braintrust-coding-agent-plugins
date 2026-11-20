@@ -42,16 +42,8 @@ impl Daemon {
             return;
         };
         let through = fields
-            .claude_mirrors
-            .as_ref()
-            .and_then(|mirrors| mirrors.get(path))
-            .or_else(|| {
-                fields
-                    .mirror
-                    .as_ref()
-                    .filter(|mirror| mirror.path.as_deref() == Some(path))
-            })
-            .and_then(|mirror| mirror.through);
+            .claude_reference(path)
+            .and_then(|reference| reference.through);
         #[derive(serde::Serialize)]
         struct PollPayload<'a> {
             transcript_path: &'a str,

@@ -4,6 +4,9 @@
 //! the output shape to this crate so every front-end reports daemon commands
 //! consistently and JSON mode never falls back to human prose.
 
+mod auth_diagnostic;
+pub use auth_diagnostic::AuthDiagnostic;
+
 use crate::wire::{SessionRoute, StatusResult, TraceDestination};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -101,22 +104,6 @@ pub struct ImportSummary {
     pub finalized: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthDiagnostic {
-    pub status: String,
-    pub source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonStatus {
@@ -157,9 +144,7 @@ impl DaemonDiagnostic {
 
     /// The daemon answered and could not authenticate the route.
     pub fn auth_failed(&self) -> bool {
-        self.auth
-            .as_ref()
-            .is_some_and(|auth| auth.status == "error")
+        self.auth.as_ref().is_some_and(AuthDiagnostic::is_error)
     }
 }
 

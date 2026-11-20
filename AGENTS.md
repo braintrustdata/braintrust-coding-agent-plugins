@@ -53,6 +53,13 @@ that flexibility; do not use an opaque JSON fallback for a known schema merely
 to avoid modeling it. Preserve native format variants and unknown extensions
 explicitly when introducing shared types.
 
+Put shared schema interpretation, validated lookup, lossless edits, and common
+projections on the type that owns those rules. Keep filesystem, credential,
+process, and event-ordering policy in the services that coordinate them. Organize
+shared schemas around one primary owner per file, with small private companion
+types alongside that owner. Keep single-use transport shapes data-only when
+methods would merely duplicate field access.
+
 Install the pinned tools with [mise](https://mise.jdx.dev). `mise install`
 reads `.tool-versions` and `mise.toml`, then runs `make install-deps`:
 

@@ -46,7 +46,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
         let mut before = 0u64;
         let mut latest_by_route: HashMap<String, PendingEvent> = HashMap::new();
         if let Ok(Some(template)) = events.identity().await {
-            let env = journal::envelope_from_redacted(template);
+            let env = template.into_envelope();
             daemon.remember_claude_transcripts(&env);
             if let Some(route) = &env.route {
                 latest_by_route.insert(
@@ -64,7 +64,7 @@ pub(super) async fn discover_unprocessed_journals(daemon: &Arc<Daemon>) -> Vec<P
             let through = entry.id;
             match entry.record {
                 EventRecord::Event(redacted) => {
-                    let mut env = journal::envelope_from_redacted(redacted);
+                    let mut env = redacted.into_envelope();
                     let Some(source) = daemon.translators.canonical_source(&env.source) else {
                         before = through;
                         continue;

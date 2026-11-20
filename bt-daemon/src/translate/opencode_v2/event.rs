@@ -1,7 +1,8 @@
 //! Partial OpenCode 2 wire types. Unknown fields are accepted; arbitrary tool
 //! inputs, outputs and provider-specific content remain JSON values.
+pub(super) use super::context::*;
+pub(super) use super::tool_content::*;
 pub(super) use crate::agents::usage::OpenCodeTokens as Tokens;
-use crate::json::{Extensions, Field};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -214,25 +215,6 @@ pub(super) struct NativeError {
 pub(super) struct ErrorResponse {
     pub body: String,
 }
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub(super) enum ToolContent {
-    Known(KnownToolContent),
-    Other(Value),
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub(super) enum KnownToolContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "file")]
-    File {
-        mime: String,
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-    },
-}
 #[derive(Deserialize)]
 pub(super) struct PermissionAsked {
     #[serde(rename = "sessionID")]
@@ -307,133 +289,4 @@ pub(super) struct Interrupted {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub reason: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-pub(super) struct Context {
-    #[serde(rename = "sessionID")]
-    pub session_id: String,
-    #[serde(default)]
-    pub system: Vec<String>,
-    #[serde(default)]
-    pub messages: Vec<ContextMessage>,
-}
-#[derive(Deserialize, Serialize)]
-pub(super) struct ContextMessage {
-    pub role: String,
-    pub content: MessageContent,
-}
-#[derive(Serialize)]
-#[serde(untagged)]
-pub(super) enum MessageContent {
-    Text(String),
-    Parts(Vec<ContextPart>),
-    Other(Value),
-}
-#[derive(Serialize)]
-#[serde(untagged)]
-pub(super) enum ContextPart {
-    Known(KnownContextPart),
-    Other(Value),
-}
-// Select the known schema before deserializing it. An untagged fallback
-// must not turn a malformed known media or tool part into arbitrary JSON.
-impl<'de> Deserialize<'de> for MessageContent {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        match value {
-            Value::String(text) => Ok(Self::Text(text)),
-            Value::Array(parts) => serde_json::from_value(Value::Array(parts))
-                .map(Self::Parts)
-                .map_err(serde::de::Error::custom),
-            other => Ok(Self::Other(other)),
-        }
-    }
-}
-impl<'de> Deserialize<'de> for ContextPart {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        if matches!(
-            value.get("type").and_then(Value::as_str),
-            Some("text" | "media" | "tool-call" | "tool-result")
-        ) {
-            serde_json::from_value(value)
-                .map(Self::Known)
-                .map_err(serde::de::Error::custom)
-        } else {
-            Ok(Self::Other(value))
-        }
-    }
-}
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub(super) enum KnownContextPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "media")]
-    Media {
-        #[serde(
-            default,
-            rename = "mediaType",
-            skip_serializing_if = "Field::is_missing"
-        )]
-        media_type: Field<String>,
-        #[serde(default, skip_serializing_if = "Field::is_missing")]
-        data: Field<String>,
-        #[serde(default, skip_serializing_if = "Field::is_missing")]
-        media: Field<Media>,
-        #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
-        extra: Extensions,
-    },
-    #[serde(rename = "tool-call")]
-    ToolCall {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    #[serde(rename = "tool-result")]
-    ToolResult { id: String, result: ToolResult },
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct Media {
-    #[serde(default, skip_serializing_if = "Field::is_missing")]
-    pub source: Field<MediaSource>,
-    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
-    pub extra: Extensions,
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct MediaSource {
-    #[serde(
-        default,
-        rename = "mediaType",
-        skip_serializing_if = "Field::is_missing"
-    )]
-    pub media_type: Field<String>,
-    #[serde(default, skip_serializing_if = "Field::is_missing")]
-    pub data: Field<String>,
-    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
-    pub extra: Extensions,
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(super) struct ToolResult {
-    pub value: Value,
-}
-
-#[cfg(test)]
-mod extension_tests {
-    use super::*;
-    use serde_json::json;
-    #[test]
-    fn media_extensions_round_trip_but_known_fields_remain_typed() {
-        let raw = json!([{"type":"media","media":{"source":{"mediaType":"application/pdf","data":"YWJj","future":true},"future":null},"future":[42]}]);
-        let parsed: MessageContent = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(serde_json::to_value(parsed).unwrap(), raw);
-        assert!(serde_json::from_value::<MessageContent>(json!([
-            {"type":"media","media":{"source":{"data":42}}}
-        ]))
-        .is_err());
-        let future = json!([{"type":"future","payload":{"data":42}}]);
-        let parsed: MessageContent = serde_json::from_value(future.clone()).unwrap();
-        assert_eq!(serde_json::to_value(parsed).unwrap(), future);
-    }
 }
