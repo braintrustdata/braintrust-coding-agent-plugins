@@ -1,7 +1,7 @@
 //! Known hook structure is typed; extension data and future handler formats are
 //! preserved as opaque JSON. No settings orchestration navigates these values.
 use super::{HOOK_COMMAND, LEGACY_HOOK_COMMAND};
-use crate::muse::field::Field;
+use crate::json::Field;
 use crate::muse::hooks::HookName;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -38,6 +38,8 @@ struct UserCommand {
     #[serde(rename = "type")]
     kind: CommandType,
     command: String,
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    timeout: Field<u64>,
     #[serde(flatten)]
     extra: Extensions,
 }
@@ -72,7 +74,7 @@ impl<'de> Deserialize<'de> for HookHandler {
 }
 impl HookHandler {
     fn is_owned(&self) -> bool {
-        matches!(self, Self::User(handler) if handler.extra.is_empty()
+        matches!(self, Self::User(handler) if handler.extra.is_empty() && handler.timeout.is_missing()
             && matches!(handler.command.as_str(), HOOK_COMMAND | LEGACY_HOOK_COMMAND))
     }
     fn contains_braintrust(&self) -> bool {
@@ -122,6 +124,7 @@ impl HookOverlay {
                     hooks: vec![HookHandler::User(UserCommand {
                         kind: CommandType::Command,
                         command: command.into(),
+                        timeout: Field::Missing,
                         extra: BTreeMap::new(),
                     })],
                 });

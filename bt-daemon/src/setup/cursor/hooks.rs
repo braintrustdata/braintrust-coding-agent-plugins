@@ -5,8 +5,14 @@
 //! marked with their process identity, which later runs remove once that
 //! process has exited.
 
-use crate::setup::common::{edit_object, load_object, FileAccess};
+use crate::agents::schema::{
+    CursorCommandHook, CursorHookEntries, CursorHookEntry, CursorHooks, HookFile,
+};
+#[cfg(test)]
+use crate::setup::common::load_object;
+use crate::setup::common::{edit_json, load_json, FileAccess};
 use crate::wire::ProcessIdentity;
+#[cfg(test)]
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -62,15 +68,10 @@ fn capture_specs_from_manifest(
     manifest: &str,
     windows: bool,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let manifest: Value = serde_json::from_str(manifest)?;
-    let hooks = manifest
-        .get("hooks")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("Cursor hooks must be an object"))?;
-    hooks.iter().map(|(event, entries)| {
-        let command = entries.as_array().and_then(|entries| entries.first())
-            .and_then(|entry| entry.get("command")).and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Cursor hook {event:?} is missing its command"))?;
+    let manifest: HookFile<CursorCommandHook> = serde_json::from_str(manifest)?;
+    manifest.hooks.iter().map(|(event, entries)| {
+        let command = &entries.first()
+            .ok_or_else(|| anyhow::anyhow!("Cursor hook {event:?} is missing its command"))?.command;
         let response = cursor_hook_response(event);
         let command = if windows {
             powershell_encoded_command(&format!(
@@ -91,18 +92,24 @@ fn cursor_hook_response(event: &str) -> &'static str {
     }
 }
 
+fn capture_registration(event: &str, command: &str) -> anyhow::Result<CursorCommandHook> {
+    let manifest: HookFile<CursorCommandHook> = serde_json::from_str(super::HOOKS_MANIFEST)?;
+    let matcher = manifest
+        .hooks
+        .get(event)
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.matcher.clone());
+    Ok(CursorCommandHook::capture(command.to_owned(), matcher))
+}
+
+#[cfg(test)]
 pub(crate) fn capture_hook_entry(event: &str, command: &str) -> anyhow::Result<Value> {
-    let manifest: Value = serde_json::from_str(super::HOOKS_MANIFEST)?;
-    let mut entry = hook_entry(command);
-    if let Some(matcher) = manifest["hooks"][event][0]["matcher"].as_str() {
-        entry["matcher"] = Value::String(matcher.to_owned());
-    }
-    Ok(entry)
+    Ok(serde_json::to_value(capture_registration(event, command)?)?)
 }
 
 /// Suppress a plugin registration only when this event has a user capture hook.
 pub(crate) fn user_capture_hook_is_installed_at(config_dir: &Path, event: &str) -> bool {
-    let Ok(config) = load_object(&config_dir.join("hooks.json")) else {
+    let Ok(config) = load_json::<CursorHooks>(&config_dir.join("hooks.json")) else {
         return false;
     };
     let Ok(specs) = persistent_specs() else {
@@ -114,15 +121,12 @@ pub(crate) fn user_capture_hook_is_installed_at(config_dir: &Path, event: &str) 
         .is_some_and(|(event, command)| capture_entry_is_registered(&config, event, command))
 }
 
-fn capture_entry_is_registered(config: &Map<String, Value>, event: &str, command: &str) -> bool {
-    let Ok(expected) = capture_hook_entry(event, command) else {
+fn capture_entry_is_registered(config: &CursorHooks, event: &str, command: &str) -> bool {
+    let Ok(expected) = capture_registration(event, command) else {
         return false;
     };
-    config
-        .get("hooks")
-        .and_then(|hooks| hooks.get(event))
-        .and_then(Value::as_array)
-        .is_some_and(|entries| entries.iter().any(|entry| entry == &expected))
+    matches!(config.hooks.as_ref().and_then(|hooks| hooks.get(event)), Some(CursorHookEntries::Entries(entries))
+        if entries.iter().any(|entry| matches!(entry, CursorHookEntry::Command(entry) if entry == &expected)))
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -179,100 +183,70 @@ fn managed_process_identity(command: &str) -> Option<ProcessIdentity> {
 }
 
 fn remove_stale_managed_hooks(
-    config: &mut Map<String, Value>,
+    config: &mut CursorHooks,
     mut process_is_alive: impl FnMut(&ProcessIdentity) -> bool,
 ) {
-    let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
+    let Some(hooks) = &mut config.hooks else {
         return;
     };
-    for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
-        entries.retain(|entry| {
-            managed_process_identity(
-                entry
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-            .is_none_or(|identity| process_is_alive(&identity))
-        });
+    for entries in hooks.values_mut() {
+        if let CursorHookEntries::Entries(entries) = entries {
+            entries.retain(|entry| {
+                managed_process_identity(entry.command().unwrap_or_default())
+                    .is_none_or(|identity| process_is_alive(&identity))
+            });
+        }
     }
 }
 
+#[cfg(test)]
 fn hook_entry(command: &str) -> Value {
-    serde_json::json!({
-        "command": command,
-        "timeout": 10,
-        "failClosed": false
-    })
+    serde_json::json!(CursorCommandHook::capture(command.to_owned(), None))
 }
 
-/// Add (`enable`) or remove the entries for `specs`, preserving every other
-/// hook. Persistent entries are replaced by ownership marker; managed entries
-/// are replaced by exact command.
+/// Add or remove owned entries while preserving unrelated native definitions.
 fn apply_specs(
-    config: &mut Map<String, Value>,
+    config: &mut CursorHooks,
     path: &Path,
     specs: &[(String, String)],
     enable: bool,
 ) -> anyhow::Result<()> {
     if enable {
-        config
-            .entry("version")
-            .or_insert_with(|| Value::Number(1.into()));
+        config.version.get_or_insert(1);
     }
-
-    if enable || config.contains_key("hooks") {
-        let hooks = config
-            .entry("hooks")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cursor hooks must be a JSON object: {}", path.display())
-            })?;
-
+    if enable || config.hooks.is_some() {
+        let hooks = config.hooks.get_or_insert_with(Default::default);
         let persistent = specs == persistent_specs()?;
         if persistent {
-            for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
-                entries.retain(|entry| {
-                    !entry
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(is_persistent_command)
-                });
+            for entries in hooks.values_mut() {
+                if let CursorHookEntries::Entries(entries) = entries {
+                    entries.retain(|entry| !entry.command().is_some_and(is_persistent_command));
+                }
             }
         }
-
         for (event, command) in specs {
-            let Some(entries) = hooks.get_mut(event) else {
-                if enable {
-                    let entry = if persistent {
-                        capture_hook_entry(event, command)?
-                    } else {
-                        hook_entry(command)
-                    };
-                    hooks.insert(event.clone(), Value::Array(vec![entry]));
-                }
+            if !enable && !hooks.contains_key(event) {
                 continue;
-            };
-            let entries = entries.as_array_mut().ok_or_else(|| {
-                anyhow::anyhow!(
+            }
+            let entries = hooks
+                .entry(event.clone())
+                .or_insert_with(|| CursorHookEntries::Entries(Vec::new()));
+            let CursorHookEntries::Entries(entries) = entries else {
+                anyhow::bail!(
                     "Cursor hook event `{event}` must be an array: {}",
                     path.display()
-                )
-            })?;
-            entries.retain(|entry| {
-                entry.get("command").and_then(Value::as_str) != Some(command.as_str())
-            });
+                );
+            };
+            entries.retain(|entry| entry.command() != Some(command.as_str()));
             if enable {
-                entries.push(if persistent {
-                    capture_hook_entry(event, command)?
+                entries.push(CursorHookEntry::Command(if persistent {
+                    capture_registration(event, command)?
                 } else {
-                    hook_entry(command)
-                });
+                    CursorCommandHook::capture(command.clone(), None)
+                }));
             }
         }
     }
-
     Ok(())
 }
 
@@ -283,7 +257,7 @@ pub(super) fn validate(
     enable: bool,
 ) -> anyhow::Result<()> {
     let path = config_dir.join("hooks.json");
-    let mut config = load_object(&path)?;
+    let mut config = load_json::<CursorHooks>(&path)?;
     apply_specs(&mut config, &path, specs, enable)
 }
 
@@ -293,7 +267,7 @@ pub(super) fn apply(
     enable: bool,
 ) -> anyhow::Result<()> {
     let path = config_dir.join("hooks.json");
-    edit_object(&path, FileAccess::Inherited, |config, _| {
+    edit_json(&path, FileAccess::Inherited, |config, _| {
         apply_specs(config, &path, specs, enable)
     })
 }
@@ -301,7 +275,7 @@ pub(super) fn apply(
 /// Whether every persistent capture entry is registered.
 pub(crate) fn capture_hooks_are_installed_at(config_dir: &Path) -> bool {
     let path = config_dir.join("hooks.json");
-    let Ok(config) = load_object(&path) else {
+    let Ok(config) = load_json::<CursorHooks>(&path) else {
         return false;
     };
     let Ok(specs) = persistent_specs() else {
@@ -335,7 +309,7 @@ impl CursorManagedHooks {
         );
         let specs = specs(&marker, cfg!(windows));
         let path = config_dir.join("hooks.json");
-        edit_object(&path, FileAccess::Inherited, |config, _| {
+        edit_json(&path, FileAccess::Inherited, |config, _| {
             remove_stale_managed_hooks(config, crate::process::process_is_alive);
             apply_specs(config, &path, &specs, true)
         })?;

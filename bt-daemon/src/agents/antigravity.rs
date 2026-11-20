@@ -1,3 +1,4 @@
+pub(crate) mod schema;
 use super::{Agent, Identity, Register, Registrar};
 use std::sync::Arc;
 

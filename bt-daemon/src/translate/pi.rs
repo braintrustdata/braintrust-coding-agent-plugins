@@ -9,6 +9,8 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::request::RequestConfig;
+use crate::agents::usage::PiUsage as Usage;
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
@@ -149,37 +151,6 @@ struct AssistantMessage {
     provider_thinking_level: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct Usage {
-    #[serde(default)]
-    input: i64,
-    #[serde(default)]
-    output: i64,
-    // Pi reports `reasoning` as a subset of `output`, and only for providers
-    // that expose the breakdown.
-    #[serde(default)]
-    reasoning: Option<i64>,
-    #[serde(default)]
-    cache_read: i64,
-    // `cacheWrite1h` is the subset of `cacheWrite` written with 1h retention.
-    #[serde(default)]
-    cache_write: i64,
-    #[serde(default)]
-    cache_write1h: Option<i64>,
-    #[serde(default)]
-    total_tokens: Option<i64>,
-    #[serde(default)]
-    cost: Option<Cost>,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct Cost {
-    #[serde(default)]
-    total: Option<f64>,
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 #[derive(Serialize)]
@@ -197,9 +168,9 @@ enum AssistantContent {
     #[serde(rename = "toolCall")]
     ToolCall {
         #[serde(default)]
-        id: Option<Value>,
+        id: Option<String>,
         #[serde(default)]
-        name: Option<Value>,
+        name: Option<String>,
         #[serde(default)]
         arguments: Option<Value>,
     },
@@ -259,11 +230,11 @@ struct SessionCompact {
 #[derive(Serialize)]
 struct CompactionEntry {
     #[serde(default)]
-    summary: Option<Value>,
+    summary: Option<String>,
     #[serde(default)]
-    tokens_before: Option<Value>,
+    tokens_before: Option<u64>,
     #[serde(default)]
-    timestamp: Option<Value>,
+    timestamp: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -271,29 +242,29 @@ struct CompactionEntry {
 #[derive(Serialize)]
 struct Preparation {
     #[serde(default)]
-    tokens_before: Option<Value>,
+    tokens_before: Option<u64>,
     #[serde(default)]
-    first_kept_entry_id: Option<Value>,
+    first_kept_entry_id: Option<String>,
     #[serde(default)]
-    is_split_turn: Option<Value>,
+    is_split_turn: Option<bool>,
     #[serde(default)]
     messages_to_summarize: Option<Vec<Value>>,
     #[serde(default)]
     turn_prefix_messages: Option<Vec<Value>>,
     #[serde(default)]
-    target_id: Option<Value>,
+    target_id: Option<String>,
     #[serde(default)]
-    old_leaf_id: Option<Value>,
+    old_leaf_id: Option<String>,
     #[serde(default)]
-    common_ancestor_id: Option<Value>,
+    common_ancestor_id: Option<String>,
     #[serde(default)]
     user_wants_summary: Option<bool>,
     #[serde(default)]
-    custom_instructions: Option<Value>,
+    custom_instructions: Option<String>,
     #[serde(default)]
-    replace_instructions: Option<Value>,
+    replace_instructions: Option<bool>,
     #[serde(default)]
-    label: Option<Value>,
+    label: Option<String>,
     #[serde(default)]
     entries_to_summarize: Option<Vec<Value>>,
 }
@@ -303,11 +274,11 @@ struct Preparation {
 #[derive(Serialize)]
 struct BeforeCompact {
     #[serde(default)]
-    reason: Option<Value>,
+    reason: Option<String>,
     #[serde(default)]
-    will_retry: Option<Value>,
+    will_retry: Option<bool>,
     #[serde(default)]
-    custom_instructions: Option<Value>,
+    custom_instructions: Option<String>,
     #[serde(default)]
     preparation: Option<Preparation>,
     #[serde(default)]
@@ -338,7 +309,7 @@ struct PendingLlm {
     start_ms: i64,
     input: Value,
     first_token_ms: Option<i64>,
-    request_config: Map<String, Value>,
+    request_config: RequestConfig,
     selected_model: Option<SelectedModel>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -407,8 +378,9 @@ impl AgentTranslator for PiTranslator {
             }
             "before_provider_request" => {
                 if let Some(call) = self.pending_llms.last_mut() {
-                    call.request_config =
-                        request_config(event.get("payload").unwrap_or(&Value::Null));
+                    call.request_config = serde_json::from_value(Value::Object(request_config(
+                        event.get("payload").unwrap_or(&Value::Null),
+                    )))?;
                 }
             }
             "message_update" => {
@@ -531,7 +503,7 @@ impl PiTranslator {
                 end_ms: Some(ts),
                 input: Some(pending.input),
                 metadata: (!pending.request_config.is_empty())
-                    .then_some(Value::Object(pending.request_config)),
+                    .then(|| json!(pending.request_config)),
                 error: Some(error.into()),
                 ..Default::default()
             }));
@@ -751,7 +723,7 @@ impl PiTranslator {
             start_ms: ts,
             input,
             first_token_ms: None,
-            request_config: Map::new(),
+            request_config: RequestConfig::default(),
             selected_model,
         });
     }
@@ -786,7 +758,7 @@ impl PiTranslator {
                 start_ms: ts,
                 input: json!([]),
                 first_token_ms: None,
-                request_config: Map::new(),
+                request_config: RequestConfig::default(),
                 selected_model: None,
             }
         } else {
@@ -819,17 +791,20 @@ impl PiTranslator {
                     || message.model.as_deref() != Some(&selected.id)
             })
             .map(|selected| format!("{}/{}", selected.provider, selected.id));
-        let mut metadata = pending.request_config;
-        if let Value::Object(fields) = without_nulls(json!({
-            "model": model,
-            "provider": message.provider,
-            "api": message.api,
-            "stop_reason": message.stop_reason,
-            "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
-            "provider_thinking_level": message.provider_thinking_level,
-            "selected_model": selected_model,
-            "response_id": message.response_id,
-        })) {
+        let mut metadata = json!(pending.request_config);
+        if let (Value::Object(metadata), Value::Object(fields)) = (
+            &mut metadata,
+            without_nulls(json!({
+                "model": model,
+                "provider": message.provider,
+                "api": message.api,
+                "stop_reason": message.stop_reason,
+                "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
+                "provider_thinking_level": message.provider_thinking_level,
+                "selected_model": selected_model,
+                "response_id": message.response_id,
+            })),
+        ) {
             metadata.extend(fields);
         }
         // Pi prices unknown models at zero, which would override the backend's
@@ -853,7 +828,7 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(pending.input),
             output: Some(json!([output])),
-            metadata: Some(Value::Object(metadata)),
+            metadata: Some(metadata),
             metrics: Some(without_nulls(json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
@@ -1059,29 +1034,31 @@ struct LegacyContinuation {
 }
 
 fn legacy_continuation(payload: &Value) -> Option<LegacyContinuation> {
-    let value = payload.get("legacy_resume")?;
-    let root_span_id = value.get("span")?.as_str()?.to_owned();
-    if root_span_id.is_empty() {
+    #[derive(Deserialize)]
+    struct ResumePayload {
+        legacy_resume: Option<Resume>,
+    }
+    #[derive(Deserialize)]
+    struct Resume {
+        span: String,
+        trace: Option<String>,
+        parent: Option<String>,
+        turns: u32,
+        tools: u32,
+    }
+    let resume = decode::<ResumePayload>(payload)?.legacy_resume?;
+    if resume.span.is_empty() {
         return None;
     }
-    let trace_root_span_id = value
-        .get("trace")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .unwrap_or(&root_span_id)
-        .to_owned();
-    let total_turns = u32::try_from(value.get("turns")?.as_u64()?).ok()?;
-    let total_tool_calls = u32::try_from(value.get("tools")?.as_u64()?).ok()?;
     Some(LegacyContinuation {
-        root_span_id,
-        trace_root_span_id,
-        parent_span_id: value
-            .get("parent")
-            .and_then(Value::as_str)
+        trace_root_span_id: resume
+            .trace
             .filter(|id| !id.is_empty())
-            .map(str::to_owned),
-        total_turns,
-        total_tool_calls,
+            .unwrap_or_else(|| resume.span.clone()),
+        root_span_id: resume.span,
+        parent_span_id: resume.parent.filter(|id| !id.is_empty()),
+        total_turns: resume.turns,
+        total_tool_calls: resume.tools,
     })
 }
 
@@ -1091,8 +1068,8 @@ fn compaction_message(event: &SessionCompact) -> Option<Value> {
     Some(json!({
         "role": "compactionSummary",
         "summary": summary,
-        "tokensBefore": entry.tokens_before.clone().unwrap_or(Value::Null),
-        "timestamp": entry.timestamp.clone().unwrap_or(Value::Null),
+        "tokensBefore": entry.tokens_before,
+        "timestamp": entry.timestamp,
     }))
 }
 
@@ -1102,9 +1079,9 @@ fn compaction_input(event: &BeforeCompact) -> Value {
         "reason": event.reason.clone(),
         "willRetry": event.will_retry.clone(),
         "customInstructions": event.custom_instructions.clone(),
-        "tokensBefore": preparation.and_then(|value| value.tokens_before.clone()),
+        "tokensBefore": preparation.and_then(|value| value.tokens_before),
         "firstKeptEntryId": preparation.and_then(|value| value.first_kept_entry_id.clone()),
-        "isSplitTurn": preparation.and_then(|value| value.is_split_turn.clone()),
+        "isSplitTurn": preparation.and_then(|value| value.is_split_turn),
         "messagesToSummarizeCount": preparation
             .and_then(|value| value.messages_to_summarize.as_ref())
             .map(Vec::len),
@@ -1123,7 +1100,7 @@ fn branch_summary_input(event: &BeforeTree) -> Value {
         "commonAncestorId": preparation.and_then(|value| value.common_ancestor_id.clone()),
         "userWantsSummary": preparation.and_then(|value| value.user_wants_summary),
         "customInstructions": preparation.and_then(|value| value.custom_instructions.clone()),
-        "replaceInstructions": preparation.and_then(|value| value.replace_instructions.clone()),
+        "replaceInstructions": preparation.and_then(|value| value.replace_instructions),
         "label": preparation.and_then(|value| value.label.clone()),
         "entriesToSummarizeCount": preparation
             .and_then(|value| value.entries_to_summarize.as_ref())

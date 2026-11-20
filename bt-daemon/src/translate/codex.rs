@@ -27,7 +27,9 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::usage::SnakeCaseUsage;
 use crate::ids;
+use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -313,10 +315,9 @@ impl AgentTranslator for CodexTranslator {
                 self.main_path.get_or_insert(path.clone());
                 self.ensure_main_scope(&path);
             }
-            let import_through_ms = payload.get("_bt_import_through_ms").and_then(Value::as_i64);
-            let through_bytes = payload
-                .pointer("/_bt_transcript_mirror/through")
-                .and_then(Value::as_u64);
+            let fields = TranscriptPayload::decode(payload)?;
+            let import_through_ms = fields.import_through_ms;
+            let through_bytes = fields.mirror.and_then(|mirror| mirror.through);
             let after = self.deferred_hook(event, agent_id.is_none());
             if self.catch_up_chunk(
                 &path,
@@ -1287,13 +1288,25 @@ impl CodexTranslator {
         let Some(llm) = scope.open_llm.take() else {
             return;
         };
-        let usage = payload.get("info").and_then(|i| i.get("last_token_usage"));
-        let metrics = usage.map(token_metrics).filter(|m| !m.is_empty());
+        #[derive(Deserialize)]
+        struct TokenCount {
+            info: Option<TokenCountInfo>,
+        }
+        #[derive(Deserialize)]
+        struct TokenCountInfo {
+            last_token_usage: Option<SnakeCaseUsage>,
+        }
+        let decoded = decode::<TokenCount>(payload);
+        let usage = decoded
+            .as_ref()
+            .and_then(|event| event.info.as_ref())
+            .and_then(|info| info.last_token_usage.as_ref());
+        let metrics = usage
+            .map(|usage| usage.metrics().with_total())
+            .filter(|metrics| !metrics.is_empty());
         let usage_metadata = if metrics.is_none() {
             Some(json!({
-                "usage_unavailable_reason": if usage
-                    .and_then(Value::as_object)
-                    .is_none_or(Map::is_empty)
+                "usage_unavailable_reason": if usage.is_none_or(SnakeCaseUsage::is_empty)
                 {
                     "codex_token_count_missing_usage"
                 } else {
@@ -1323,7 +1336,7 @@ impl CodexTranslator {
             end_ms: Some(end),
             output,
             metadata: usage_metadata,
-            metrics: metrics.map(Value::Object),
+            metrics: metrics.map(|metrics| json!(metrics)),
             ..Default::default()
         }));
         let _ = ts;
@@ -1678,19 +1691,14 @@ fn is_injected_user_context(text: &str) -> bool {
 }
 
 fn effective_transcript_path(event: &Envelope) -> Option<String> {
-    event
-        .payload
-        .pointer("/_bt_transcript_mirror/mirror")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            if event.event == "SubagentStop" {
-                str_field(&event.payload, "agent_transcript_path")
-            } else {
-                str_field(&event.payload, "transcript_path")
-                    .or_else(|| str_field(&event.payload, "agent_transcript_path"))
-            }
-        })
+    let fields = TranscriptPayload::decode(&event.payload).ok()?;
+    fields.mirror.and_then(|mirror| mirror.mirror).or_else(|| {
+        if event.event == "SubagentStop" {
+            fields.agent_transcript_path
+        } else {
+            fields.transcript_path.or(fields.agent_transcript_path)
+        }
+    })
 }
 
 impl Scope {
@@ -2229,86 +2237,6 @@ fn read_new_lines(
         lines,
         complete: true,
     }
-}
-
-fn token_metrics(usage: &Value) -> Map<String, Value> {
-    const MAP: &[(&str, &str)] = &[
-        ("input_tokens", "prompt_tokens"),
-        ("prompt_tokens", "prompt_tokens"),
-        ("output_tokens", "completion_tokens"),
-        ("completion_tokens", "completion_tokens"),
-        ("total_tokens", "tokens"),
-        ("tokens", "tokens"),
-        ("cached_input_tokens", "prompt_cached_tokens"),
-        ("prompt_cached_tokens", "prompt_cached_tokens"),
-        ("input_tokens_details.cached_tokens", "prompt_cached_tokens"),
-        (
-            "prompt_tokens_details.cached_tokens",
-            "prompt_cached_tokens",
-        ),
-        (
-            "prompt_cache_creation_tokens",
-            "prompt_cache_creation_tokens",
-        ),
-        (
-            "input_tokens_details.cache_creation_tokens",
-            "prompt_cache_creation_tokens",
-        ),
-        (
-            "input_tokens_details.cache_write_tokens",
-            "prompt_cache_creation_tokens",
-        ),
-        (
-            "prompt_tokens_details.cache_creation_tokens",
-            "prompt_cache_creation_tokens",
-        ),
-        (
-            "prompt_tokens_details.cache_write_tokens",
-            "prompt_cache_creation_tokens",
-        ),
-        ("reasoning_output_tokens", "completion_reasoning_tokens"),
-        ("completion_reasoning_tokens", "completion_reasoning_tokens"),
-        ("reasoning_tokens", "completion_reasoning_tokens"),
-        (
-            "output_tokens_details.reasoning_tokens",
-            "completion_reasoning_tokens",
-        ),
-        (
-            "completion_tokens_details.reasoning_tokens",
-            "completion_reasoning_tokens",
-        ),
-        ("cost", "cost"),
-        ("cost", "estimated_cost"),
-        ("estimated_cost", "estimated_cost"),
-        ("total_cost", "estimated_cost"),
-        ("cost_usd", "estimated_cost"),
-    ];
-    let mut metrics = Map::new();
-    for (from, to) in MAP {
-        if metrics.contains_key(*to) {
-            continue;
-        }
-        if let Some(v) = num_at(usage, from) {
-            metrics.insert((*to).to_string(), json!(v));
-        }
-    }
-    if !metrics.contains_key("tokens") {
-        if let (Some(p), Some(c)) = (
-            metrics.get("prompt_tokens").and_then(Value::as_f64),
-            metrics.get("completion_tokens").and_then(Value::as_f64),
-        ) {
-            metrics.insert("tokens".to_string(), json!(p + c));
-        }
-    }
-    metrics
-}
-
-fn num_at(v: &Value, path: &str) -> Option<f64> {
-    let mut cur = v;
-    for part in path.split('.') {
-        cur = cur.get(part)?;
-    }
-    cur.as_f64().filter(|n| n.is_finite())
 }
 
 #[cfg(test)]

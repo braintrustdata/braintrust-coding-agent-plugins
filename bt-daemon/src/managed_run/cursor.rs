@@ -6,6 +6,7 @@ use super::{
     managed_hook_shell_command, quote_unix_shell_arg, quote_windows_command_arg, Injection,
     ManagedRun, Terminal,
 };
+use crate::agents::schema::{CursorCommandHook, HookFile};
 use crate::agents::Cursor;
 use crate::args::RunHookCommand;
 use crate::paths;
@@ -72,12 +73,10 @@ const CURSOR_HOOKS_MANIFEST: &str = include_str!(concat!(
     "/../src/plugins/cursor/content/hooks/hooks.json"
 ));
 
+#[cfg(test)]
 pub(super) fn cursor_hook_events() -> anyhow::Result<Vec<String>> {
-    let manifest: serde_json::Value = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
-    manifest["hooks"]
-        .as_object()
-        .map(|hooks| hooks.keys().cloned().collect())
-        .ok_or_else(|| anyhow::anyhow!("Cursor hook manifest has no hooks object"))
+    let manifest: HookFile<CursorCommandHook> = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
+    Ok(manifest.hooks.into_keys().collect())
 }
 
 /// Build a private plugin that Cursor loads only for the managed invocation.
@@ -108,10 +107,11 @@ fn write_cursor_managed_plugin_for_platform(
         }))?,
     )?;
     let script_path = hook_dir.join(if windows { "trace.ps1" } else { "trace.sh" });
-    let source_manifest: serde_json::Value = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
-    let hooks = cursor_hook_events()?
-        .iter()
-        .map(|event| {
+    let source_manifest: HookFile<CursorCommandHook> = serde_json::from_str(CURSOR_HOOKS_MANIFEST)?;
+    let hooks = source_manifest
+        .hooks
+        .into_iter()
+        .map(|(event, entries)| {
             let command = if windows {
                 format!(
                     "powershell.exe -NoProfile -ExecutionPolicy Bypass -File {} {event}",
@@ -120,20 +120,17 @@ fn write_cursor_managed_plugin_for_platform(
             } else {
                 format!("\"${{CURSOR_PLUGIN_ROOT}}/hooks/trace.sh\" {event}")
             };
-            let mut registration = serde_json::json!({
-                "command": command,
-                "timeout": 10,
-                "failClosed": false
-            });
-            if let Some(matcher) = source_manifest["hooks"][event][0]["matcher"].as_str() {
-                registration["matcher"] = serde_json::json!(matcher);
-            }
-            (event.clone(), serde_json::json!([registration]))
+            let matcher = entries.first().and_then(|entry| entry.matcher.clone());
+            (event, vec![CursorCommandHook::capture(command, matcher)])
         })
-        .collect::<serde_json::Map<_, _>>();
+        .collect();
     std::fs::write(
         hook_dir.join("hooks.json"),
-        serde_json::to_vec(&serde_json::json!({ "version": 1, "hooks": hooks }))?,
+        serde_json::to_vec(&HookFile {
+            hooks,
+            version: crate::json::Field::Value(1),
+            extra: Default::default(),
+        })?,
     )?;
 
     if windows {

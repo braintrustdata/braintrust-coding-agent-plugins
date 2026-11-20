@@ -20,6 +20,101 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
+/// Journaled transcript reference. An empty object records captured absence.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Reference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through: Option<u64>,
+}
+
+impl Reference {
+    pub fn captured(path: &str, mirror: &Path, through: u64) -> Self {
+        Self {
+            path: Some(path.to_owned()),
+            mirror: Some(mirror.to_string_lossy().into_owned()),
+            through: Some(through),
+        }
+    }
+    pub fn read_path(&self) -> Option<&str> {
+        self.mirror.as_deref().or(self.path.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GrokReferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Reference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<Reference>,
+}
+
+impl GrokReferences {
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_none() && self.events.is_none() && self.system_prompt.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Observation {
+    pub path: Option<String>,
+    pub observed_bytes: Option<u64>,
+    pub full_path: Option<String>,
+    pub full_observed_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct Snapshot {
+    pub path: String,
+    pub contents: String,
+}
+
+/// Decode the known capture protocol once at the envelope boundary. Native
+/// agent data remains in the raw journal and is decoded by its own translator.
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct TranscriptPayload {
+    #[serde(default, alias = "transcriptPath")]
+    pub transcript_path: Option<String>,
+    pub agent_transcript_path: Option<String>,
+    pub agent_id: Option<String>,
+    #[serde(rename = "_bt_claude_children")]
+    pub claude_children: Option<std::collections::BTreeMap<String, ClaudeChildReference>>,
+    pub cwd: Option<String>,
+    #[serde(rename = "_bt_transcript_mirror")]
+    pub mirror: Option<Reference>,
+    #[serde(rename = "_bt_claude_transcript_mirrors")]
+    pub claude_mirrors: Option<std::collections::BTreeMap<String, Reference>>,
+    #[serde(rename = "_bt_grok_transcript_mirrors")]
+    pub grok_mirrors: Option<GrokReferences>,
+    #[serde(rename = "_bt_transcript_observation")]
+    pub observation: Option<Observation>,
+    #[serde(rename = "_bt_transcript_snapshot")]
+    pub snapshot: Option<Snapshot>,
+    #[serde(rename = "_bt_transcript_replay")]
+    pub replay: Option<bool>,
+    #[serde(rename = "_bt_import_through_offset")]
+    pub import_through_offset: Option<u64>,
+    #[serde(rename = "_bt_import_through_ms")]
+    pub import_through_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ClaudeChildReference {
+    pub path: String,
+    pub through: Option<u64>,
+}
+
+impl TranscriptPayload {
+    pub fn decode(payload: &serde_json::Value) -> serde_json::Result<Self> {
+        serde::Deserialize::deserialize(payload)
+    }
+}
+
 /// Namespace for mirror file names (distinct from the span-id namespace).
 const NAMESPACE: Uuid = Uuid::from_u128(0x3d51_9a02_7c64_4b8f_9e17_a2c5_0d63_88f1);
 

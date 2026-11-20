@@ -1,7 +1,7 @@
 //! Authored Braintrust row shapes. Serialization into SpanRow is the final JSON
 //! boundary; lifecycle and metric policy never navigate these JSON values.
-use super::field::Field;
 use super::hooks::*;
+use crate::json::Field;
 use serde::Serialize;
 use serde_json::Value;
 

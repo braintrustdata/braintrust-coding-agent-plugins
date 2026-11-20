@@ -3,12 +3,14 @@
 //! written after the session's last hook are still translated.
 
 use super::*;
+use crate::transcript_mirror::TranscriptPayload;
 
 #[derive(Clone)]
 pub(super) struct ClaudeTranscriptObservation {
     /// Synthetic-event provenance only: never retain native prompts or responses.
     pub(super) template: Envelope,
     pub(super) through: Option<u64>,
+    pub(super) path: String,
     pub(super) children: HashMap<String, ClaudeChildObservation>,
 }
 
@@ -16,37 +18,50 @@ pub(super) struct ClaudeTranscriptObservation {
 pub(super) struct ClaudeChildObservation {
     pub(super) template: Envelope,
     pub(super) through: Option<u64>,
+    pub(super) path: String,
 }
 
 impl Daemon {
     pub(super) fn remember_claude_transcripts(&self, env: &Envelope) {
-        if env.source != "claude-code" || env.payload.get("_bt_import_through_offset").is_some() {
+        if env.source != "claude-code" {
+            return;
+        }
+        let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+            return;
+        };
+        if fields.import_through_offset.is_some() {
             return;
         }
         let Some(route) = env.route.as_ref() else {
             return;
         };
-        let Some(path) = env.payload.get("transcript_path").and_then(Value::as_str) else {
+        let Some(path) = fields.transcript_path.as_deref() else {
             return;
         };
         let Ok(key) = DeliveryKey::new(&env.source, &env.session_id, route) else {
             return;
         };
-        let through = env
-            .payload
-            .get("_bt_claude_transcript_mirrors")
+        let through = fields
+            .claude_mirrors
+            .as_ref()
             .and_then(|mirrors| mirrors.get(path))
             .or_else(|| {
-                env.payload
-                    .get("_bt_transcript_mirror")
-                    .filter(|mirror| mirror.get("path").and_then(Value::as_str) == Some(path))
+                fields
+                    .mirror
+                    .as_ref()
+                    .filter(|mirror| mirror.path.as_deref() == Some(path))
             })
-            .and_then(|mirror| mirror.get("through"))
-            .and_then(Value::as_u64);
-        let mut payload = serde_json::json!({"transcript_path": path});
-        if let Some(cwd) = env.payload.get("cwd").and_then(Value::as_str) {
-            payload["cwd"] = Value::String(cwd.to_string());
+            .and_then(|mirror| mirror.through);
+        #[derive(serde::Serialize)]
+        struct PollPayload<'a> {
+            transcript_path: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cwd: Option<&'a str>,
         }
+        let payload = serde_json::json!(PollPayload {
+            transcript_path: path,
+            cwd: fields.cwd.as_deref()
+        });
         let template = Envelope {
             source: env.source.clone(),
             source_version: env.source_version.clone(),
@@ -64,63 +79,47 @@ impl Daemon {
         let old = observations.remove(&key);
         let previous = old
             .as_ref()
-            .filter(|observation| {
-                observation
-                    .template
-                    .payload
-                    .get("transcript_path")
-                    .and_then(Value::as_str)
-                    == Some(path)
-            })
+            .filter(|observation| observation.path == path)
             .and_then(|observation| observation.through);
         let mut children = old
             .map(|observation| observation.children)
             .unwrap_or_default();
-        if let Some(saved) = env
-            .payload
-            .get("_bt_claude_children")
-            .and_then(Value::as_object)
-        {
+        if let Some(saved) = fields.claude_children.as_ref() {
             for (agent_id, observation) in saved {
-                let Some(child_path) = observation.get("path").and_then(Value::as_str) else {
-                    continue;
-                };
+                let child_path = &observation.path;
                 let mut child_template = template.clone();
-                child_template.payload["agent_id"] = Value::String(agent_id.clone());
-                child_template.payload["agent_transcript_path"] =
-                    Value::String(child_path.to_string());
+                child_template.payload["agent_id"] = serde_json::json!(agent_id);
+                child_template.payload["agent_transcript_path"] = serde_json::json!(child_path);
                 children.insert(
                     agent_id.clone(),
                     ClaudeChildObservation {
                         template: child_template,
-                        through: observation.get("through").and_then(Value::as_u64),
+                        through: observation.through,
+                        path: child_path.clone(),
                     },
                 );
             }
         }
         if matches!(env.event.as_str(), "SubagentStop" | "TranscriptUpdate") {
             if let (Some(agent_id), Some(child_path)) = (
-                env.payload.get("agent_id").and_then(Value::as_str),
-                env.payload
-                    .get("agent_transcript_path")
-                    .and_then(Value::as_str),
+                fields.agent_id.as_deref(),
+                fields.agent_transcript_path.as_deref(),
             ) {
-                let child_through = env
-                    .payload
-                    .get("_bt_claude_transcript_mirrors")
+                let child_through = fields
+                    .claude_mirrors
+                    .as_ref()
                     .and_then(|mirrors| mirrors.get(child_path))
-                    .and_then(|mirror| mirror.get("through"))
-                    .and_then(Value::as_u64);
+                    .and_then(|mirror| mirror.through);
                 let mut child_template = template.clone();
-                child_template.payload["agent_id"] = Value::String(agent_id.to_string());
-                child_template.payload["agent_transcript_path"] =
-                    Value::String(child_path.to_string());
+                child_template.payload["agent_id"] = serde_json::json!(agent_id);
+                child_template.payload["agent_transcript_path"] = serde_json::json!(child_path);
                 let previous = children.get(agent_id).and_then(|child| child.through);
                 children.insert(
                     agent_id.to_string(),
                     ClaudeChildObservation {
                         template: child_template,
                         through: child_through.or(previous),
+                        path: child_path.to_owned(),
                     },
                 );
             }
@@ -129,6 +128,7 @@ impl Daemon {
             key,
             ClaudeTranscriptObservation {
                 template,
+                path: path.to_owned(),
                 through: through.or(previous),
                 children,
             },
@@ -172,22 +172,14 @@ impl Daemon {
             let Some(observation) = observation else {
                 continue;
             };
-            let mut targets = vec![(observation.template, observation.through, "transcript_path")];
+            let mut targets = vec![(observation.template, observation.through, observation.path)];
             targets.extend(
                 observation
                     .children
                     .into_values()
-                    .map(|child| (child.template, child.through, "agent_transcript_path")),
+                    .map(|child| (child.template, child.through, child.path)),
             );
-            for (mut env, previous, field) in targets {
-                let Some(path) = env
-                    .payload
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                else {
-                    continue;
-                };
+            for (mut env, previous, path) in targets {
                 let Ok(metadata) = tokio::fs::metadata(&path).await else {
                     continue;
                 };
@@ -196,12 +188,9 @@ impl Daemon {
                 }
                 env.ts_ms = now_ms();
                 hydrate_transcript_reference(&self.data_dir, &mut env).await;
-                let through = env
-                    .payload
-                    .get("_bt_claude_transcript_mirrors")
-                    .and_then(|mirrors| mirrors.get(&path))
-                    .and_then(|mirror| mirror.get("through"))
-                    .and_then(Value::as_u64);
+                let through = TranscriptPayload::decode(&env.payload)
+                    .ok()
+                    .and_then(|fields| fields.claude_mirrors?.get(&path)?.through);
                 if through.is_none() || through == previous {
                     continue;
                 }

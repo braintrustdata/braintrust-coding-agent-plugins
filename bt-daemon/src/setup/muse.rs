@@ -3,11 +3,11 @@
 use super::common::{write_json_atomic_unlocked, CommandRunner, FileAccess};
 use super::Setup;
 use crate::agents::Muse;
+use crate::json::Field;
 use crate::muse::config::{
     inspect_hook_file, HookFileInspection, HookOverlay, MuseSettings,
     HOOK_COMMAND as MUSE_HOOK_COMMAND,
 };
-use crate::muse::field::Field;
 use crate::paths;
 use anyhow::{bail, Context};
 use fs2::FileExt;

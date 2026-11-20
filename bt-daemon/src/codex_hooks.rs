@@ -1,8 +1,11 @@
 //! Inspect and activate Braintrust hooks through Codex's app-server protocol.
 //! Trust writes use the same exact-definition config API as Codex's /hooks UI.
 
+use crate::agents::schema::{HookFile, HookGroup};
 use anyhow::{anyhow, Context};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,6 +33,59 @@ const PLUGIN_EVENTS: &[&str] = &[
     "interrupt",
     "sessionEnd",
 ];
+// The app-server transport is JSON; consumers only receive typed results.
+#[derive(Deserialize)]
+struct ConfigRead {
+    config: Config,
+}
+#[derive(Deserialize)]
+struct Config {
+    #[serde(default)]
+    features: BTreeMap<String, bool>,
+}
+#[derive(Deserialize)]
+struct PluginList {
+    marketplaces: Vec<PluginMarketplace>,
+}
+#[derive(Deserialize)]
+struct PluginMarketplace {
+    plugins: Vec<Plugin>,
+}
+#[derive(Deserialize)]
+struct Plugin {
+    id: String,
+    installed: bool,
+    enabled: bool,
+}
+#[derive(Debug, Deserialize)]
+struct HooksList {
+    data: Vec<HookEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct HookEntry {
+    errors: Option<Vec<Value>>,
+    hooks: Vec<Hook>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Hook {
+    plugin_id: Option<String>,
+    event_name: Option<String>,
+    handler_type: Option<String>,
+    command: Option<String>,
+    enabled: Option<bool>,
+    is_managed: Option<bool>,
+    source: Option<String>,
+    source_path: Option<String>,
+    trust_status: Option<String>,
+    key: Option<String>,
+    current_hash: Option<String>,
+}
+#[derive(Serialize)]
+struct TrustState<'a> {
+    trusted_hash: &'a str,
+}
+
 pub(crate) async fn activate() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let mut command: tokio::process::Command =
@@ -49,12 +105,12 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
             let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
             let stdout = child.stdout.take().context("Codex stdout unavailable")?;
             let mut stdout = BufReader::new(stdout.take(8 * 1024 * 1024));
-            request(&mut stdin, &mut stdout, 1, "initialize", json!({
+            request::<Value>(&mut stdin, &mut stdout, 1, "initialize", json!({
             "clientInfo":{"name":"braintrust_trace_setup","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"experimentalApi":true}
         })).await?;
             stdin.write_all(b"{\"method\":\"initialized\"}\n").await?;
-            let config = request(
+            let config: ConfigRead = request(
                 &mut stdin,
                 &mut stdout,
                 2,
@@ -62,12 +118,13 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
                 json!({"includeLayers":false}),
             )
             .await?;
-            let features = &config["config"]["features"];
+            let features = &config.config.features;
             anyhow::ensure!(
-                features["hooks"] != false && features["codex_hooks"] != false,
+                features.get("hooks") != Some(&false)
+                    && features.get("codex_hooks") != Some(&false),
                 "Codex hooks are disabled in config; enable hooks and retry setup"
             );
-            let plugins = request(
+            let plugins: PluginList = request(
                 &mut stdin,
                 &mut stdout,
                 3,
@@ -77,22 +134,16 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
                 }),
             )
             .await?;
-            let installed = plugins["marketplaces"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|marketplace| marketplace["plugins"].as_array())
-                .flatten()
-                .any(|plugin| {
-                    plugin["id"] == PLUGIN
-                        && plugin["installed"] == true
-                        && plugin["enabled"] == true
-                });
+            let installed = plugins
+                .marketplaces
+                .iter()
+                .flat_map(|marketplace| &marketplace.plugins)
+                .any(|plugin| plugin.id == PLUGIN && plugin.installed && plugin.enabled);
             anyhow::ensure!(
                 installed,
                 "Codex tracing plugin is not installed and enabled; rerun `bt trace install codex`"
             );
-            let hooks = request(
+            let hooks: HooksList = request(
                 &mut stdin,
                 &mut stdout,
                 4,
@@ -102,7 +153,7 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
             .await?;
             let edits = trust_edits(&hooks)?;
             if !edits.is_empty() {
-                request(
+                request::<Value>(
                     &mut stdin,
                     &mut stdout,
                     5,
@@ -114,7 +165,7 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
                 )
                 .await?;
             }
-            let hooks = request(
+            let hooks: HooksList = request(
                 &mut stdin,
                 &mut stdout,
                 6,
@@ -163,12 +214,12 @@ pub(crate) async fn run_trust_override(
             let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
             let stdout = child.stdout.take().context("Codex stdout unavailable")?;
             let mut stdout = BufReader::new(stdout.take(8 * 1024 * 1024));
-            request(&mut stdin, &mut stdout, 1, "initialize", json!({
+            request::<Value>(&mut stdin, &mut stdout, 1, "initialize", json!({
             "clientInfo":{"name":"braintrust_trace_run","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"experimentalApi":true}
         })).await?;
             stdin.write_all(b"{\"method\":\"initialized\"}\n").await?;
-            let hooks = request(
+            let hooks: HooksList = request(
                 &mut stdin,
                 &mut stdout,
                 2,
@@ -189,34 +240,28 @@ pub(crate) async fn run_trust_override(
 }
 
 fn managed_run_trust_state(
-    hooks: &Value,
+    hooks: &HooksList,
     expected_command: &str,
 ) -> anyhow::Result<std::ffi::OsString> {
-    let expected: Value = serde_json::from_str(PACKAGED_HOOKS)?;
-    let expected_events: std::collections::HashSet<String> = expected["hooks"]
-        .as_object()
-        .context("packaged hooks missing")?
+    let expected: HookFile<HookGroup> = serde_json::from_str(PACKAGED_HOOKS)?;
+    let expected_events: std::collections::HashSet<String> = expected
+        .hooks
         .keys()
         .map(|event| format!("{}{}", event[..1].to_ascii_lowercase(), &event[1..]))
         .collect();
-    let entries = hooks["data"]
-        .as_array()
-        .context("hooks/list has no data array")?;
+    let entries = &hooks.data;
     let mut seen = std::collections::HashSet::new();
     let mut trust = std::collections::BTreeMap::new();
     for entry in entries {
         anyhow::ensure!(
-            entry["errors"].as_array().is_some_and(Vec::is_empty),
+            entry.errors.as_ref().is_some_and(Vec::is_empty),
             "Codex reported hook errors during managed-run setup"
         );
-        for hook in entry["hooks"]
-            .as_array()
-            .context("hooks/list entry has no hooks array")?
-        {
-            if hook["source"] != "sessionFlags" {
+        for hook in &entry.hooks {
+            if hook.source.as_deref() != Some("sessionFlags") {
                 continue;
             }
-            let Some(event) = hook["eventName"].as_str() else {
+            let Some(event) = hook.event_name.as_deref() else {
                 continue;
             };
             if !expected_events.contains(event) {
@@ -224,25 +269,27 @@ fn managed_run_trust_state(
             }
             anyhow::ensure!(
                 seen.insert(event.to_owned())
-                    && hook["handlerType"] == "command"
-                    && hook["command"] == expected_command
-                    && hook["enabled"] == true
-                    && hook["isManaged"] == false,
+                    && hook.handler_type.as_deref() == Some("command")
+                    && hook.command.as_deref() == Some(expected_command)
+                    && hook.enabled == Some(true)
+                    && hook.is_managed == Some(false),
                 "Codex changed a Braintrust hook while preparing this run"
             );
             anyhow::ensure!(
                 matches!(
-                    hook["trustStatus"].as_str(),
+                    hook.trust_status.as_deref(),
                     Some("trusted" | "untrusted" | "modified")
                 ),
                 "Codex reported an unsupported trust state for a managed Braintrust hook"
             );
-            let key = hook["key"]
-                .as_str()
+            let key = hook
+                .key
+                .as_deref()
                 .filter(|value| !value.is_empty())
                 .context("Codex omitted a managed Braintrust hook key")?;
-            let hash = hook["currentHash"]
-                .as_str()
+            let hash = hook
+                .current_hash
+                .as_deref()
                 .filter(|value| !value.is_empty())
                 .context("Codex omitted a managed Braintrust hook hash")?;
             anyhow::ensure!(
@@ -273,35 +320,32 @@ fn managed_run_trust_state(
 
 /// Validate the complete installed file, including the other platform's command,
 /// before approving exact hashes returned by Codex. Never infer hashes or keys.
-fn trust_edits(hooks: &Value) -> anyhow::Result<serde_json::Map<String, Value>> {
+fn trust_edits(hooks: &HooksList) -> anyhow::Result<BTreeMap<String, TrustState<'_>>> {
+    // Full-file equality is an encoding-boundary check: absent and null
+    // fields must remain distinct before trusting Codex's exact hashes.
     let expected: Value = serde_json::from_str(PACKAGED_HOOKS)?;
     let mut checked_paths = std::collections::HashSet::new();
     let mut events = std::collections::HashSet::new();
-    let mut edits = serde_json::Map::new();
-    for entry in hooks["data"]
-        .as_array()
-        .context("hooks/list has no data array")?
-    {
-        for hook in entry["hooks"]
-            .as_array()
-            .context("hooks/list entry has no hooks array")?
-        {
-            if hook["pluginId"].as_str() != Some(PLUGIN) {
+    let mut edits = BTreeMap::new();
+    for entry in &hooks.data {
+        for hook in &entry.hooks {
+            if hook.plugin_id.as_deref() != Some(PLUGIN) {
                 continue;
             }
-            let event = hook["eventName"].as_str().context("hook event missing")?;
+            let event = hook.event_name.as_deref().context("hook event missing")?;
             anyhow::ensure!(
                 PLUGIN_EVENTS.contains(&event)
                     && events.insert(event)
-                    && hook["handlerType"] == "command"
-                    && hook["command"] == "bt trace hook --source codex"
-                    && hook["enabled"] == true
-                    && hook["isManaged"] == false
-                    && hook["source"] == "plugin",
+                    && hook.handler_type.as_deref() == Some("command")
+                    && hook.command.as_deref() == Some("bt trace hook --source codex")
+                    && hook.enabled == Some(true)
+                    && hook.is_managed == Some(false)
+                    && hook.source.as_deref() == Some("plugin"),
                 "Unexpected or disabled Braintrust hook definition; inspect /hooks"
             );
-            let path = hook["sourcePath"]
-                .as_str()
+            let path = hook
+                .source_path
+                .as_deref()
                 .context("hook source path missing")?;
             anyhow::ensure!(
                 Path::new(path).is_absolute(),
@@ -312,24 +356,27 @@ fn trust_edits(hooks: &Value) -> anyhow::Result<serde_json::Map<String, Value>> 
                 anyhow::ensure!(installed == expected,
                     "Installed Braintrust hooks differ from this bt version; update bt and retry setup");
             }
-            if hook["trustStatus"] == "trusted" {
+            if hook.trust_status.as_deref() == Some("trusted") {
                 continue;
             }
             anyhow::ensure!(
-                hook["trustStatus"] == "untrusted" || hook["trustStatus"] == "modified",
+                hook.trust_status.as_deref() == Some("untrusted")
+                    || hook.trust_status.as_deref() == Some("modified"),
                 "Unknown Braintrust hook trust state"
             );
-            let key = hook["key"]
-                .as_str()
+            let key = hook
+                .key
+                .as_deref()
                 .filter(|s| !s.is_empty())
                 .context("hook key missing")?;
-            let hash = hook["currentHash"]
-                .as_str()
+            let hash = hook
+                .current_hash
+                .as_deref()
                 .filter(|s| !s.is_empty())
                 .context("hook hash missing")?;
             anyhow::ensure!(
                 edits
-                    .insert(key.to_owned(), json!({"trusted_hash":hash}))
+                    .insert(key.to_owned(), TrustState { trusted_hash: hash })
                     .is_none(),
                 "Duplicate Braintrust hook key"
             );
@@ -342,13 +389,13 @@ fn trust_edits(hooks: &Value) -> anyhow::Result<serde_json::Map<String, Value>> 
     Ok(edits)
 }
 
-async fn request(
+async fn request<T: DeserializeOwned>(
     stdin: &mut (impl AsyncWrite + Unpin),
     stdout: &mut (impl AsyncBufRead + Unpin),
     id: u64,
     method: &str,
     params: Value,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<T> {
     let mut encoded = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
     encoded.push(b'\n');
     stdin.write_all(&encoded).await?;
@@ -359,23 +406,32 @@ async fn request(
             stdout.read_line(&mut line).await? != 0,
             "Codex closed the probe stream"
         );
-        let response: Value = serde_json::from_str(&line).context("invalid Codex response")?;
-        if response.get("id") != Some(&json!(id)) {
+        #[derive(Deserialize)]
+        struct Response {
+            id: Option<Value>,
+            error: Option<RpcError>,
+            #[serde(
+                default,
+                deserialize_with = "crate::agents::schema::deserialize_present"
+            )]
+            result: Option<Box<serde_json::value::RawValue>>,
+        }
+        #[derive(Deserialize)]
+        struct RpcError {
+            message: Option<String>,
+        }
+        let response: Response = serde_json::from_str(&line).context("invalid Codex response")?;
+        if response.id != Some(json!(id)) {
             continue;
         }
-        if let Some(error) = response.get("error") {
+        if let Some(error) = response.error {
             return Err(anyhow!(
                 "{method}: {}",
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("request failed")
+                error.message.as_deref().unwrap_or("request failed")
             ));
         }
-        return response
-            .get("result")
-            .cloned()
-            .context("Codex response has no result");
+        let result = response.result.context("Codex response has no result")?;
+        return serde_json::from_str(result.get()).context("invalid Codex result");
     }
 }
 
@@ -402,12 +458,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_distinguishes_null_results_from_missing_results() {
+        let mut input = Vec::new();
+        let mut output = std::io::Cursor::new(b"{\"id\":1,\"result\":null}\n");
+        assert_eq!(
+            request::<Value>(&mut input, &mut output, 1, "initialize", json!({}))
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        let mut output = std::io::Cursor::new(b"{\"id\":1}\n");
+        assert!(
+            request::<Value>(&mut input, &mut output, 1, "initialize", json!({}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no result")
+        );
+    }
+
+    #[tokio::test]
     async fn rpc_ignores_notifications_and_reports_unsupported_methods() {
         let mut input = Vec::new();
         let mut output = std::io::Cursor::new(
             b"{\"method\":\"notice\"}\n{\"id\":3,\"error\":{\"message\":\"Method not found\"}}\n",
         );
-        let error = request(&mut input, &mut output, 3, "hooks/list", json!({}))
+        let error = request::<Value>(&mut input, &mut output, 3, "hooks/list", json!({}))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Method not found"));

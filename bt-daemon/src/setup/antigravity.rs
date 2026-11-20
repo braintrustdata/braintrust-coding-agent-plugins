@@ -5,6 +5,7 @@ use crate::agents::Antigravity;
 use crate::paths;
 use crate::setup::Setup;
 use anyhow::bail;
+#[cfg(test)]
 use serde_json::Value;
 use std::path::Path;
 
@@ -68,15 +69,17 @@ fn disable_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Resu
 
 fn update_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Result<()> {
     let home = home(config_dir)?;
-    let plugins = runner.json_in_home("agy", &["plugin", "list"], home)?;
-    let installed = plugins
-        .get("imports")
-        .and_then(Value::as_array)
-        .is_some_and(|imports| {
-            imports
-                .iter()
-                .any(|plugin| plugin.get("name").and_then(Value::as_str) == Some(PLUGIN))
-        });
+    #[derive(serde::Deserialize)]
+    struct PluginList {
+        imports: Vec<Plugin>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Plugin {
+        name: String,
+    }
+    let plugins: PluginList =
+        serde_json::from_value(runner.json_in_home("agy", &["plugin", "list"], home)?)?;
+    let installed = plugins.imports.iter().any(|plugin| plugin.name == PLUGIN);
     if !installed {
         bail!(
             "Google Antigravity tracing plugin is not installed; run `bt trace install antigravity`"

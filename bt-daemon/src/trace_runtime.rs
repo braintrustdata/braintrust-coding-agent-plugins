@@ -1705,6 +1705,7 @@ mod tests {
         let settings = crate::settings::AgentSettings {
             trace_to_braintrust: Some(true),
             route: None,
+            ..Default::default()
         };
         let error = run_hook_command(hook_args(), &host, settings)
             .await
@@ -1743,6 +1744,7 @@ mod tests {
         let settings = crate::settings::AgentSettings {
             trace_to_braintrust: Some(true),
             route: None,
+            ..Default::default()
         };
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1758,6 +1760,7 @@ mod tests {
         let settings = crate::settings::AgentSettings {
             trace_to_braintrust: Some(false),
             route: None,
+            ..Default::default()
         };
         run_hook_command(hook_args(), &test_host(Arc::new(PanicHost)), settings)
             .await

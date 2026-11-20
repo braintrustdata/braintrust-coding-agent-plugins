@@ -85,21 +85,24 @@ impl CommandRunner for SystemCommandRunner {
 
 /// An agent marketplace that distributes a Braintrust plugin. Codex and
 /// Claude Code share this flow; they differ in verbs and listing shapes.
-pub(super) struct Marketplace {
+pub(super) struct Marketplace<List, Entry> {
     pub program: &'static str,
     pub name: &'static str,
     pub source: &'static str,
     /// The subcommand that refreshes a configured marketplace.
     pub refresh: &'static str,
     /// Find this marketplace in `<program> plugin marketplace list --json`.
-    pub find: fn(&Value) -> Option<&Value>,
+    pub find: fn(&List) -> Option<&Entry>,
     /// Whether a configured marketplace points at the published source.
-    pub is_published: fn(&Value) -> bool,
+    pub is_published: fn(&Entry) -> bool,
 }
 
-impl Marketplace {
-    fn list(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
-        runner.json(self.program, &["plugin", "marketplace", "list", "--json"])
+impl<List: serde::de::DeserializeOwned, Entry> Marketplace<List, Entry> {
+    fn list(&self, runner: &mut dyn CommandRunner) -> anyhow::Result<List> {
+        Ok(serde_json::from_value(runner.json(
+            self.program,
+            &["plugin", "marketplace", "list", "--json"],
+        )?)?)
     }
 
     /// Configure the published marketplace, refreshing it when it is already
@@ -169,11 +172,8 @@ pub(super) fn github_repo_matches(source: &str, expected: &str) -> bool {
 }
 
 pub(super) fn package_version(manifest: &str) -> anyhow::Result<String> {
-    let manifest = serde_json::from_str::<Value>(manifest)?;
-    manifest
-        .get("version")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    serde_json::from_str::<crate::agents::schema::PluginManifest>(manifest)?
+        .version
         .ok_or_else(|| anyhow::anyhow!("package manifest has no string version"))
 }
 
@@ -204,10 +204,10 @@ pub(super) fn version_is_older(installed: &str, expected: &str) -> bool {
 
 /// Whether the plugin version an agent CLI reports as JSON is older than the
 /// version in `manifest`. Any failure to determine it reports `false`.
-pub(super) fn installed_json_version_is_older(
+pub(super) fn installed_json_version_is_older<List: serde::de::DeserializeOwned>(
     program: &str,
     args: &[&str],
-    find_version: impl Fn(&Value) -> Option<&str>,
+    find_version: impl Fn(&List) -> Option<&str>,
     manifest: &str,
 ) -> bool {
     let Ok(expected) = package_version(manifest) else {
@@ -222,7 +222,7 @@ pub(super) fn installed_json_version_is_older(
     if !output.status.success() {
         return false;
     }
-    serde_json::from_slice::<Value>(&output.stdout)
+    serde_json::from_slice::<List>(&output.stdout)
         .ok()
         .and_then(|value| find_version(&value).map(str::to_owned))
         .is_some_and(|installed| version_is_older(&installed, &expected))
@@ -256,23 +256,48 @@ pub(super) fn edit_object(
     access: FileAccess,
     mut edit: impl FnMut(&mut Map<String, Value>, bool) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    edit_json(path, access, |config, existed| edit(config, existed))
+}
+
+/// Edit a typed agent configuration while preserving its extension fields.
+pub(super) fn edit_json<T>(
+    path: &Path,
+    access: FileAccess,
+    mut edit: impl FnMut(&mut T, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<()>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Default + PartialEq + Clone,
+{
     if !path.exists() {
-        let mut probe = Map::new();
+        let mut probe = T::default();
         edit(&mut probe, false)?;
-        if probe.is_empty() {
+        if probe == T::default() {
             return Ok(());
         }
     }
     crate::settings::with_settings_lock(path, || {
         let existed = path.exists();
-        let mut object = load_object(path)?;
-        let original = object.clone();
-        edit(&mut object, existed)?;
-        if object != original {
-            write_object_atomic_unlocked(path, object, access)?;
+        let mut config = load_json::<T>(path)?;
+        let original = config.clone();
+        edit(&mut config, existed)?;
+        if config != original {
+            write_json_atomic_unlocked(path, &config, access)?;
         }
         Ok(())
     })
+}
+
+pub(super) fn load_json<T: serde::de::DeserializeOwned + Default>(
+    path: &Path,
+) -> anyhow::Result<T> {
+    match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .with_context(|| format!("invalid JSON configuration: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read configuration: {}", path.display()))
+        }
+    }
 }
 
 /// Whether an atomic replacement keeps the directory's inherited access or is
@@ -283,6 +308,7 @@ pub(super) enum FileAccess {
     OwnerOnly,
 }
 
+#[cfg(test)]
 pub(super) fn write_object_atomic_with(
     path: &Path,
     object: Map<String, Value>,
@@ -291,6 +317,7 @@ pub(super) fn write_object_atomic_with(
     crate::settings::with_settings_lock(path, || write_object_atomic_unlocked(path, object, access))
 }
 
+#[cfg(test)]
 pub(super) fn write_object_atomic_unlocked(
     path: &Path,
     object: Map<String, Value>,

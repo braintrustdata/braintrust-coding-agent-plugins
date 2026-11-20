@@ -10,11 +10,13 @@ use super::recent::{RecentMap, RecentSet};
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::cursor::schema::{Role, TranscriptRecord};
+use crate::agents::usage::TokenMetrics;
 use crate::{ids, wire::Envelope};
 use hooks::{
-    CursorHook, Hook, ImportStopHook, PromptHook, ResponseHook, Role, SessionEndHook, Specialized,
+    CursorHook, Hook, ImportStopHook, PromptHook, ResponseHook, SessionEndHook, Specialized,
     StopHook, SubagentStartHook, SubagentStopHook, ToolHook, ToolPhase, TranscriptMirror,
-    TranscriptRecord, TurnUsage,
+    TurnUsage,
 };
 pub(crate) use hooks::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use serde::{Deserialize, Serialize};
@@ -112,46 +114,64 @@ struct Turn {
     boundary: i64,
     model_seq: u64,
     emitted_text: String,
-    usage: serde_json::Map<String, Value>,
+    usage: TokenMetrics,
 }
+#[derive(PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ModelContent {
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Option<Value>,
+    },
+}
+impl ModelContent {
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+    fn encoded_len(&self) -> usize {
+        serde_json::to_vec(self).map_or(0, |encoded| encoded.len())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ModelStep {
     #[serde(with = "super::state::row")]
     row: SpanRow,
-    content: Vec<Value>,
+    content: Vec<ModelContent>,
     text: String,
     bytes: usize,
     truncated: bool,
 }
 impl ModelStep {
-    fn push(&mut self, value: Value) {
-        if let Some(text) = value
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|_| value.get("type").and_then(Value::as_str) == Some("text"))
-        {
-            // afterAgentResponse repeats the concatenation of transcript text
-            // fragments. Retain one authoritative copy of that exact content.
+    fn push(&mut self, value: ModelContent) {
+        if let Some(text) = value.text() {
             if !self.text.is_empty() && self.text == text {
-                self.content
-                    .retain(|v| v.get("type").and_then(Value::as_str) != Some("text"));
+                self.content.retain(|part| part.text().is_none());
                 self.text.clear();
-                self.bytes = self.content.iter().map(|v| v.to_string().len()).sum();
+                self.bytes = self.content.iter().map(ModelContent::encoded_len).sum();
             }
         }
         if self.content.contains(&value) {
             return;
         }
-        let size = value.to_string().len();
+        let size = value.encoded_len();
         if self.bytes + size > MAX_HISTORY_BYTES || self.content.len() >= MAX_HISTORY_MESSAGES {
             self.truncated = true;
             return;
         }
         self.bytes += size;
-        if value.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = value.get("text").and_then(Value::as_str) {
-                self.text.push_str(text);
-            }
+        if let Some(text) = value.text() {
+            self.text.push_str(text);
         }
         self.content.push(value);
     }
@@ -380,7 +400,7 @@ impl CursorTranslator {
             boundary: ts,
             model_seq: 0,
             emitted_text: String::new(),
-            usage: serde_json::Map::new(),
+            usage: TokenMetrics::default(),
         };
         if let Some(g) = generation {
             self.prompt_generations.insert(g.into(), turn.clone());
@@ -528,15 +548,11 @@ impl CursorTranslator {
             metadata["history_truncated"] = json!(true);
         }
     }
-    fn model_content(&mut self, content: Value, ts: i64, ops: &mut Vec<SpanOp>) {
+    fn model_content(&mut self, content: ModelContent, ts: i64, ops: &mut Vec<SpanOp>) {
         if let Some(turn) = self.turn.as_mut().filter(|turn| turn.end.is_some()) {
             // Late output belongs to the closed turn. Its receipt time does
             // not establish another model request or extend model latency.
-            if let Some(text) = content
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|_| content.get("type").and_then(Value::as_str) == Some("text"))
-            {
+            if let Some(text) = content.text() {
                 self.history
                     .push(json!({"role":"assistant","content":text}));
                 self.seen.insert(format!(
@@ -570,20 +586,14 @@ impl CursorTranslator {
             let text = step
                 .content
                 .iter()
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|v| v.get("text").and_then(Value::as_str))
+                .filter_map(ModelContent::text)
                 .collect::<String>();
             if turn.emitted_text.len() + text.len() <= MAX_HISTORY_BYTES {
                 turn.emitted_text.push_str(&text);
             }
         }
         if let Some(owner) = step.row.parent_span_ids.first() {
-            for text in step
-                .content
-                .iter()
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|v| v.get("text").and_then(Value::as_str))
-            {
+            for text in step.content.iter().filter_map(ModelContent::text) {
                 self.seen.insert(format!(
                     "output-text:{owner}:{}",
                     ids::span_id(&self.namespace, text)
@@ -732,7 +742,11 @@ impl CursorTranslator {
                 return;
             }
             self.model_content(
-                json!({"type":"tool_use","id":call_id,"name":tool.row.name,"input":tool.row.input}),
+                ModelContent::ToolUse {
+                    id: call_id.to_owned(),
+                    name: tool.row.name.clone(),
+                    input: tool.row.input.clone(),
+                },
                 e.ts_ms,
                 ops,
             );
@@ -766,12 +780,11 @@ impl CursorTranslator {
                 // Without preToolUse, the duration is the only available
                 // tool-request boundary. Tool execution is not model latency.
                 self.model_content(
-                    json!({
-                        "type":"tool_use",
-                        "id":call_id,
-                        "name":name,
-                        "input":input,
-                    }),
+                    ModelContent::ToolUse {
+                        id: call_id,
+                        name,
+                        input,
+                    },
                     boundary,
                     ops,
                 );
@@ -973,7 +986,8 @@ impl CursorTranslator {
         let (records, truncated, complete) = self.transcript.read_batch(path, through)?;
         self.history.truncated |= truncated;
         for raw in records {
-            let record = TranscriptRecord::decode(&raw)?;
+            let record =
+                super::decode::decode::<TranscriptRecord>("cursor", "transcript record", &raw)?;
             let role = record.role();
             if role == Some(Role::User) {
                 self.transcript.assistant_records = 0;
@@ -1156,7 +1170,7 @@ impl CursorTranslator {
                 {
                     return;
                 }
-                self.model_content(json!({"type":"text","text":text}), ts, ops);
+                self.model_content(ModelContent::Text { text: text.clone() }, ts, ops);
                 if let Some(t) = &mut self.turn {
                     t.output = Some(text);
                 }
@@ -1320,32 +1334,34 @@ impl CursorTranslator {
         else {
             return;
         };
-        let mut metrics = serde_json::Map::new();
-        for (count, metric) in [
-            (usage.input_tokens, "prompt_tokens"),
-            (usage.output_tokens, "completion_tokens"),
-            (usage.cache_read_tokens, "prompt_cached_tokens"),
-            (usage.cache_write_tokens, "prompt_cache_creation_tokens"),
-        ] {
-            if let Some(count) = count {
-                metrics.insert(metric.into(), json!(count));
-            }
-        }
-        if metrics.is_empty() {
+        if usage.input_tokens.is_none()
+            && usage.output_tokens.is_none()
+            && usage.cache_read_tokens.is_none()
+            && usage.cache_write_tokens.is_none()
+        {
             return;
         }
-        // Response and stop can report partial snapshots for the same turn.
-        // Merge known counts rather than fabricating missing values or summing
-        // repeated observations. Cache counts remain subsets of prompt usage.
-        turn.usage.extend(metrics);
+        // Response and stop carry partial snapshots. Replace known fields,
+        // never sum snapshots or fabricate counters missing from both.
+        if let Some(count) = usage.input_tokens {
+            turn.usage.prompt_tokens = Some(count);
+        }
+        if let Some(count) = usage.output_tokens {
+            turn.usage.completion_tokens = Some(count);
+        }
+        if let Some(count) = usage.cache_read_tokens {
+            turn.usage.prompt_cached_tokens = Some(count);
+        }
+        if let Some(count) = usage.cache_write_tokens {
+            turn.usage.prompt_cache_creation_tokens = Some(count);
+        }
         if let Some(total) = turn
             .usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .zip(turn.usage.get("completion_tokens").and_then(Value::as_u64))
+            .prompt_tokens
+            .zip(turn.usage.completion_tokens)
             .and_then(|(prompt, completion)| prompt.checked_add(completion))
         {
-            turn.usage.insert("tokens".into(), json!(total));
+            turn.usage.tokens = Some(total);
         }
         let mut row = self.row(
             turn.id.clone(),
@@ -1353,7 +1369,7 @@ impl CursorTranslator {
             &format!("Turn {}", turn.ordinal),
             SpanType::Task,
         );
-        let metrics = Value::Object(turn.usage.clone());
+        let metrics = json!(turn.usage);
         let metrics_id = ids::span_id(&self.namespace, &metrics.to_string());
         row.metrics = Some(metrics);
         row.metadata = Some(json!({"token_usage_scope":"turn"}));
@@ -1404,7 +1420,13 @@ impl CursorTranslator {
             CursorHook::BeforeSubmitPrompt(prompt) => self.prompt(e, hook, prompt, ops),
             CursorHook::Tool(phase, tool) => self.tool(e, hook, phase, tool, ops),
             CursorHook::AfterAgentThought(thought) => {
-                self.model_content(json!({"type":"thinking","text":thought.text}), e.ts_ms, ops);
+                self.model_content(
+                    ModelContent::Thinking {
+                        text: thought.text.clone(),
+                    },
+                    e.ts_ms,
+                    ops,
+                );
             }
             CursorHook::AfterAgentResponse(response) => {
                 self.response(e, generation, response, &native, ops)
@@ -1460,7 +1482,13 @@ impl CursorTranslator {
                 .and_then(|t| text.strip_prefix(&t.emitted_text))
                 .unwrap_or(text);
             if !unseen.is_empty() {
-                self.model_content(json!({"type":"text","text":unseen}), e.ts_ms, ops);
+                self.model_content(
+                    ModelContent::Text {
+                        text: unseen.to_owned(),
+                    },
+                    e.ts_ms,
+                    ops,
+                );
             }
             if let Some(t) = &mut self.turn {
                 t.output = Some(text.into());
@@ -1652,28 +1680,20 @@ fn user_prompt(text: &str) -> Value {
     json!([{ "role": "user", "content": text }])
 }
 
-fn assistant_message(content: &[Value]) -> Value {
+fn assistant_message(content: &[ModelContent]) -> Value {
     let mut text = String::new();
     let mut reasoning = Vec::new();
     let mut calls = Vec::new();
     for part in content {
-        match part.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(value) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(value);
-                }
+        match part {
+            ModelContent::Text { text: value } => text.push_str(value),
+            ModelContent::Thinking { text: value } => {
+                reasoning.push(json!({"type":"summary_text", "text":value}))
             }
-            Some("thinking") => {
-                if let Some(value) = part.get("text").and_then(Value::as_str) {
-                    reasoning.push(json!({"type":"summary_text", "text":value}));
-                }
-            }
-            Some("tool_use") => calls.push(json!({
-                "id": part.get("id"), "type": "function",
-                "function": {"name": part.get("name"),
-                    "arguments": tool_result_content(part.get("input"))},
+            ModelContent::ToolUse { id, name, input } => calls.push(json!({
+                "id": id, "type": "function",
+                "function": {"name": name, "arguments": tool_result_content(input.as_ref())},
             })),
-            _ => {}
         }
     }
     let mut message = json!({"role":"assistant", "content":text});

@@ -392,11 +392,9 @@ fn plugin_version_from_plugin_root(source: &str) -> Option<String> {
 }
 
 fn plugin_version_from_manifest(path: &std::path::Path) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).ok()?)
+    serde_json::from_slice::<crate::agents::schema::PluginManifest>(&std::fs::read(path).ok()?)
         .ok()?
-        .get("version")?
-        .as_str()
-        .map(str::to_owned)
+        .version
 }
 
 fn now_ms() -> i64 {
