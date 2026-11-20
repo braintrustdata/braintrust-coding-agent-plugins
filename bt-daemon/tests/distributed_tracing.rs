@@ -2281,7 +2281,8 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
     child_events[0].capture.as_mut().unwrap().truncated = true;
     forward(child_events.remove(0), &socket, &host).await;
     // Status is a passive snapshot; capture acknowledgement does not wait
-    // for routing. Observe the eventual session without forcing a flush.
+    // for routing. Wait past the resolved-but-not-dispatched snapshot without
+    // forcing a flush; other errors still reach the assertion below.
     let status = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = run_status(StatusArgs {
@@ -2291,11 +2292,11 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
             .await
             .unwrap()
             .unwrap();
-            if status
-                .sessions
-                .iter()
-                .any(|s| s.session_id == "partial-child")
-            {
+            if status.sessions.iter().any(|s| {
+                s.session_id == "partial-child"
+                    && s.last_error.as_deref()
+                        != Some("correlation resolved; journaled events awaiting delivery")
+            }) {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2310,7 +2311,7 @@ async fn truncated_first_child_capture_stays_standalone_despite_later_evidence()
         .expect("incomplete first capture must be accepted immediately");
     assert!(
         accepted.last_error.is_none(),
-        "incomplete evidence must not defer delivery"
+        "incomplete evidence must not defer delivery: {accepted:?}"
     );
     forward_all(&mut child_events, &socket, &host).await;
     forward(
@@ -3142,29 +3143,35 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
 }
 
 async fn stored_pending_child(data_dir: &Path, session: &str) -> (PathBuf, serde_json::Value) {
-    let mut entries = tokio::fs::read_dir(data_dir.join("correlation"))
-        .await
-        .unwrap();
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        if entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("json")
-        {
-            continue;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(data_dir.join("correlation"))
+                .await
+                .unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                if entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("json")
+                {
+                    continue;
+                }
+                let state: serde_json::Value =
+                    serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
+                if state["events"].as_array().is_some_and(|events| {
+                    events
+                        .iter()
+                        .any(|event| event["env"]["session_id"] == session)
+                }) {
+                    return (entry.path(), state);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let state: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
-        if state["events"].as_array().is_some_and(|events| {
-            events
-                .iter()
-                .any(|event| event["env"]["session_id"] == session)
-        }) {
-            return (entry.path(), state);
-        }
-    }
-    panic!("no persisted pending event for {session}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no persisted pending event for {session}"))
 }
 
 fn test_host() -> HostInfo {
