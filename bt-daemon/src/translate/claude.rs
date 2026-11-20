@@ -750,7 +750,13 @@ impl ClaudeTranslator {
                     .map(|turn| turn.user_turn_id.clone())
                     .unwrap_or_else(|| self.last_user_turn_id.clone()),
             });
-        let parent_id = origin.parent_id.clone();
+        let parent_id = string_field(&event.payload, "_bt_import_parent_agent_id")
+            .and_then(|id| self.subagents.get(&id).map(|agent| agent.span_id.clone()))
+            .or_else(|| {
+                string_field(&event.payload, "_bt_import_parent_tool_id")
+                    .map(|id| ids::span_id(&self.session_id, &format!("tool:{id}")))
+            })
+            .unwrap_or_else(|| origin.parent_id.clone());
         let owner = origin
             .user_turn_id
             .clone()
