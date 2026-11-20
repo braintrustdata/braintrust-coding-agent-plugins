@@ -11,6 +11,7 @@ use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
+use crate::transcript_mirror::{Reference, TranscriptPayload};
 use crate::wire::Envelope;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -26,6 +27,133 @@ const MAX_OPEN_TOOLS: usize = 256;
 const MAX_OUTPUT_CHUNKS: usize = 2_048;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SYSTEM_PROMPT_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct NativeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<NativeParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "type")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp: Option<i64>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct NativeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    update: Option<NativeUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    meta: Option<NativeMeta>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_update: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
+    meta: Option<NativeMeta>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::agents::schema::deserialize_present"
+    )]
+    content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::agents::schema::deserialize_present"
+    )]
+    raw_input: Option<Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::agents::schema::deserialize_present"
+    )]
+    raw_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<NativeUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "prompt_id")]
+    prompt_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "stop_reason"
+    )]
+    stop_reason: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt_index: Option<PromptIndex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_start_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_timestamp_ms: Option<i64>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_read_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_creation_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_duration_ms: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_usd_ticks: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_calls: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::agents::schema::deserialize_present"
+    )]
+    model_usage: Option<Value>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PromptIndex {
+    Text(String),
+    Number(serde_json::Number),
+}
 
 impl TranslatorFactory for crate::agents::Grok {
     fn create(&self, session_id: &str) -> Box<dyn AgentTranslator> {
@@ -183,7 +311,7 @@ impl TranscriptCursor {
 #[derive(Serialize, Deserialize)]
 struct TranscriptRecord {
     end_offset: u64,
-    value: Value,
+    value: NativeRecord,
 }
 #[derive(Serialize, Deserialize)]
 struct TranscriptBatch {
@@ -211,7 +339,7 @@ struct GrokTranslator {
     open_llm: Option<OpenLlm>,
     open_tools: BTreeMap<String, OpenTool>,
     completed_tools: RecentMap<String, CompletedTool>,
-    pending_tool_events: RecentMap<String, Value>,
+    pending_tool_events: RecentMap<String, NativeRecord>,
     emitted_turns: RecentSet<String>,
     emitted_chunks: RecentSet<String>,
     updates: TranscriptCursor,
@@ -387,19 +515,19 @@ impl GrokTranslator {
 
     fn process_update(
         &mut self,
-        record: &Value,
+        record: &NativeRecord,
         record_end_offset: u64,
         event: &Envelope,
         ctx: &SessionCtx,
         ops: &mut Vec<SpanOp>,
     ) {
-        let Some(params) = record.get("params") else {
+        let Some(params) = record.params.as_ref() else {
             return;
         };
-        let Some(update) = params.get("update") else {
+        let Some(update) = params.update.as_ref() else {
             return;
         };
-        let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        let Some(kind) = update.session_update.as_deref() else {
             return;
         };
         let ts_ms = record_ts_ms(record).unwrap_or(event.ts_ms);
@@ -411,7 +539,9 @@ impl GrokTranslator {
             if kind != "user_message_chunk" && self.current_turn.is_none() {
                 return;
             }
-            let serialized = serde_json::to_string(record).unwrap_or_default();
+            let serialized = serde_json::to_value(record)
+                .and_then(|value| serde_json::to_string(&value))
+                .unwrap_or_default();
             let chunk_identity = if kind == "user_message_chunk" {
                 serialized
             } else {
@@ -428,10 +558,7 @@ impl GrokTranslator {
         }
         match kind {
             "user_message_chunk" => {
-                let meta = update
-                    .get("_meta")
-                    .or_else(|| params.get("_meta"))
-                    .and_then(Value::as_object);
+                let meta = update.meta.as_ref().or(params.meta.as_ref());
                 let next_number = self.turn_seq.saturating_add(1);
                 let turn_key = turn_key(meta, next_number);
                 if self
@@ -439,7 +566,7 @@ impl GrokTranslator {
                     .as_ref()
                     .is_some_and(|turn| turn.key == turn_key)
                 {
-                    if let Some(content) = update.get("content") {
+                    if let Some(content) = update.content.as_ref() {
                         let Some(turn) = self.current_turn.as_mut() else {
                             return;
                         };
@@ -456,16 +583,10 @@ impl GrokTranslator {
                 self.ensure_root(ts_ms, event, ctx, ops);
                 self.turn_seq = next_number;
                 let span_id = ids::span_id(&self.session_id, &format!("turn:{turn_key}"));
-                let model = meta
-                    .and_then(|m| m.get("modelId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let prompt_id = meta
-                    .and_then(|m| m.get("promptId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let model = meta.and_then(|m| m.model_id.clone());
+                let prompt_id = meta.and_then(|m| m.prompt_id.clone());
                 let mut user_input = BoundedOutput::default();
-                if let Some(content) = update.get("content") {
+                if let Some(content) = update.content.as_ref() {
                     user_input.push(content_value(content));
                 }
                 let input = user_input.message_content();
@@ -500,17 +621,9 @@ impl GrokTranslator {
                 if self.current_turn.is_none() {
                     return;
                 }
-                let meta = params
-                    .get("_meta")
-                    .or_else(|| update.get("_meta"))
-                    .and_then(Value::as_object);
-                let prompt_id = meta
-                    .and_then(|m| m.get("promptId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let stream_start_ms = meta
-                    .and_then(|m| m.get("streamStartMs"))
-                    .and_then(Value::as_i64);
+                let meta = params.meta.as_ref().or(update.meta.as_ref());
+                let prompt_id = meta.and_then(|m| m.prompt_id.clone());
+                let stream_start_ms = meta.and_then(|m| m.stream_start_ms);
                 let needs_new = self.open_llm.as_ref().is_none_or(|llm| {
                     identities_differ(
                         llm.prompt_id.as_deref(),
@@ -612,7 +725,7 @@ impl GrokTranslator {
                     turn.prompt_id.get_or_insert(prompt_id);
                 }
                 let is_reasoning = kind == "agent_thought_chunk";
-                if let Some(content) = update.get("content") {
+                if let Some(content) = update.content.as_ref() {
                     if let Some(llm) = self.open_llm.as_mut() {
                         llm.last_ms = llm.last_ms.max(ts_ms);
                         if is_reasoning {
@@ -635,7 +748,7 @@ impl GrokTranslator {
                 else {
                     return;
                 };
-                let Some(call_id) = update.get("toolCallId").and_then(Value::as_str) else {
+                let Some(call_id) = update.tool_call_id.as_deref() else {
                     return;
                 };
                 if self.open_tools.contains_key(call_id) {
@@ -648,11 +761,7 @@ impl GrokTranslator {
                 }
                 self.evict_open_tool_if_needed(ts_ms, ops);
                 let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
-                let name = update
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Tool")
-                    .to_string();
+                let name = update.title.as_deref().unwrap_or("Tool").to_string();
                 ops.push(SpanOp::Insert(SpanRow {
                     span_id: span_id.clone(),
                     root_span_id: self.root_span_id.clone(),
@@ -661,7 +770,7 @@ impl GrokTranslator {
                     name,
                     span_type: SpanType::Tool,
                     start_ms: Some(ts_ms),
-                    input: update.get("rawInput").cloned(),
+                    input: update.raw_input.as_ref().cloned(),
                     metadata: Some(json!({"tool_call_id": call_id})),
                     ..Default::default()
                 }));
@@ -676,10 +785,10 @@ impl GrokTranslator {
             }
             "tool_call_update" => {
                 self.close_llm(ts_ms, "tool_update", Some("llm:tool_update".into()), ops);
-                let Some(call_id) = update.get("toolCallId").and_then(Value::as_str) else {
+                let Some(call_id) = update.tool_call_id.as_deref() else {
                     return;
                 };
-                let status = update.get("status").and_then(Value::as_str);
+                let status = update.status.as_deref();
                 if !matches!(status, Some("completed" | "failed" | "error" | "cancelled")) {
                     return;
                 }
@@ -710,14 +819,10 @@ impl GrokTranslator {
                         root_span_id: self.root_span_id.clone(),
                         parent_span_ids: vec![parent_span_id.clone()],
                         turn_span_id: Some(parent_span_id.clone()),
-                        name: update
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Tool")
-                            .to_string(),
+                        name: update.title.as_deref().unwrap_or("Tool").to_string(),
                         span_type: SpanType::Tool,
                         start_ms: Some(ts_ms),
-                        input: update.get("rawInput").cloned(),
+                        input: update.raw_input.as_ref().cloned(),
                         metadata: Some(json!({
                             "tool_call_id": call_id,
                             "missing_start": true
@@ -747,8 +852,8 @@ impl GrokTranslator {
                 );
                 let cancelled = status == Some("cancelled");
                 let mut metadata = Map::new();
-                if let Some(kind) = update.get("kind") {
-                    metadata.insert("kind".into(), kind.clone());
+                if let Some(kind) = update.kind.as_ref() {
+                    metadata.insert("kind".into(), json!(kind));
                 }
                 if let Some(status) = status {
                     metadata.insert("status".into(), json!(status));
@@ -766,8 +871,9 @@ impl GrokTranslator {
                     parent_span_ids: vec![tool.parent_span_id],
                     end_ms: Some(end_ms),
                     output: update
-                        .get("rawOutput")
-                        .or_else(|| update.get("content"))
+                        .raw_output
+                        .as_ref()
+                        .or(update.content.as_ref())
                         .cloned(),
                     error: failed.then(|| {
                         tool_failure_text(update)
@@ -783,11 +889,9 @@ impl GrokTranslator {
                 let Some(turn) = self.current_turn.as_ref() else {
                     return;
                 };
-                let usage = update.get("usage");
+                let usage = update.usage.as_ref();
                 let metrics = usage.map(usage_metrics);
-                let native_model_calls = usage
-                    .and_then(|value| value.get("modelCalls"))
-                    .and_then(Value::as_u64);
+                let native_model_calls = usage.and_then(|value| value.model_calls);
                 let reconstructed_model_calls = turn.llm_span_ids.len() as u64;
                 if let (Some(llm_span_id), Some(metrics)) = (turn.llm_span_ids.last(), &metrics) {
                     ops.push(SpanOp::Merge(SpanRow {
@@ -804,13 +908,13 @@ impl GrokTranslator {
                     }));
                 }
                 let mut metadata = Map::new();
-                if let Some(prompt_id) = update.get("prompt_id") {
-                    metadata.insert("prompt_id".into(), prompt_id.clone());
+                if let Some(prompt_id) = update.prompt_id.as_ref() {
+                    metadata.insert("prompt_id".into(), json!(prompt_id));
                 }
-                if let Some(stop_reason) = update.get("stop_reason") {
-                    metadata.insert("stop_reason".into(), stop_reason.clone());
+                if let Some(stop_reason) = update.stop_reason.as_ref() {
+                    metadata.insert("stop_reason".into(), json!(stop_reason));
                 }
-                if let Some(model_usage) = usage.and_then(|value| value.get("modelUsage")) {
+                if let Some(model_usage) = usage.and_then(|value| value.model_usage.as_ref()) {
                     metadata.insert("model_usage".into(), model_usage.clone());
                 }
                 if native_model_calls.is_some_and(|native| native != reconstructed_model_calls) {
@@ -822,10 +926,9 @@ impl GrokTranslator {
                         }),
                     );
                 }
-                if let (Some(expected), Some(actual)) = (
-                    turn.prompt_id.as_deref(),
-                    update.get("prompt_id").and_then(Value::as_str),
-                ) {
+                if let (Some(expected), Some(actual)) =
+                    (turn.prompt_id.as_deref(), update.prompt_id.as_deref())
+                {
                     if expected != actual {
                         metadata.insert(
                             "prompt_id_mismatch".into(),
@@ -849,11 +952,11 @@ impl GrokTranslator {
         }
     }
 
-    fn process_event(&mut self, record: &Value, ops: &mut Vec<SpanOp>) {
-        if record.get("type").and_then(Value::as_str) != Some("tool_completed") {
+    fn process_event(&mut self, record: &NativeRecord, ops: &mut Vec<SpanOp>) {
+        if record.kind.as_deref() != Some("tool_completed") {
             return;
         }
-        let Some(call_id) = record.get("tool_call_id").and_then(Value::as_str) else {
+        let Some(call_id) = record.tool_call_id.as_deref() else {
             return;
         };
         let key = call_id.to_string();
@@ -874,18 +977,18 @@ impl GrokTranslator {
                 failure_recorded: completed.failure_recorded,
             },
         );
-        let outcome = record.get("outcome").and_then(Value::as_str);
+        let outcome = record.outcome.as_deref();
         let cancelled = matches!(outcome, Some("cancelled" | "canceled"));
         // Keep the precise message from the terminal update instead of
         // overwriting it with the hook's bare outcome.
         let failed =
             !cancelled && !matches!(outcome, Some("success") | None) && !completed.failure_recorded;
         let mut metadata = Map::new();
-        if let Some(duration) = record.get("duration_ms") {
-            metadata.insert("duration_ms".into(), duration.clone());
+        if let Some(duration) = record.duration_ms.as_ref() {
+            metadata.insert("duration_ms".into(), json!(duration));
         }
-        if let Some(outcome) = record.get("outcome") {
-            metadata.insert("outcome".into(), outcome.clone());
+        if let Some(outcome) = record.outcome.as_ref() {
+            metadata.insert("outcome".into(), json!(outcome));
         }
         if cancelled {
             metadata.insert("cancelled".into(), json!(true));
@@ -1074,7 +1177,7 @@ impl GrokTranslator {
         );
     }
 
-    fn process_system_prompt(&mut self, reference: Option<&Value>, ops: &mut Vec<SpanOp>) {
+    fn process_system_prompt(&mut self, reference: Option<&Reference>, ops: &mut Vec<SpanOp>) {
         if self.system_prompt.is_some() {
             return;
         }
@@ -1112,7 +1215,7 @@ impl GrokTranslator {
 
     fn process_event_enrichment(
         &mut self,
-        reference: Option<&Value>,
+        reference: Option<&Reference>,
         ops: &mut Vec<SpanOp>,
     ) -> bool {
         let Some(reference) = reference else {
@@ -1146,23 +1249,24 @@ impl GrokTranslator {
         ctx: &SessionCtx,
     ) -> anyhow::Result<(Vec<SpanOp>, bool)> {
         let mut ops = Vec::new();
-        let Some(mirrors) = event.payload.get("_bt_grok_transcript_mirrors") else {
+        let fields = TranscriptPayload::decode(&event.payload)?;
+        let Some(mirrors) = fields.grok_mirrors else {
             return Ok((ops, true));
         };
         // Updates are authoritative and advance before optional event
         // enrichment. Both fixed captured boundaries are drained before a
         // terminal hook is finalized.
-        let updates = read_new_records(mirrors.get("updates"), &self.updates)?;
+        let updates = read_new_records(mirrors.updates.as_ref(), &self.updates)?;
         if updates.reset {
             self.reset_transcript_state();
         }
         let updates_complete = updates.complete;
         self.updates = updates.cursor;
-        self.process_system_prompt(mirrors.get("system_prompt"), &mut ops);
+        self.process_system_prompt(mirrors.system_prompt.as_ref(), &mut ops);
         for record in updates.records {
             self.process_update(&record.value, record.end_offset, event, ctx, &mut ops);
         }
-        let events_complete = self.process_event_enrichment(mirrors.get("events"), &mut ops);
+        let events_complete = self.process_event_enrichment(mirrors.events.as_ref(), &mut ops);
         Ok((ops, updates_complete && events_complete))
     }
 
@@ -1314,23 +1418,16 @@ fn add_first_llm_input_metadata(
     }
 }
 
-fn read_text_snapshot(reference: Option<&Value>) -> anyhow::Result<Option<String>> {
+fn read_text_snapshot(reference: Option<&Reference>) -> anyhow::Result<Option<String>> {
     let Some(reference) = reference else {
         return Ok(None);
     };
-    let Some(path) = reference
-        .get("mirror")
-        .and_then(Value::as_str)
-        .or_else(|| reference.get("path").and_then(Value::as_str))
-    else {
+    let Some(path) = reference.read_path() else {
         return Ok(None);
     };
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
-    let through = reference
-        .get("through")
-        .and_then(Value::as_u64)
-        .unwrap_or(file_len);
+    let through = reference.through.unwrap_or(file_len);
     anyhow::ensure!(
         file_len >= through,
         "Grok system prompt mirror {path} is shorter than captured boundary {through}"
@@ -1346,7 +1443,7 @@ fn read_text_snapshot(reference: Option<&Value>) -> anyhow::Result<Option<String
 }
 
 fn read_new_records(
-    reference: Option<&Value>,
+    reference: Option<&Reference>,
     cursor: &TranscriptCursor,
 ) -> anyhow::Result<TranscriptBatch> {
     let Some(reference) = reference else {
@@ -1357,11 +1454,7 @@ fn read_new_records(
             reset: false,
         });
     };
-    let Some(path) = reference
-        .get("mirror")
-        .and_then(Value::as_str)
-        .or_else(|| reference.get("path").and_then(Value::as_str))
-    else {
+    let Some(path) = reference.read_path() else {
         return Ok(TranscriptBatch {
             cursor: cursor.clone(),
             records: Vec::new(),
@@ -1370,7 +1463,7 @@ fn read_new_records(
         });
     };
 
-    let captured_through = reference.get("through").and_then(Value::as_u64);
+    let captured_through = reference.through;
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error)
@@ -1491,15 +1584,14 @@ fn cursor_tail_matches(
     Ok(observed == cursor.tail)
 }
 
-fn turn_key(meta: Option<&Map<String, Value>>, sequence: u32) -> String {
-    if let Some(prompt_id) = meta
-        .and_then(|value| value.get("promptId"))
-        .and_then(Value::as_str)
-    {
+fn turn_key(meta: Option<&NativeMeta>, sequence: u32) -> String {
+    if let Some(prompt_id) = meta.and_then(|value| value.prompt_id.as_deref()) {
         return format!("prompt:{prompt_id}");
     }
-    if let Some(prompt_index) = meta.and_then(|value| value.get("promptIndex")) {
-        return format!("prompt-index:{prompt_index}");
+    if let Some(index) = meta.and_then(|value| value.prompt_index.as_ref()) {
+        if let Ok(index) = serde_json::to_string(index) {
+            return format!("prompt-index:{index}");
+        }
     }
     format!("sequence:{sequence}")
 }
@@ -1517,23 +1609,20 @@ fn identities_differ(
         )
 }
 
-fn record_ts_ms(record: &Value) -> Option<i64> {
+fn record_ts_ms(record: &NativeRecord) -> Option<i64> {
     record
-        .pointer("/params/_meta/agentTimestampMs")
-        .and_then(Value::as_i64)
+        .params
+        .as_ref()
+        .and_then(|params| params.meta.as_ref())
+        .and_then(|meta| meta.agent_timestamp_ms)
         .or_else(|| {
             record
-                .get("ts")
-                .and_then(Value::as_str)
+                .ts
+                .as_deref()
                 .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
                 .map(|ts| ts.timestamp_millis())
         })
-        .or_else(|| {
-            record
-                .get("timestamp")
-                .and_then(Value::as_i64)
-                .map(|seconds| seconds.saturating_mul(1000))
-        })
+        .or_else(|| record.timestamp.map(|seconds| seconds.saturating_mul(1000)))
 }
 
 fn content_value(content: &Value) -> Value {
@@ -1543,30 +1632,42 @@ fn content_value(content: &Value) -> Value {
         .unwrap_or_else(|| content.clone())
 }
 
-fn usage_metrics(usage: &Value) -> Value {
+fn usage_metrics(usage: &NativeUsage) -> Value {
     let mut metrics = Map::new();
-    for (native, common) in [
-        ("inputTokens", "prompt_tokens"),
-        ("outputTokens", "completion_tokens"),
-        ("totalTokens", "tokens"),
-        ("cachedReadTokens", "prompt_cached_tokens"),
-        ("cacheCreationTokens", "prompt_cache_creation_tokens"),
-        ("reasoningTokens", "completion_reasoning_tokens"),
-        ("apiDurationMs", "api_duration_ms"),
-        ("costUsdTicks", "cost_usd_ticks"),
-        ("modelCalls", "model_calls"),
-    ] {
-        if let Some(value) = usage.get(native) {
-            metrics.insert(common.into(), value.clone());
-        }
+    if let Some(value) = &usage.input_tokens {
+        metrics.insert("prompt_tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.output_tokens {
+        metrics.insert("completion_tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.total_tokens {
+        metrics.insert("tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.cached_read_tokens {
+        metrics.insert("prompt_cached_tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.cache_creation_tokens {
+        metrics.insert("prompt_cache_creation_tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.reasoning_tokens {
+        metrics.insert("completion_reasoning_tokens".into(), json!(value));
+    }
+    if let Some(value) = &usage.api_duration_ms {
+        metrics.insert("api_duration_ms".into(), json!(value));
+    }
+    if let Some(value) = &usage.cost_usd_ticks {
+        metrics.insert("cost_usd_ticks".into(), json!(value));
+    }
+    if let Some(value) = &usage.model_calls {
+        metrics.insert("model_calls".into(), json!(value));
     }
     Value::Object(metrics)
 }
 
 /// Grok's readable failure text is in ACP `content`; `rawOutput` is its
 /// serialized `ToolOutput` enum, which only carries text in a variant payload.
-fn tool_failure_text(update: &Value) -> Option<String> {
-    let raw = update.get("rawOutput");
+fn tool_failure_text(update: &NativeUpdate) -> Option<String> {
+    let raw = update.raw_output.as_ref();
     if let Some(raw) = raw.filter(|raw| raw["type"] == "Bash") {
         if raw["timed_out"] == true {
             return Some("Command timed out".into());
@@ -1575,7 +1676,7 @@ fn tool_failure_text(update: &Value) -> Option<String> {
             return Some(format!("Command terminated by signal {signal}"));
         }
     }
-    if let Some(text) = update.get("content").and_then(nonempty_error_text) {
+    if let Some(text) = update.content.as_ref().and_then(nonempty_error_text) {
         return Some(text);
     }
     let raw = raw?;

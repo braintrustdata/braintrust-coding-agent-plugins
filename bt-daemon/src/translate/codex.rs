@@ -28,6 +28,7 @@ use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
+use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -313,10 +314,9 @@ impl AgentTranslator for CodexTranslator {
                 self.main_path.get_or_insert(path.clone());
                 self.ensure_main_scope(&path);
             }
-            let import_through_ms = payload.get("_bt_import_through_ms").and_then(Value::as_i64);
-            let through_bytes = payload
-                .pointer("/_bt_transcript_mirror/through")
-                .and_then(Value::as_u64);
+            let fields = TranscriptPayload::decode(payload)?;
+            let import_through_ms = fields.import_through_ms;
+            let through_bytes = fields.mirror.and_then(|mirror| mirror.through);
             let after = self.deferred_hook(event, agent_id.is_none());
             if self.catch_up_chunk(
                 &path,
@@ -1678,19 +1678,14 @@ fn is_injected_user_context(text: &str) -> bool {
 }
 
 fn effective_transcript_path(event: &Envelope) -> Option<String> {
-    event
-        .payload
-        .pointer("/_bt_transcript_mirror/mirror")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            if event.event == "SubagentStop" {
-                str_field(&event.payload, "agent_transcript_path")
-            } else {
-                str_field(&event.payload, "transcript_path")
-                    .or_else(|| str_field(&event.payload, "agent_transcript_path"))
-            }
-        })
+    let fields = TranscriptPayload::decode(&event.payload).ok()?;
+    fields.mirror.and_then(|mirror| mirror.mirror).or_else(|| {
+        if event.event == "SubagentStop" {
+            fields.agent_transcript_path
+        } else {
+            fields.transcript_path.or(fields.agent_transcript_path)
+        }
+    })
 }
 
 impl Scope {

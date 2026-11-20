@@ -5,14 +5,15 @@
 //! [`Register::register`]. A command looks up agents in its own registry, so
 //! an agent without a capability simply does not appear there.
 
-mod antigravity;
+pub(crate) mod antigravity;
 mod claude;
 mod codex;
-mod cursor;
+pub(crate) mod cursor;
 mod grok;
 mod muse;
 mod opencode;
 mod pi;
+pub(crate) mod schema;
 
 pub(crate) use antigravity::Antigravity;
 pub(crate) use claude::Claude;

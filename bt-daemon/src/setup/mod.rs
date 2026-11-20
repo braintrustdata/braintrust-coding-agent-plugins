@@ -16,12 +16,13 @@ pub(crate) mod pi;
 
 use crate::agents::{registrar, Agent};
 use crate::paths;
+use crate::settings::AgentSettings;
 use crate::trace_command::{EnableArgs, SetupAgent};
 use crate::wire::SessionRoute;
 use crate::TraceCommandOutput;
 use anyhow::Context;
 pub(crate) use common::CommandRunner;
-use common::{load_object, write_object_atomic_with, FileAccess, SystemCommandRunner};
+use common::{load_object, FileAccess, SystemCommandRunner};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -117,38 +118,35 @@ fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> 
 /// tags, and span plugins unless the new route replaces them, and dropping
 /// keys from earlier settings formats.
 fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()> {
-    let mut settings = load_object(path)?;
+    let raw = load_object(path)?;
+    #[derive(serde::Deserialize, Default)]
+    struct LegacyFields {
+        additional_metadata: Option<Value>,
+        tags: Option<std::collections::BTreeSet<String>>,
+    }
+    let legacy: LegacyFields = serde_json::from_value(Value::Object(raw.clone()))?;
+    let mut settings: AgentSettings = serde_json::from_value(Value::Object(raw))?;
+    let stored = settings.route.as_ref();
     if route.additional_metadata.is_none() {
-        route.additional_metadata = settings
-            .get("route")
-            .and_then(|route| route.get("additional_metadata"))
-            .or_else(|| settings.get("additional_metadata"))
+        route.additional_metadata = stored
+            .and_then(|route| route.additional_metadata.as_ref())
+            .or(legacy.additional_metadata.as_ref())
             .filter(|metadata| metadata.is_object())
             .cloned();
     }
     if route.tags.is_empty() {
-        route.tags = settings
-            .get("route")
-            .and_then(|route| route.get("tags"))
-            .or_else(|| settings.get("tags"))
-            .and_then(Value::as_array)
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
+        route.tags = stored
+            .map(|route| route.tags.clone())
+            .or(legacy.tags)
             .unwrap_or_default();
     }
     if route.span_plugins.is_empty() {
-        route.span_plugins = settings
-            .get("route")
-            .and_then(|route| route.get("span_plugins"))
-            .and_then(|plugins| serde_json::from_value(plugins.clone()).ok())
+        route.span_plugins = stored
+            .map(|route| route.span_plugins.clone())
             .unwrap_or_default();
     }
-    settings.insert("trace_to_braintrust".into(), Value::Bool(true));
-    settings.insert("route".into(), serde_json::to_value(route)?);
+    settings.trace_to_braintrust = Some(true);
+    settings.route = Some(route);
     for key in [
         "traceToBraintrust",
         "profile",
@@ -161,10 +159,12 @@ fn enable_tracing_at(path: &Path, mut route: SessionRoute) -> anyhow::Result<()>
         "additional_metadata",
         "tags",
     ] {
-        settings.remove(key);
+        settings.extra.remove(key);
     }
-    write_object_atomic_with(path, settings, FileAccess::OwnerOnly)
-        .with_context(|| format!("failed to write agent settings: {}", path.display()))
+    crate::settings::with_settings_lock(path, || {
+        common::write_json_atomic_unlocked(path, &settings, FileAccess::OwnerOnly)
+    })
+    .with_context(|| format!("failed to write agent settings: {}", path.display()))
 }
 
 fn remove_tracing_settings(path: &Path) -> anyhow::Result<()> {

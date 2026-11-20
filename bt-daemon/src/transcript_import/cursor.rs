@@ -2,9 +2,11 @@ use super::{
     envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
     TranscriptLayout,
 };
+use crate::agents::cursor::schema::TranscriptRecord;
 use crate::translate::cursor::{IMPORT_CHECKPOINT, IMPORT_START, IMPORT_STOP};
 use crate::wire::Envelope;
 use anyhow::{bail, Context};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,14 +58,8 @@ fn filename_matches(path: &Path, session_id: &str) -> bool {
             == Some("agent-transcripts")
 }
 
-fn is_conversation_record(record: &Value) -> bool {
-    matches!(
-        record.get("role").and_then(Value::as_str),
-        Some("user" | "assistant")
-    ) && record
-        .get("message")
-        .and_then(Value::as_object)
-        .is_some_and(|message| message.get("content").is_some())
+fn is_conversation_record(record: &TranscriptRecord) -> bool {
+    matches!(record, TranscriptRecord::Message { .. })
 }
 
 impl TranscriptImport for crate::agents::Cursor {
@@ -184,17 +180,19 @@ fn envelopes_with_snapshot(
     if records.is_empty() {
         bail!("Cursor transcript {} is empty", path.display());
     }
-    for (index, record) in records.iter().enumerate() {
-        let supported = is_conversation_record(record);
-        let terminal = record.get("type").and_then(Value::as_str) == Some("turn_ended");
-        if !supported && !terminal {
-            bail!(
-                "unsupported Cursor transcript record in {} at record {}",
-                path.display(),
-                index + 1
-            );
-        }
-    }
+    let records = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            TranscriptRecord::deserialize(record).with_context(|| {
+                format!(
+                    "unsupported Cursor transcript record in {} at record {}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Cursor's transcript records have no per-record timestamps. File mtime
     // is the only available clock and is explicitly an estimate for import.
@@ -212,7 +210,7 @@ fn envelopes_with_snapshot(
     // turn unless no conversation records follow the latest marker.
     let final_terminal = records
         .iter()
-        .rposition(|record| record.get("type").and_then(Value::as_str) == Some("turn_ended"))
+        .rposition(|record| matches!(record, TranscriptRecord::TurnEnded { .. }))
         .filter(|marker| !records[*marker + 1..].iter().any(is_conversation_record))
         .map(|marker| &records[marker]);
     let boundary = |event: &str, through: Option<u64>| {
@@ -225,14 +223,11 @@ fn envelopes_with_snapshot(
             "historical_fidelity": "user_and_assistant_text_and_terminal_status"
         });
         if event == IMPORT_STOP {
-            if let Some(status) = final_terminal.and_then(|record| record.get("status")) {
-                payload["status"] = status.clone();
-            }
-            if let Some(error) = final_terminal
-                .and_then(|record| record.get("error"))
-                .filter(|error| error.is_string())
-            {
-                payload["error_message"] = error.clone();
+            if let Some(TranscriptRecord::TurnEnded { status, error, .. }) = final_terminal {
+                payload["status"] = json!(status);
+                if let Some(error) = error {
+                    payload["error_message"] = json!(error);
+                }
             }
         }
         if let Some(through) = through {

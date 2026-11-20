@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 
 use super::{managed_hook_shell_command, Injection, ManagedRun, Terminal};
+use crate::agents::schema::{HookFile, HookGroup};
 use crate::agents::Codex;
 use crate::args::RunHookCommand;
 
@@ -22,30 +23,20 @@ fn codex_managed_run_args(
     unix_command: &str,
     windows_command: &str,
 ) -> anyhow::Result<Vec<OsString>> {
-    let manifest: serde_json::Value = serde_json::from_str(PACKAGED_HOOKS)?;
+    let manifest: HookFile<HookGroup> = serde_json::from_str(PACKAGED_HOOKS)?;
     let mut args = vec![OsString::from("--enable"), OsString::from("hooks")];
-    for (event, groups) in manifest["hooks"]
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Codex hook manifest has no hooks map"))?
-    {
-        let mut groups = groups.clone();
-        for group in groups
-            .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("Codex hook groups must be an array"))?
-        {
-            for hook in group["hooks"]
-                .as_array_mut()
-                .ok_or_else(|| anyhow::anyhow!("Codex hook group has no hooks array"))?
-            {
-                anyhow::ensure!(hook["type"] == "command", "Unsupported Codex hook type");
-                hook["command"] = serde_json::Value::String(unix_command.to_owned());
-                hook["commandWindows"] = serde_json::Value::String(windows_command.to_owned());
+    for (event, mut groups) in manifest.hooks {
+        for group in &mut groups {
+            for hook in &mut group.hooks {
+                anyhow::ensure!(hook.kind == "command", "Unsupported Codex hook type");
+                hook.command = unix_command.to_owned();
+                hook.command_windows = Some(windows_command.to_owned());
             }
         }
         args.push(OsString::from("-c"));
         args.push(OsString::from(format!(
             "hooks.{event}={}",
-            toml_literal(&groups)?
+            toml_literal(&serde_json::to_value(&groups)?)?
         )));
     }
     Ok(args)

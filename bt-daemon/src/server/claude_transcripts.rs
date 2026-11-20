@@ -3,17 +3,25 @@
 //! written after the session's last hook are still translated.
 
 use super::*;
+use crate::transcript_mirror::TranscriptPayload;
 
 #[derive(Clone)]
 pub(super) struct ClaudeTranscriptObservation {
     /// Synthetic-event provenance only: never retain native prompts or responses.
     pub(super) template: Envelope,
     pub(super) through: Option<u64>,
+    path: String,
 }
 
 impl Daemon {
     pub(super) fn remember_claude_transcripts(&self, env: &Envelope) {
-        if env.source != "claude-code" || env.payload.get("_bt_import_through_offset").is_some() {
+        if env.source != "claude-code" {
+            return;
+        }
+        let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+            return;
+        };
+        if fields.import_through_offset.is_some() {
             return;
         }
         if env.event == "SessionEnd" {
@@ -25,27 +33,33 @@ impl Daemon {
         let Some(route) = env.route.as_ref() else {
             return;
         };
-        let Some(path) = env.payload.get("transcript_path").and_then(Value::as_str) else {
+        let Some(path) = fields.transcript_path.as_deref() else {
             return;
         };
         let Ok(key) = DeliveryKey::new(&env.source, &env.session_id, route) else {
             return;
         };
-        let through = env
-            .payload
-            .get("_bt_claude_transcript_mirrors")
+        let through = fields
+            .claude_mirrors
+            .as_ref()
             .and_then(|mirrors| mirrors.get(path))
             .or_else(|| {
-                env.payload
-                    .get("_bt_transcript_mirror")
-                    .filter(|mirror| mirror.get("path").and_then(Value::as_str) == Some(path))
+                fields
+                    .mirror
+                    .as_ref()
+                    .filter(|mirror| mirror.path.as_deref() == Some(path))
             })
-            .and_then(|mirror| mirror.get("through"))
-            .and_then(Value::as_u64);
-        let mut payload = serde_json::json!({"transcript_path": path});
-        if let Some(cwd) = env.payload.get("cwd").and_then(Value::as_str) {
-            payload["cwd"] = Value::String(cwd.to_string());
+            .and_then(|mirror| mirror.through);
+        #[derive(serde::Serialize)]
+        struct PollPayload<'a> {
+            transcript_path: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cwd: Option<&'a str>,
         }
+        let payload = serde_json::json!(PollPayload {
+            transcript_path: path,
+            cwd: fields.cwd.as_deref()
+        });
         let template = Envelope {
             source: env.source.clone(),
             source_version: env.source_version.clone(),
@@ -62,19 +76,13 @@ impl Daemon {
         let mut observations = self.claude_transcripts.lock();
         let previous = observations
             .get(&key)
-            .filter(|observation| {
-                observation
-                    .template
-                    .payload
-                    .get("transcript_path")
-                    .and_then(Value::as_str)
-                    == Some(path)
-            })
+            .filter(|observation| observation.path == path)
             .and_then(|observation| observation.through);
         observations.insert(
             key,
             ClaudeTranscriptObservation {
                 template,
+                path: path.to_owned(),
                 through: through.or(previous),
             },
         );
@@ -117,15 +125,7 @@ impl Daemon {
             let Some(observation) = observation else {
                 continue;
             };
-            let Some(path) = observation
-                .template
-                .payload
-                .get("transcript_path")
-                .and_then(Value::as_str)
-            else {
-                tracing::warn!(session_id = %key.session_id, "Claude transcript observation has no transcript path");
-                continue;
-            };
+            let path = &observation.path;
             let Ok(metadata) = tokio::fs::metadata(path).await else {
                 continue;
             };
@@ -135,12 +135,9 @@ impl Daemon {
             let mut env = observation.template;
             env.ts_ms = now_ms();
             hydrate_transcript_reference(&self.data_dir, &mut env).await;
-            let through = env
-                .payload
-                .get("_bt_claude_transcript_mirrors")
-                .and_then(|mirrors| mirrors.get(env.payload.get("transcript_path")?.as_str()?))
-                .and_then(|mirror| mirror.get("through"))
-                .and_then(Value::as_u64);
+            let through = TranscriptPayload::decode(&env.payload)
+                .ok()
+                .and_then(|fields| fields.claude_mirrors?.get(path)?.through);
             if through.is_none() || through == observation.through {
                 continue;
             }

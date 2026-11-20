@@ -16,6 +16,7 @@ use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::ids;
+use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -2440,24 +2441,23 @@ fn read_snapshot_bounded(
 /// order: the daemon's own mirror, then an inline snapshot (older journals),
 /// then the live path.
 fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Value> {
-    let import_through_offset = event
-        .payload
-        .get("_bt_import_through_offset")
-        .and_then(Value::as_u64);
-    if let Some(mirrors) = event.payload.get("_bt_claude_transcript_mirrors") {
+    let Ok(fields) = TranscriptPayload::decode(&event.payload) else {
+        return Vec::new();
+    };
+    let import_through_offset = fields.import_through_offset;
+    if let Some(mirrors) = &fields.claude_mirrors {
         // This marker records even an absent/unreadable file. Never replace a
         // captured absence with bytes appended later to the mutable native path.
         let Some(reference) = mirrors.get(path) else {
             return Vec::new();
         };
-        let Some(mirror) = reference.get("mirror").and_then(Value::as_str) else {
+        let Some(mirror) = reference.mirror.as_deref() else {
             return Vec::new();
         };
-        let Some(through) = reference.get("through").and_then(Value::as_u64) else {
+        let Some(through) = reference.through else {
             return Vec::new();
         };
-        let through = if event.payload.get("transcript_path").and_then(Value::as_str) == Some(path)
-        {
+        let through = if fields.transcript_path.as_deref() == Some(path) {
             import_through_offset.map_or(through, |offset| offset.min(through))
         } else {
             through
@@ -2465,13 +2465,13 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         return read_file_bounded(mirror, offset, None, Some(through));
     }
 
-    let mirror = event
-        .payload
-        .get("_bt_transcript_mirror")
-        .filter(|mirror| mirror.get("path").and_then(Value::as_str) == Some(path));
+    let mirror = fields
+        .mirror
+        .as_ref()
+        .filter(|mirror| mirror.path.as_deref() == Some(path));
     if let Some(mirror) = mirror {
-        let mirror_path = mirror.get("mirror").and_then(Value::as_str);
-        let through = mirror.get("through").and_then(Value::as_u64);
+        let mirror_path = mirror.mirror.as_deref();
+        let through = mirror.through;
         if let (Some(mirror_path), Some(through)) = (mirror_path, through) {
             // The mirror is byte-identical to the source prefix, so offsets
             // are interchangeable between them. An import offset is the
@@ -2485,27 +2485,18 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
     }
 
     // Journals written before transcript mirroring carry the whole file.
-    let snapshot = event
-        .payload
-        .get("_bt_transcript_snapshot")
-        .filter(|snapshot| snapshot.get("path").and_then(Value::as_str) == Some(path))
-        .and_then(|snapshot| snapshot.get("contents"))
-        .and_then(Value::as_str);
+    let snapshot = fields
+        .snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.path == path)
+        .map(|snapshot| snapshot.contents.as_str());
     match (snapshot, import_through_offset) {
         (Some(contents), through @ Some(_)) => {
             read_snapshot_bounded(contents, offset, None, through)
         }
         (Some(contents), None) => read_snapshot_bounded(contents, offset, Some(event.ts_ms), None),
         (None, through @ Some(_)) => read_file_bounded(path, offset, None, through),
-        (None, None)
-            if event
-                .payload
-                .get("_bt_transcript_replay")
-                .and_then(Value::as_bool)
-                == Some(true) =>
-        {
-            Vec::new()
-        }
+        (None, None) if fields.replay == Some(true) => Vec::new(),
         (None, None) => read_file_bounded(path, offset, Some(event.ts_ms), None),
     }
 }

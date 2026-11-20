@@ -4,26 +4,32 @@ use super::common::{github_repo_matches, CommandRunner};
 use crate::agents::Grok;
 use crate::setup::Setup;
 use anyhow::bail;
-use serde_json::Value;
+use serde::Deserialize;
 
 const PLUGIN: &str = "trace-grok";
 const PLUGIN_SOURCE: &str = "braintrustdata/braintrust-grok-plugin";
 
-fn installed_plugin(value: &Value) -> Option<&Value> {
-    value
-        .as_array()?
-        .iter()
-        .find(|item| item.get("name").and_then(Value::as_str) == Some(PLUGIN))
+#[derive(Deserialize)]
+struct InstalledPlugin {
+    name: String,
+    source: Option<String>,
 }
 
-fn is_published(item: &Value) -> bool {
-    item.get("source")
-        .and_then(Value::as_str)
+fn installed_plugin(plugins: &[InstalledPlugin]) -> Option<&InstalledPlugin> {
+    plugins.iter().find(|plugin| plugin.name == PLUGIN)
+}
+
+fn is_published(plugin: &InstalledPlugin) -> bool {
+    plugin
+        .source
+        .as_deref()
         .is_some_and(|source| github_repo_matches(source, PLUGIN_SOURCE))
 }
 
-fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
-    runner.json("grok", &["plugin", "list", "--json"])
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Vec<InstalledPlugin>> {
+    Ok(serde_json::from_value(
+        runner.json("grok", &["plugin", "list", "--json"])?,
+    )?)
 }
 
 impl Setup for Grok {

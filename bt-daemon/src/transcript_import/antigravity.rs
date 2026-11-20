@@ -2,8 +2,10 @@ use super::{
     envelope, validate_session_id, IncrementalRecords, TailSession, TranscriptImport,
     TranscriptLayout,
 };
+use crate::agents::antigravity::schema::TranscriptRecord as AntigravityRecord;
 use crate::wire::Envelope;
 use anyhow::bail;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -117,20 +119,20 @@ pub(super) fn envelopes(
     if records.is_empty() {
         bail!("Antigravity transcript {} is empty", path.display());
     }
-    let (start_ms, end_ms) = timestamp_bounds_created(records);
+    let records = records
+        .iter()
+        .map(AntigravityRecord::deserialize)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (start_ms, end_ms) = timestamp_bounds_created(&records);
     let transcript_path = path.to_string_lossy().into_owned();
     let mut events = Vec::new();
     let mut planned_calls = VecDeque::new();
     let mut invocation_num = 0i64;
     for (index, record) in records.iter().enumerate() {
-        let record_type = record.get("type").and_then(Value::as_str);
-        let step = record
-            .get("step_index")
-            .or_else(|| record.get("stepIndex"))
-            .and_then(Value::as_i64)
-            .unwrap_or(index as i64);
+        let record_type = record.kind.as_str();
+        let step = record.step_index.unwrap_or(index as i64);
         let ts = created_at_ms(record).unwrap_or(start_ms);
-        if record_type == Some("PLANNER_RESPONSE") {
+        if record_type == "PLANNER_RESPONSE" {
             let before = index
                 .checked_sub(1)
                 .and_then(|index| record_end_offsets.get(index))
@@ -164,11 +166,7 @@ pub(super) fn envelopes(
             ));
             invocation_num += 1;
         }
-        if let Some(calls) = record
-            .get("tool_calls")
-            .or_else(|| record.get("toolCalls"))
-            .and_then(Value::as_array)
-        {
+        if let Some(calls) = &record.tool_calls {
             planned_calls.extend(calls.iter().cloned());
         }
         if !is_tool_result(record) {
@@ -176,7 +174,7 @@ pub(super) fn envelopes(
         }
         let mut extra = json!({"stepIdx": step});
         if let Some(call) = planned_calls.pop_front() {
-            extra["toolCall"] = call;
+            extra["toolCall"] = json!(call);
         }
         if is_denied(record) {
             extra["toolApproval"] = json!("denied");
@@ -226,24 +224,22 @@ fn bounded_payload(session_id: &str, transcript_path: &str, through: u64, extra:
     payload
 }
 
-fn is_denied(record: &Value) -> bool {
+fn is_denied(record: &AntigravityRecord) -> bool {
     record
-        .get("content")
+        .content
+        .as_ref()
         .and_then(Value::as_str)
         .is_some_and(|content| content.to_ascii_lowercase().contains("denied"))
 }
 
-fn is_tool_result(record: &Value) -> bool {
+fn is_tool_result(record: &AntigravityRecord) -> bool {
     !matches!(
-        record.get("type").and_then(Value::as_str),
-        Some("USER_INPUT" | "PLANNER_RESPONSE" | "CONVERSATION_HISTORY" | "CHECKPOINT")
-    ) && record
-        .get("step_index")
-        .or_else(|| record.get("stepIndex"))
-        .is_some()
+        record.kind.as_str(),
+        "USER_INPUT" | "PLANNER_RESPONSE" | "CONVERSATION_HISTORY" | "CHECKPOINT"
+    ) && record.step_index.is_some()
 }
 
-fn timestamp_bounds_created(records: &[Value]) -> (i64, i64) {
+fn timestamp_bounds_created(records: &[AntigravityRecord]) -> (i64, i64) {
     let timestamps = records.iter().filter_map(created_at_ms).collect::<Vec<_>>();
     timestamps
         .iter()
@@ -257,11 +253,10 @@ fn timestamp_bounds_created(records: &[Value]) -> (i64, i64) {
         })
 }
 
-fn created_at_ms(record: &Value) -> Option<i64> {
+fn created_at_ms(record: &AntigravityRecord) -> Option<i64> {
     record
-        .get("created_at")
-        .or_else(|| record.get("createdAt"))
-        .and_then(Value::as_str)
+        .created_at
+        .as_deref()
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.timestamp_millis())
 }

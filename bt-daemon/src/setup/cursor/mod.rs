@@ -11,6 +11,7 @@ pub(crate) use hooks::{
 #[cfg(test)]
 pub(crate) use hooks::{capture_hook_entry, persistent_specs};
 
+use crate::agents::schema::PluginManifest;
 use crate::agents::Cursor;
 use crate::paths;
 use crate::setup::common::{
@@ -18,7 +19,6 @@ use crate::setup::common::{
 };
 use crate::setup::Setup;
 use anyhow::{bail, Context};
-use serde_json::Value;
 use std::path::Path;
 
 const PLUGIN_NAME: &str = "trace-cursor";
@@ -58,23 +58,22 @@ fn write_embedded_plugin_at(plugin: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn installed_manifest_at(plugin: &Path) -> Option<Value> {
+fn installed_manifest_at(plugin: &Path) -> Option<PluginManifest> {
     let raw = std::fs::read(plugin.join(".cursor-plugin/plugin.json")).ok()?;
     serde_json::from_slice(&raw).ok()
 }
 
-fn is_ours(manifest: &Value) -> bool {
-    matches!(
-        manifest.get("name").and_then(Value::as_str),
-        Some("braintrust" | PLUGIN_NAME)
-    ) && manifest
-        .get("repository")
-        .and_then(Value::as_str)
-        .is_some_and(|repo| {
-            github_repo_matches(repo, MONOREPO_SOURCE)
-                || github_repo_matches(repo, PLUGIN_SOURCE)
-                || github_repo_matches(repo, LEGACY_PLUGIN_SOURCE)
-        })
+fn is_ours(manifest: &PluginManifest) -> bool {
+    matches!(manifest.name.as_deref(), Some("braintrust" | PLUGIN_NAME))
+        && manifest
+            .repository
+            .as_ref()
+            .and_then(|repository| repository.url())
+            .is_some_and(|repo| {
+                github_repo_matches(repo, MONOREPO_SOURCE)
+                    || github_repo_matches(repo, PLUGIN_SOURCE)
+                    || github_repo_matches(repo, LEGACY_PLUGIN_SOURCE)
+            })
 }
 
 /// Fail unless the plugin at `plugin_dir` is the Braintrust plugin, so setup
@@ -82,7 +81,7 @@ fn is_ours(manifest: &Value) -> bool {
 /// `unrecognized` describes a missing or unreadable manifest and `different`
 /// a manifest for another plugin.
 fn ensure_ours(plugin_dir: &Path, unrecognized: &str, different: &str) -> anyhow::Result<()> {
-    let installed: Value = std::fs::read(plugin_dir.join(".cursor-plugin/plugin.json"))
+    let installed: PluginManifest = std::fs::read(plugin_dir.join(".cursor-plugin/plugin.json"))
         .context(unrecognized.to_owned())
         .and_then(|raw| {
             serde_json::from_slice(&raw).context("installed plugin manifest is invalid")
@@ -122,7 +121,7 @@ impl Setup for Cursor {
             return false;
         }
         let expected = package_version(PLUGIN_MANIFEST).ok();
-        let installed = installed_manifest.get("version").and_then(Value::as_str);
+        let installed = installed_manifest.version.as_deref();
         installed
             .zip(expected.as_deref())
             .is_some_and(|(installed, expected)| version_is_older(installed, expected))
@@ -208,12 +207,22 @@ fn install_plugin_at(runner: &mut dyn CommandRunner, plugin_dir: &Path) -> anyho
     // distribution, including components added after this bt build shipped.
     for (relative, field) in [("hooks/hooks.json", "hooks"), ("mcp.json", "mcpServers")] {
         let path = staged_plugin.join(relative);
-        let manifest: Value = serde_json::from_slice(
+        #[derive(serde::Deserialize)]
+        struct Components {
+            hooks: Option<std::collections::BTreeMap<String, serde::de::IgnoredAny>>,
+            #[serde(rename = "mcpServers")]
+            mcp_servers: Option<std::collections::BTreeMap<String, serde::de::IgnoredAny>>,
+        }
+        let manifest: Components = serde_json::from_slice(
             &std::fs::read(&path)
                 .with_context(|| format!("published Cursor plugin is missing {relative}"))?,
         )
         .with_context(|| format!("published Cursor plugin has invalid {relative}"))?;
-        if !manifest.get(field).is_some_and(Value::is_object) {
+        let present = match field {
+            "hooks" => manifest.hooks.is_some(),
+            _ => manifest.mcp_servers.is_some(),
+        };
+        if !present {
             bail!("published Cursor plugin {relative} must contain a {field} object");
         }
     }

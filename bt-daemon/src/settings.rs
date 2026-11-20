@@ -31,10 +31,15 @@ impl InvocationSettings {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AgentSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_to_braintrust: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<SessionRoute>,
+    /// Unrelated settings and legacy fields survive route migration.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl AgentSettings {
@@ -57,6 +62,7 @@ impl AgentSettings {
             return Ok(Self {
                 trace_to_braintrust: Some(settings.trace_to_braintrust),
                 route: Some(settings.route),
+                ..Self::default()
             });
         }
         let raw = std::fs::read_to_string(path).map_err(|error| {
@@ -147,19 +153,18 @@ fn migrate_persisted_route_at(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let mut settings: Map<String, Value> = serde_json::from_str(&raw)?;
-        let Some(stored) = settings.get("route") else {
+        let mut settings: AgentSettings = serde_json::from_str(&raw)?;
+        let Some(stored) = settings.route.as_ref() else {
             return Ok(false);
         };
-        let stored: SessionRoute = serde_json::from_value(stored.clone())?;
         // Do not overwrite a route that setup changed while resolution was in
         // flight. `same_route` deliberately treats a legacy route and its
         // stable-ID successor as equivalent for journal replay, so the
         // persistence guard must compare their exact serialized forms.
-        if serde_json::to_value(&stored)? != serde_json::to_value(legacy_route)? {
+        if serde_json::to_value(stored)? != serde_json::to_value(legacy_route)? {
             return Ok(false);
         }
-        settings.insert("route".into(), serde_json::to_value(canonical_route)?);
+        settings.route = Some(canonical_route.clone());
         write_json_atomic(path, &settings)?;
         Ok(true)
     })
@@ -193,11 +198,11 @@ pub(crate) fn with_settings_lock<T>(
     result
 }
 
-fn write_json_atomic(path: &Path, settings: &Map<String, Value>) -> anyhow::Result<()> {
+fn write_json_atomic(path: &Path, settings: &AgentSettings) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("configuration path has no parent: {}", path.display()))?;
-    let mut encoded = serde_json::to_string_pretty(&Value::Object(settings.clone()))?;
+    let mut encoded = serde_json::to_string_pretty(settings)?;
     encoded.push('\n');
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     // Protect the replacement before it takes the settings file's place;

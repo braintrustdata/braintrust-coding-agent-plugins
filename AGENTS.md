@@ -39,6 +39,20 @@ limitation and preserve known parent totals rather than inventing attribution.
 
 ## Local development
 
+Use concrete Rust types for every known schema. Decode JSON at the input
+boundary, then pass typed structs and enums through the implementation; serialize
+them at the output boundary. Share schema types across hooks, setup, managed
+runs, transcript import, replay, and other consumers of the same data instead of
+defining parallel shapes. Known IDs, flags, counters, messages, tool-call
+envelopes, and configuration fields must not be stored or traversed as
+`serde_json::Value`, including through string-keyed `.get()` or indexing.
+Reserve `Value` for encoding boundaries and genuinely open-ended data such as
+metadata, arbitrary tool arguments/results, JSON schemas, and unknown extension
+fields that must round-trip. Document why each remaining dynamic field needs
+that flexibility; do not use an opaque JSON fallback for a known schema merely
+to avoid modeling it. Preserve native format variants and unknown extensions
+explicitly when introducing shared types.
+
 Install the pinned tools with [mise](https://mise.jdx.dev). `mise install`
 reads `.tool-versions` and `mise.toml`, then runs `make install-deps`:
 

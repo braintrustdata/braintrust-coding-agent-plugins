@@ -7,6 +7,7 @@ use crate::agents::Claude;
 use crate::paths;
 use crate::setup::Setup;
 use anyhow::{bail, Context};
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 
@@ -17,35 +18,45 @@ const PLUGIN_MANIFEST: &str =
     plugin_source!("claude/content/plugins/trace-claude-code/.claude-plugin/plugin.json");
 const LEGACY_TRACING_ENV_KEYS: [&str; 2] = ["BRAINTRUST_CC_PROJECT", "BRAINTRUST_CC_DEBUG"];
 
-const MARKETPLACE: Marketplace = Marketplace {
+#[derive(Deserialize)]
+struct MarketplaceEntry {
+    name: String,
+    source: Option<String>,
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstalledPlugin {
+    id: String,
+    version: Option<String>,
+    enabled: Option<bool>,
+}
+
+type InstalledPlugins = Vec<InstalledPlugin>;
+
+const MARKETPLACE: Marketplace<Vec<MarketplaceEntry>, MarketplaceEntry> = Marketplace {
     program: "claude",
     name: MARKETPLACE_NAME,
     source: MARKETPLACE_SOURCE,
     refresh: "update",
-    find: |value| {
-        value
-            .as_array()?
-            .iter()
-            .find(|item| item.get("name").and_then(Value::as_str) == Some(MARKETPLACE_NAME))
-    },
-    is_published: |item| {
-        item.get("source").and_then(Value::as_str) == Some("github")
-            && item
-                .get("repo")
-                .and_then(Value::as_str)
+    find: |entries| entries.iter().find(|entry| entry.name == MARKETPLACE_NAME),
+    is_published: |entry| {
+        entry.source.as_deref() == Some("github")
+            && entry
+                .repo
+                .as_deref()
                 .is_some_and(|repo| github_repo_matches(repo, MARKETPLACE_SOURCE))
     },
 };
 
-fn installed_plugin(value: &Value) -> Option<&Value> {
-    value
-        .as_array()?
-        .iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(PLUGIN))
+fn installed_plugin(plugins: &InstalledPlugins) -> Option<&InstalledPlugin> {
+    plugins.iter().find(|plugin| plugin.id == PLUGIN)
 }
 
-fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
-    runner.json("claude", &["plugin", "list", "--json"])
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<InstalledPlugins> {
+    Ok(serde_json::from_value(
+        runner.json("claude", &["plugin", "list", "--json"])?,
+    )?)
 }
 
 impl Setup for Claude {
@@ -74,11 +85,7 @@ impl Setup for Claude {
         installed_json_version_is_older(
             "claude",
             &["plugin", "list", "--json"],
-            |value| {
-                installed_plugin(value)
-                    .and_then(|plugin| plugin.get("version"))
-                    .and_then(Value::as_str)
-            },
+            |value| installed_plugin(value).and_then(|plugin| plugin.version.as_deref()),
             PLUGIN_MANIFEST,
         )
     }
@@ -94,7 +101,7 @@ fn install(runner: &mut dyn CommandRunner) -> anyhow::Result<()> {
             None => runner.run("claude", &["plugin", "install", PLUGIN])?,
             Some(plugin) => {
                 runner.run("claude", &["plugin", "update", PLUGIN])?;
-                if plugin.get("enabled").and_then(Value::as_bool) == Some(false) {
+                if plugin.enabled == Some(false) {
                     runner.run("claude", &["plugin", "enable", PLUGIN])?;
                 }
             }
@@ -112,9 +119,13 @@ fn legacy_tracing_env_keys(path: &Path) -> anyhow::Result<Vec<&'static str>> {
                 .with_context(|| format!("failed to inspect Claude settings: {}", path.display()));
         }
     };
-    let value: Value = serde_json::from_slice(&raw)
+    #[derive(Deserialize)]
+    struct Settings {
+        env: Option<std::collections::BTreeMap<String, Value>>,
+    }
+    let settings: Settings = serde_json::from_slice(&raw)
         .with_context(|| format!("Claude settings are not valid JSON: {}", path.display()))?;
-    let env = value.get("env").and_then(Value::as_object);
+    let env = settings.env.as_ref();
     Ok(LEGACY_TRACING_ENV_KEYS
         .into_iter()
         .filter(|key| env.is_some_and(|env| env.contains_key(*key)))

@@ -5,7 +5,7 @@ use super::common::{
 };
 use crate::agents::Codex;
 use crate::setup::Setup;
-use serde_json::Value;
+use serde::Deserialize;
 
 const MARKETPLACE_NAME: &str = "braintrust-codex-plugins";
 const MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
@@ -22,36 +22,65 @@ const LIST_PLUGINS_ARGS: &[&str] = &[
 const PLUGIN_MANIFEST: &str =
     plugin_source!("codex/content/plugins/trace-codex/.codex-plugin/plugin.json");
 
-const MARKETPLACE: Marketplace = Marketplace {
+#[derive(Deserialize)]
+struct MarketplaceList {
+    marketplaces: Vec<MarketplaceEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketplaceEntry {
+    name: String,
+    marketplace_source: Option<MarketplaceSource>,
+}
+
+#[derive(Deserialize)]
+struct MarketplaceSource {
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InstalledPlugins {
+    installed: Vec<InstalledPlugin>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledPlugin {
+    plugin_id: String,
+    version: Option<String>,
+}
+
+const MARKETPLACE: Marketplace<MarketplaceList, MarketplaceEntry> = Marketplace {
     program: "codex",
     name: MARKETPLACE_NAME,
     source: MARKETPLACE_SOURCE,
     refresh: "upgrade",
-    find: |value| {
-        value
-            .get("marketplaces")
-            .and_then(Value::as_array)?
+    find: |list| {
+        list.marketplaces
             .iter()
-            .find(|item| item.get("name").and_then(Value::as_str) == Some(MARKETPLACE_NAME))
+            .find(|entry| entry.name == MARKETPLACE_NAME)
     },
-    is_published: |item| {
-        item.get("marketplaceSource")
-            .and_then(|source| source.get("source"))
-            .and_then(Value::as_str)
+    is_published: |entry| {
+        entry
+            .marketplace_source
+            .as_ref()
+            .and_then(|source| source.source.as_deref())
             .is_some_and(|source| github_repo_matches(source, MARKETPLACE_SOURCE))
     },
 };
 
-fn installed_plugin(value: &Value) -> Option<&Value> {
-    value
-        .get("installed")
-        .and_then(Value::as_array)?
+fn installed_plugin(plugins: &InstalledPlugins) -> Option<&InstalledPlugin> {
+    plugins
+        .installed
         .iter()
-        .find(|item| item.get("pluginId").and_then(Value::as_str) == Some(PLUGIN))
+        .find(|plugin| plugin.plugin_id == PLUGIN)
 }
 
-fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<Value> {
-    runner.json("codex", LIST_PLUGINS_ARGS)
+fn list_plugins(runner: &mut dyn CommandRunner) -> anyhow::Result<InstalledPlugins> {
+    Ok(serde_json::from_value(
+        runner.json("codex", LIST_PLUGINS_ARGS)?,
+    )?)
 }
 
 impl Setup for Codex {
@@ -83,11 +112,7 @@ impl Setup for Codex {
         installed_json_version_is_older(
             "codex",
             LIST_PLUGINS_ARGS,
-            |value| {
-                installed_plugin(value)
-                    .and_then(|plugin| plugin.get("version"))
-                    .and_then(Value::as_str)
-            },
+            |value| installed_plugin(value).and_then(|plugin| plugin.version.as_deref()),
             PLUGIN_MANIFEST,
         )
     }

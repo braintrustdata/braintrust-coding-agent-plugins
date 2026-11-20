@@ -9,6 +9,7 @@ use crate::pipeline::{
     translation::Translation,
 };
 use crate::sink::SinkFactory;
+use crate::transcript_mirror::{GrokReferences, Reference, TranscriptPayload};
 use crate::wire::Envelope;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -357,17 +358,15 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
     if env.source != "codex" {
         return;
     }
-    let field = if env.event == "SubagentStop" {
-        "agent_transcript_path"
-    } else {
-        "transcript_path"
+    let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+        return;
     };
-    let Some(path) = env
-        .payload
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-    else {
+    let path = if env.event == "SubagentStop" {
+        fields.agent_transcript_path
+    } else {
+        fields.transcript_path
+    };
+    let Some(path) = path else {
         return;
     };
     let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
@@ -382,33 +381,29 @@ pub(crate) async fn hydrate_transcript_reference(data_dir: &std::path::Path, env
     if let Some(payload) = env.payload.as_object_mut() {
         payload.insert(
             "_bt_transcript_mirror".to_string(),
-            serde_json::json!({
-                "path": path,
-                "mirror": mirror.to_string_lossy(),
-                "through": through,
-            }),
+            serde_json::json!(Reference::captured(&path, &mirror, through)),
         );
     }
 }
 
 async fn hydrate_cursor_transcript_reference(data_dir: &std::path::Path, env: &mut Envelope) {
-    if env.payload.get("_bt_transcript_mirror").is_some() {
+    let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+        return;
+    };
+    if fields.mirror.is_some() {
         return;
     }
-    let path = env
-        .payload
-        .get("transcript_path")
-        .and_then(serde_json::Value::as_str);
-    let mut observation = serde_json::json!({});
-    if let Some(path) = path.filter(|path| !path.is_empty()) {
-        let observed_bytes = env
-            .payload
-            .get("_bt_transcript_observation")
-            .filter(|observation| {
-                observation.get("path").and_then(serde_json::Value::as_str) == Some(path)
-            })
-            .and_then(|observation| observation.get("observed_bytes"))
-            .and_then(serde_json::Value::as_u64);
+    let mut observation = Reference::default();
+    if let Some(path) = fields
+        .transcript_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+    {
+        let observed_bytes = fields
+            .observation
+            .as_ref()
+            .filter(|observation| observation.path.as_deref() == Some(path))
+            .and_then(|observation| observation.observed_bytes);
         let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
         match crate::transcript_mirror::capture_generation(
             data_dir,
@@ -419,8 +414,7 @@ async fn hydrate_cursor_transcript_reference(data_dir: &std::path::Path, env: &m
         .await
         {
             Ok((mirror, through)) => {
-                observation =
-                    serde_json::json!({"path": path, "mirror": mirror, "through": through});
+                observation = Reference::captured(path, &mirror, through);
             }
             Err(error) => {
                 tracing::debug!(session_id = %env.session_id, %error, "Cursor transcript mirror skipped");
@@ -430,26 +424,35 @@ async fn hydrate_cursor_transcript_reference(data_dir: &std::path::Path, env: &m
     if let Some(payload) = env.payload.as_object_mut() {
         // An empty observation is also durable: no transcript was available
         // at this boundary, even if the external path appears during replay.
-        payload.insert("_bt_transcript_mirror".to_string(), observation);
+        payload.insert(
+            "_bt_transcript_mirror".to_string(),
+            serde_json::json!(observation),
+        );
     }
 }
 
 async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &mut Envelope) {
     // Historical snapshots and newly captured references are observations,
     // not invitations to reread an external file during journal recovery.
-    if env.payload.get("_bt_claude_transcript_mirrors").is_some()
-        || env.payload.get("_bt_transcript_mirror").is_some()
-        || env.payload.get("_bt_transcript_snapshot").is_some()
-        || env.payload.get("_bt_transcript_replay").is_some()
+    let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+        return;
+    };
+    if fields.claude_mirrors.is_some()
+        || fields.mirror.is_some()
+        || fields.snapshot.is_some()
+        || fields.replay.is_some()
     {
         return;
     }
     let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
-    let mut mirrors = serde_json::Map::new();
-    for field in ["transcript_path", "agent_transcript_path"] {
-        let Some(path) = env.payload.get(field).and_then(serde_json::Value::as_str) else {
-            continue;
-        };
+    let mut mirrors = std::collections::BTreeMap::new();
+    for path in [
+        fields.transcript_path.as_deref(),
+        fields.agent_transcript_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if mirrors.contains_key(path) {
             continue;
         }
@@ -457,7 +460,7 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
             Ok((mirror, through)) => {
                 mirrors.insert(
                     path.to_string(),
-                    serde_json::json!({"path": path, "mirror": mirror, "through": through}),
+                    Reference::captured(path, &mirror, through),
                 );
             }
             Err(error) => {
@@ -471,7 +474,7 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     if let Some(payload) = env.payload.as_object_mut() {
         payload.insert(
             "_bt_claude_transcript_mirrors".to_string(),
-            serde_json::Value::Object(mirrors),
+            serde_json::json!(mirrors),
         );
     }
 }
@@ -481,20 +484,17 @@ const GROK_TERMINAL_SNAPSHOT_QUIET_PERIOD: std::time::Duration =
     std::time::Duration::from_millis(10);
 
 async fn hydrate_grok_transcript_references(data_dir: &std::path::Path, env: &mut Envelope) {
-    let Some(transcript) = env
-        .payload
-        .get("transcriptPath")
-        .or_else(|| env.payload.get("transcript_path"))
-        .and_then(serde_json::Value::as_str)
-        .map(std::path::PathBuf::from)
-    else {
+    let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
+        return;
+    };
+    let Some(transcript) = fields.transcript_path.map(std::path::PathBuf::from) else {
         return;
     };
     let Some(session_dir) = transcript.parent() else {
         return;
     };
     let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
-    let mut mirrors = serde_json::Map::new();
+    let mut mirrors = GrokReferences::default();
     capture_grok_transcript_pass(
         data_dir,
         session_dir,
@@ -522,7 +522,7 @@ async fn hydrate_grok_transcript_references(data_dir: &std::path::Path, env: &mu
         if let Some(payload) = env.payload.as_object_mut() {
             payload.insert(
                 "_bt_grok_transcript_mirrors".to_string(),
-                serde_json::Value::Object(mirrors),
+                serde_json::json!(mirrors),
             );
         }
     }
@@ -533,12 +533,12 @@ async fn capture_grok_transcript_pass(
     session_dir: &std::path::Path,
     mirror_session: &str,
     session_id: &str,
-    mirrors: &mut serde_json::Map<String, serde_json::Value>,
+    mirrors: &mut GrokReferences,
 ) {
-    for (name, key) in [
-        ("updates.jsonl", "updates"),
-        ("events.jsonl", "events"),
-        ("system_prompt.txt", "system_prompt"),
+    for (name, slot) in [
+        ("updates.jsonl", &mut mirrors.updates),
+        ("events.jsonl", &mut mirrors.events),
+        ("system_prompt.txt", &mut mirrors.system_prompt),
     ] {
         let source = session_dir.join(name);
         let Some(source_str) = source.to_str() else {
@@ -546,14 +546,7 @@ async fn capture_grok_transcript_pass(
         };
         match crate::transcript_mirror::capture(data_dir, mirror_session, source_str).await {
             Ok((mirror, through)) => {
-                mirrors.insert(
-                    key.to_string(),
-                    serde_json::json!({
-                        "path": source,
-                        "mirror": mirror,
-                        "through": through,
-                    }),
-                );
+                *slot = Some(Reference::captured(source_str, &mirror, through));
             }
             Err(error) => {
                 tracing::debug!(%session_id, %error, file = name, "Grok transcript mirror skipped");
