@@ -994,6 +994,111 @@ pub(crate) mod tests {
         }
     }
 
+    /// Run explicitly with `cargo test --lib sdk897_claude_backlog -- --ignored --nocapture`.
+    /// This diagnostic preloads a real SQLite event backlog and translates it
+    /// through the production Claude translator and checkpoint transaction.
+    #[tokio::test]
+    #[ignore = "manual replay performance diagnostic"]
+    async fn sdk897_claude_backlog() {
+        use crate::wire::Envelope;
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        let turns = std::env::var("SDK897_TURNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(300);
+        let body_bytes = std::env::var("SDK897_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2048);
+        let interval = (turns / 3).max(1);
+        assert!(turns > 0, "SDK897_TURNS must be positive");
+        let f = SourceFixture::new("claude-code").await;
+        let transcript = f.options.data_dir.join("claude-replay.jsonl");
+        let mut contents = Vec::new();
+        let mut events = Vec::new();
+        for turn in 0..turns {
+            for (kind, record, hook) in [
+                (
+                    "user",
+                    json!({"type":"user","uuid":format!("u-{turn}"),"timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":format!("turn {turn} {}", "x".repeat(body_bytes))}}),
+                    "UserPromptSubmit",
+                ),
+                (
+                    "assistant",
+                    json!({"type":"assistant","uuid":format!("a-{turn}"),"timestamp":"2026-01-01T00:00:01Z","message":{"id":format!("m-{turn}"),"model":"claude-test","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}),
+                    "Stop",
+                ),
+            ] {
+                contents.extend_from_slice(record.to_string().as_bytes());
+                contents.push(b'\n');
+                let mut payload = json!({"transcript_path": transcript, "_bt_claude_transcript_mirrors": {transcript.to_string_lossy().to_string(): {"mirror": transcript,"through": contents.len()}}});
+                if kind == "user" {
+                    payload["prompt"] = json!(format!("turn {turn}"));
+                }
+                events.push(Envelope {
+                    source: "claude-code".into(),
+                    session_id: "checkpoint".into(),
+                    event: hook.into(),
+                    ts_ms: 1_767_225_600_000 + turn as i64 * 2000,
+                    payload,
+                    source_version: None,
+                    plugin_version: None,
+                    managed_run_id: None,
+                    capture: None,
+                    route: None,
+                    config: None,
+                });
+            }
+        }
+        std::fs::write(&transcript, &contents).unwrap();
+        let mut boundaries = Vec::new();
+        for event in &events {
+            boundaries.push(f.write(event, false).await);
+        }
+        assert_eq!(f.db().count(Table::Events), (turns * 2) as u64);
+        let mut replay_time = Duration::ZERO;
+        for completed in (interval..=turns)
+            .step_by(interval)
+            .chain(std::iter::once(turns))
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let start = Instant::now();
+            f.process(boundaries[completed * 2 - 1]).await;
+            replay_time += start.elapsed();
+            let continuation = f.options.storage.continuation().await.unwrap().unwrap();
+            let saved: Continuation = serde_json::from_slice(&continuation).unwrap();
+            let mut translator = f
+                .options
+                .registry
+                .create_checked_with_session_namespace("claude-code", &f.options.namespace)
+                .unwrap();
+            translator.restore_state(&saved.native).unwrap();
+            let serial_start = Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(translator.save_state().unwrap());
+            }
+            println!(
+                "turns={completed} events={} continuation_bytes={} replay_ms={} mean_save_us={}",
+                completed * 2,
+                continuation.len(),
+                replay_time.as_millis(),
+                serial_start.elapsed().as_micros() / 10
+            );
+        }
+        if let Ok(budget) = std::env::var("SDK897_MAX_REPLAY_MS") {
+            let budget = budget
+                .parse::<u128>()
+                .expect("SDK897_MAX_REPLAY_MS must be an integer");
+            assert!(
+                replay_time.as_millis() <= budget,
+                "replay exceeded {budget} ms"
+            );
+        }
+        f.source.shutdown().await;
+    }
+
     #[test]
     fn every_agent_resumes_from_saved_state_at_every_native_boundary() {
         let registry = crate::translate::Registry::default_agents();

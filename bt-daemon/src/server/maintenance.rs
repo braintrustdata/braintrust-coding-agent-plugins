@@ -447,6 +447,75 @@ mod tests {
         )
     }
 
+    /// Run with `cargo test --lib sdk897_control_plane -- --ignored --nocapture`.
+    /// Holding the recovery gate makes the control RPC behavior deterministic.
+    #[tokio::test]
+    #[ignore = "manual recovery responsiveness diagnostic"]
+    async fn sdk897_control_plane() {
+        let mut timely = Vec::new();
+        for method_name in [
+            crate::wire::method::STATUS_GET,
+            crate::wire::method::DAEMON_SHUTDOWN,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (daemon, ready) = paused_ingress(tmp.path());
+            let request = crate::wire::Request::new(
+                crate::wire::RequestId::Int(1),
+                method_name,
+                serde_json::json!({}),
+            );
+            let mut client = None;
+            let response = tokio::time::timeout(
+                Duration::from_millis(250),
+                super::super::rpc::handle_request(&daemon, request, &mut client),
+            )
+            .await;
+            let returned = response.is_ok_and(|response| response.error.is_none());
+            println!("{method_name}: returned_before_recovery={returned}");
+            timely.push(returned);
+            ready.send(()).unwrap();
+            drain_all(&daemon).await;
+        }
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (daemon, ready) = paused_ingress(tmp.path());
+            let socket = tmp.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server_daemon = daemon.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = super::super::rpc::serve_connection(server_daemon, stream).await;
+            });
+            let host = crate::HostInfo {
+                serve_argv: Vec::new(),
+                version: "newer-test-version".into(),
+            };
+            let capture = event("handover", SessionRoute::default());
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                crate::forward_envelope(&capture, &socket, &host, false),
+            )
+            .await;
+            assert!(
+                !matches!(result, Ok(Ok(()))),
+                "an unacknowledged event must not be reported as captured"
+            );
+            let returned = result.is_ok();
+            println!("hook.handover: returned_before_recovery={returned}");
+            timely.push(returned);
+            ready.send(()).unwrap();
+            server.await.unwrap();
+            drain_all(&daemon).await;
+        }
+        if std::env::var_os("SDK897_EXPECT_RESPONSIVE").is_some() {
+            assert!(
+                timely.into_iter().all(|returned| returned),
+                "control RPC blocked behind recovery"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_recovery_and_dispatch_share_one_source_producer() {
         let f = crate::pipeline::translation::tests::SourceFixture::new("debug").await;
