@@ -63,4 +63,30 @@ impl AuthDiagnostic {
     pub fn is_error(&self) -> bool {
         self.status == "error"
     }
+
+    /// Render one auth view; `prefix` distinguishes the daemon's from the local.
+    pub(super) fn append_human(&self, rendered: &mut String, prefix: &str) {
+        let label = |name: &str| {
+            if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}{}", name.to_lowercase())
+            }
+        };
+        rendered.push_str(&format!(
+            "\n{}: {} ({})",
+            label("Auth"),
+            self.status,
+            self.source
+        ));
+        for (name, value) in [
+            ("Profile", &self.profile),
+            ("Organization", &self.org_name),
+            ("Auth error", &self.error),
+        ] {
+            if let Some(value) = value {
+                rendered.push_str(&format!("\n{}: {value}", label(name)));
+            }
+        }
+    }
 }
