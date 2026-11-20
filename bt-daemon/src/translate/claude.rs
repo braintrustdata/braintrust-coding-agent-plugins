@@ -6,6 +6,29 @@
 //! the hook timestamp; this is essential when replaying a journal against a
 //! transcript that already contains the completed session.
 
+mod history_message;
+mod hook_context;
+mod llm_call;
+mod message_history;
+mod native_field;
+mod parsed_transcript;
+mod subagent_hook;
+mod timestamp_envelope;
+mod transcript_envelope;
+mod transcript_tool;
+mod transcript_tool_outcome;
+
+use hook_context::HookContext;
+use llm_call::LlmCall;
+use message_history::MessageHistory;
+use parsed_transcript::ParsedTranscript;
+use subagent_hook::SubagentHook;
+#[cfg(test)]
+use timestamp_envelope::parse_rfc3339_timestamp;
+use timestamp_envelope::parse_timestamp_ms;
+use transcript_envelope::TranscriptEnvelope;
+use transcript_tool::TranscriptTool;
+
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{
@@ -15,7 +38,6 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
-use crate::agents::usage::SnakeCaseUsage;
 use crate::ids;
 use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
@@ -26,114 +48,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::sync::Arc;
 
-#[derive(Default, Deserialize, Serialize)]
-struct HookContext {
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    cwd: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    transcript_path: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    source: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    model: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    permission_mode: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_effort")]
-    effort: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    system_prompt: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct SubagentHook {
-    #[serde(deserialize_with = "deserialize_nonempty_string")]
-    agent_id: String,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    agent_type: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
-    agent_transcript_path: Option<String>,
-}
-
-/// Stable routing fields from one Claude transcript row. Message and tool
-/// blocks intentionally remain raw because they are preserved in span I/O.
-#[derive(Deserialize, Serialize)]
-struct TranscriptEnvelope {
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    #[serde(default)]
-    subtype: Option<String>,
-    #[serde(rename = "isCompactSummary", default)]
-    is_compact_summary: bool,
-}
-
-/// Timestamp decoding is deliberately separate from transcript routing. A
-/// future change to an unrelated routing field must not cause bounded reads to
-/// consume records from after a hook's capture point.
-#[derive(Deserialize, Serialize)]
-struct TimestampEnvelope {
-    #[serde(
-        rename = "timestamp",
-        default,
-        deserialize_with = "deserialize_optional_timestamp"
-    )]
-    timestamp_ms: Option<i64>,
-}
-
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
-}
-
-fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(value_as_nonempty_string))
-}
-
-/// Claude hooks report effort as `{"level": "high"}`.
-fn deserialize_optional_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(|effort| effort.get("level"))
-        .and_then(value_as_nonempty_string))
-}
-
-fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    value_as_nonempty_string(&value)
-        .ok_or_else(|| serde::de::Error::custom("expected a non-empty string or number"))
-}
-
-fn deserialize_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339_timestamp))
-}
-
-fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.timestamp_millis())
-}
-
-fn value_as_nonempty_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) if !value.is_empty() => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
-        _ => None,
-    }
 }
 
 impl TranslatorFactory for crate::agents::Claude {
@@ -191,77 +107,6 @@ enum PendingHistory {
     Owned(MessageHistory),
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct MessageHistory {
-    messages: Vec<HistoryMessage>,
-    preserved_after_compaction: Vec<String>,
-    fork_context_prefix: bool,
-}
-#[derive(Serialize, Deserialize)]
-struct HistoryMessage {
-    value: Value,
-    source_uuids: Vec<String>,
-}
-
-impl MessageHistory {
-    fn active(&self) -> Vec<Value> {
-        self.messages
-            .iter()
-            .map(|message| message.value.clone())
-            .collect()
-    }
-
-    fn push(&mut self, value: Value, source_uuid: Option<String>) -> usize {
-        let index = self.messages.len();
-        self.messages.push(HistoryMessage {
-            value,
-            source_uuids: source_uuid.into_iter().collect(),
-        });
-        index
-    }
-
-    fn update(&mut self, index: usize, value: Value, source_uuid: Option<String>) {
-        let Some(message) = self.messages.get_mut(index) else {
-            return;
-        };
-        message.value = value;
-        if let Some(source_uuid) = source_uuid {
-            if !message.source_uuids.contains(&source_uuid) {
-                message.source_uuids.push(source_uuid);
-            }
-        }
-    }
-
-    fn observe_compact_boundary(&mut self, record: &Value) {
-        self.preserved_after_compaction = record
-            .pointer("/compactMetadata/preservedMessages/uuids")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect();
-    }
-
-    fn begin_compacted(&mut self, summary: Value, source_uuid: Option<String>) {
-        let preserved = std::mem::take(&mut self.preserved_after_compaction);
-        let kept = self
-            .messages
-            .drain(..)
-            .filter(|message| {
-                message
-                    .source_uuids
-                    .iter()
-                    .any(|uuid| preserved.contains(uuid))
-            })
-            .collect::<Vec<_>>();
-        self.messages.push(HistoryMessage {
-            value: summary,
-            source_uuids: source_uuid.into_iter().collect(),
-        });
-        self.messages.extend(kept);
-    }
-}
 #[derive(Serialize, Deserialize)]
 struct PendingEmission {
     segments: VecDeque<Vec<Value>>,
@@ -1104,7 +949,7 @@ impl ClaudeTranslator {
             calls,
             tools,
             history,
-        } = parse_transcript(&records, history);
+        } = history.parse_records(&records);
         match &mut pending.history {
             PendingHistory::Main => self.main_history = history,
             PendingHistory::Owned(pending_history) => *pending_history = history,
@@ -1559,9 +1404,9 @@ impl AgentTranslator for ClaudeTranslator {
                         .and_then(|path| self.transcripts.get_mut(path))
                     {
                         let records = std::mem::take(&mut cursor.buffered);
-                        self.main_history =
-                            parse_transcript(&records, std::mem::take(&mut self.main_history))
-                                .history;
+                        self.main_history = std::mem::take(&mut self.main_history)
+                            .parse_records(&records)
+                            .history;
                     }
                 }
             }
@@ -1775,207 +1620,16 @@ fn assistant_request_id(record: &Value) -> Option<String> {
     .flatten()
     .filter(|id| !id.is_empty())
 }
-#[derive(Serialize, Deserialize)]
-struct ParsedTranscript {
-    calls: Vec<LlmCall>,
-    tools: Vec<TranscriptTool>,
-    history: MessageHistory,
-}
-
-fn parse_transcript(records: &[Value], mut history: MessageHistory) -> ParsedTranscript {
-    let mut calls = Vec::<LlmCall>::new();
-    let mut call_indexes = HashMap::<String, usize>::new();
-    let mut assistant_history_indexes = HashMap::<String, usize>::new();
-    let mut tools = HashMap::<String, TranscriptTool>::new();
-    let mut tool_order = Vec::<String>::new();
-
-    for record in records {
-        let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
-            continue;
-        };
-        match envelope.kind.as_deref() {
-            Some("assistant") => {
-                let request_id = record
-                    .get("message")
-                    .and_then(|message| string_field(message, "id"))
-                    .or_else(|| string_field(record, "requestId"))
-                    .or_else(|| string_field(record, "uuid"))
-                    .unwrap_or_default();
-                if request_id.is_empty() {
-                    continue;
-                }
-                let index = *call_indexes.entry(request_id.clone()).or_insert_with(|| {
-                    let index = calls.len();
-                    calls.push(LlmCall::new(
-                        request_id.clone(),
-                        parse_timestamp_ms(record).unwrap_or(0),
-                        if history.fork_context_prefix {
-                            Vec::new()
-                        } else {
-                            history.active()
-                        },
-                        history.fork_context_prefix,
-                    ));
-                    index
-                });
-                calls[index].observe(record);
-                let output = calls[index].output_message();
-                let source_uuid = string_field(record, "uuid");
-                if let Some(history_index) = assistant_history_indexes.get(&request_id) {
-                    history.update(*history_index, output, source_uuid);
-                } else {
-                    let history_index = history.push(output, source_uuid);
-                    assistant_history_indexes.insert(request_id.clone(), history_index);
-                }
-                // Fork transcripts copy the launching response before their
-                // first user row. It is input context, not child work or usage.
-                if calls[index].inherited {
-                    continue;
-                }
-                if let Some(content) = record.pointer("/message/content").and_then(Value::as_array)
-                {
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                            let Some(call_id) = string_field(block, "id") else {
-                                continue;
-                            };
-                            if !tools.contains_key(&call_id) {
-                                tool_order.push(call_id.clone());
-                                tools.insert(
-                                    call_id.clone(),
-                                    TranscriptTool {
-                                        call_id,
-                                        tool_name: string_field(block, "name")
-                                            .unwrap_or_else(|| "Tool".into()),
-                                        input: block
-                                            .get("input")
-                                            .cloned()
-                                            .unwrap_or_else(|| json!({})),
-                                        output: None,
-                                        approval: None,
-                                        cancelled: false,
-                                        terminal: false,
-                                        error: None,
-                                        start_ms: parse_timestamp_ms(record).unwrap_or(0),
-                                        end_ms: parse_timestamp_ms(record).unwrap_or(0),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Some("user") => {
-                history.fork_context_prefix = false;
-                // Claude persists a synthetic user message containing the new
-                // active context immediately after a compact_boundary record.
-                // It is the first model-visible message after the boundary.
-                if envelope.is_compact_summary {
-                    let content = record
-                        .pointer("/message/content")
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    history.begin_compacted(
-                        json!({
-                            "role": "user",
-                            "content": if content.is_null() {
-                                json!("[compaction summary unavailable]")
-                            } else {
-                                content
-                            },
-                            "message_type": "compaction_summary"
-                        }),
-                        string_field(record, "uuid"),
-                    );
-                    continue;
-                }
-                let content = record
-                    .pointer("/message/content")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                if let Some(blocks) = content.as_array() {
-                    let mut had_tool_result = false;
-                    for block in blocks {
-                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                            continue;
-                        }
-                        had_tool_result = true;
-                        let call_id = string_field(block, "tool_use_id").unwrap_or_default();
-                        let result = block.get("content").cloned().unwrap_or(Value::Null);
-                        history.push(
-                            json!({
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "content": result
-                            }),
-                            string_field(record, "uuid"),
-                        );
-                        if let Some(tool) = tools.get_mut(&call_id) {
-                            tool.output = Some(result);
-                            tool.end_ms = parse_timestamp_ms(record).unwrap_or(tool.start_ms);
-                            tool.terminal = true;
-                            match transcript_tool_outcome(block, record) {
-                                TranscriptToolOutcome::Succeeded => {
-                                    tool.approval = Some(ToolApproval::Approved);
-                                }
-                                TranscriptToolOutcome::Failed(error) => {
-                                    tool.approval = Some(ToolApproval::Approved);
-                                    tool.error = Some(error);
-                                }
-                                TranscriptToolOutcome::Denied => {
-                                    tool.approval = Some(ToolApproval::Denied);
-                                }
-                                TranscriptToolOutcome::Cancelled => {
-                                    tool.cancelled = true;
-                                }
-                            }
-                        }
-                    }
-                    if !had_tool_result {
-                        history.push(
-                            json!({ "role": "user", "content": content }),
-                            string_field(record, "uuid"),
-                        );
-                    }
-                } else if !content.is_null() {
-                    history.push(
-                        json!({ "role": "user", "content": content }),
-                        string_field(record, "uuid"),
-                    );
-                }
-            }
-            Some("system") if envelope.subtype.as_deref() == Some("compact_boundary") => {
-                history.observe_compact_boundary(record);
-            }
-            Some("fork-context-ref") => history.fork_context_prefix = true,
-            _ => {}
-        }
-    }
-    calls.retain(|call| !call.inherited);
-    ParsedTranscript {
-        calls,
-        tools: tool_order
-            .into_iter()
-            .filter_map(|id| tools.remove(&id))
-            .collect(),
-        history,
-    }
-}
-
 /// Returns the most recent SubagentHandback report whose matching transcript
 /// result proves that the tool completed successfully.
 pub(crate) fn successful_subagent_handback_message(records: &[Value]) -> Option<Value> {
-    parse_transcript(records, MessageHistory::default())
+    MessageHistory::default()
+        .parse_records(records)
         .tools
         .into_iter()
         .rev()
-        .find(|tool| {
-            tool.tool_name == "SubagentHandback"
-                && tool.approval == Some(ToolApproval::Approved)
-                && tool.error.is_none()
-                && !tool.cancelled
-        })
-        .and_then(|tool| tool.input.get("message").cloned())
+        .find(TranscriptTool::is_successful_handback)
+        .and_then(|tool| tool.handback_message())
 }
 
 fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
@@ -2056,382 +1710,6 @@ fn is_real_user_record(record: &Value) -> bool {
                 .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
         })
 }
-#[derive(Serialize, Deserialize)]
-struct LlmCall {
-    request_id: String,
-    inherited: bool,
-    model: String,
-    start_ms: i64,
-    end_ms: i64,
-    input: Vec<Value>,
-    text: Vec<String>,
-    tool_calls: Vec<Value>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_creation_5m_tokens: u64,
-    cache_creation_1h_tokens: u64,
-    cache_read_tokens: u64,
-    error: Option<String>,
-    api_error_status: Option<u64>,
-}
-
-impl LlmCall {
-    fn new(request_id: String, start_ms: i64, input: Vec<Value>, inherited: bool) -> Self {
-        Self {
-            request_id,
-            inherited,
-            model: "claude".into(),
-            start_ms,
-            end_ms: start_ms,
-            input,
-            text: Vec::new(),
-            tool_calls: Vec::new(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
-            cache_read_tokens: 0,
-            error: None,
-            api_error_status: None,
-        }
-    }
-
-    fn observe(&mut self, record: &Value) {
-        self.end_ms = parse_timestamp_ms(record).unwrap_or(self.end_ms);
-        if record
-            .get("isApiErrorMessage")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            self.error = string_field(record, "error")
-                .or_else(|| {
-                    record
-                        .pointer("/message/content")
-                        .and_then(Value::as_array)
-                        .and_then(|content| {
-                            content.iter().find_map(|block| {
-                                (block.get("type").and_then(Value::as_str) == Some("text"))
-                                    .then(|| block.get("text").and_then(Value::as_str))
-                                    .flatten()
-                            })
-                        })
-                        .map(str::to_owned)
-                })
-                .or_else(|| Some("Claude API error".into()));
-            self.api_error_status = record.get("apiErrorStatus").and_then(Value::as_u64);
-        }
-        let Some(message) = record.get("message") else {
-            return;
-        };
-        if let Some(model) = string_field(message, "model") {
-            self.model = model;
-        }
-        if let Some(content) = message.get("content").and_then(Value::as_array) {
-            for block in content {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = block.get("text").and_then(Value::as_str) {
-                            if !self.text.iter().any(|seen| seen == text) {
-                                self.text.push(text.to_string());
-                            }
-                        }
-                    }
-                    Some("tool_use") => {
-                        let arguments =
-                            serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
-                                .unwrap_or_else(|_| "{}".into());
-                        let call = json!({
-                            "id": block.get("id").cloned().unwrap_or(Value::Null),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name").cloned().unwrap_or(Value::Null),
-                                "arguments": arguments
-                            }
-                        });
-                        if !self.tool_calls.contains(&call) {
-                            self.tool_calls.push(call);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        #[derive(Deserialize)]
-        struct UsageRecord {
-            message: Option<UsageMessage>,
-        }
-        #[derive(Deserialize)]
-        struct UsageMessage {
-            usage: Option<SnakeCaseUsage>,
-        }
-        if let Some(usage) = decode::<UsageRecord>(record)
-            .and_then(|record| record.message)
-            .and_then(|message| message.usage)
-        {
-            self.prompt_tokens = self.prompt_tokens.max(usage.input_tokens.unwrap_or(0));
-            self.completion_tokens = self.completion_tokens.max(usage.output_tokens.unwrap_or(0));
-            self.cache_creation_tokens = self
-                .cache_creation_tokens
-                .max(usage.cache_creation_input_tokens.unwrap_or(0));
-            self.cache_read_tokens = self
-                .cache_read_tokens
-                .max(usage.cache_read_input_tokens.unwrap_or(0));
-            if let Some(cache) = usage.cache_creation {
-                self.cache_creation_5m_tokens = self
-                    .cache_creation_5m_tokens
-                    .max(cache.ephemeral_5m_input_tokens.unwrap_or(0));
-                self.cache_creation_1h_tokens = self
-                    .cache_creation_1h_tokens
-                    .max(cache.ephemeral_1h_input_tokens.unwrap_or(0));
-            }
-        }
-    }
-
-    fn output_message(&self) -> Value {
-        let content = self.text.join("\n");
-        if self.tool_calls.is_empty() {
-            json!({ "role": "assistant", "content": content })
-        } else {
-            json!({ "role": "assistant", "content": content, "tool_calls": self.tool_calls })
-        }
-    }
-
-    fn into_row(self, span_id: String, root_span_id: String, parent: String) -> SpanRow {
-        let has_split = self.cache_creation_5m_tokens > 0 || self.cache_creation_1h_tokens > 0;
-        let creation = if has_split {
-            self.cache_creation_5m_tokens + self.cache_creation_1h_tokens
-        } else {
-            self.cache_creation_tokens
-        };
-        let prompt = self.prompt_tokens + self.cache_read_tokens + creation;
-        let mut metrics = Map::new();
-        metrics.insert("prompt_tokens".into(), json!(prompt));
-        metrics.insert("completion_tokens".into(), json!(self.completion_tokens));
-        metrics.insert("tokens".into(), json!(prompt + self.completion_tokens));
-        metrics.insert("prompt_cached_tokens".into(), json!(self.cache_read_tokens));
-        if has_split {
-            metrics.insert(
-                "prompt_cache_creation_5m_tokens".into(),
-                json!(self.cache_creation_5m_tokens),
-            );
-            metrics.insert(
-                "prompt_cache_creation_1h_tokens".into(),
-                json!(self.cache_creation_1h_tokens),
-            );
-        } else {
-            metrics.insert(
-                "prompt_cache_creation_tokens".into(),
-                json!(self.cache_creation_tokens),
-            );
-        }
-        let output = self.output_message();
-        let mut metadata = Map::new();
-        metadata.insert("model".into(), json!(self.model));
-        metadata.insert("request_id".into(), json!(self.request_id));
-        if let Some(status) = self.api_error_status {
-            metadata.insert("api_error_status".into(), json!(status));
-        }
-        SpanRow {
-            span_id,
-            root_span_id,
-            parent_span_ids: vec![parent],
-            name: self.model.clone(),
-            span_type: SpanType::Llm,
-            start_ms: Some(self.start_ms),
-            end_ms: Some(self.end_ms),
-            input: Some(Value::Array(self.input)),
-            output: Some(output),
-            metadata: Some(Value::Object(metadata)),
-            metrics: Some(Value::Object(metrics)),
-            error: self.error,
-            ..Default::default()
-        }
-    }
-}
-#[derive(Serialize, Deserialize)]
-enum TranscriptToolOutcome {
-    Succeeded,
-    Failed(String),
-    Denied,
-    Cancelled,
-}
-
-fn transcript_tool_outcome(block: &Value, record: &Value) -> TranscriptToolOutcome {
-    let native_result = record.get("toolUseResult");
-    let values = [block.get("content"), native_result]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    let error_signalled = block.get("is_error").and_then(Value::as_bool) == Some(true)
-        || block.get("isError").and_then(Value::as_bool) == Some(true)
-        || values.iter().any(|value| has_structured_error(value));
-    let structured_denial = values
-        .iter()
-        .any(|value| has_structured_outcome(value, &["denied", "deny", "rejected", "reject"]));
-    let denial_text = values.iter().any(|value| {
-        (has_outcome_phrase(value, &["permission to use"])
-            && has_outcome_phrase(value, &["has been denied"]))
-            || has_outcome_phrase(
-                value,
-                &[
-                    "tool use was rejected",
-                    "tool use was denied",
-                    "user rejected",
-                    "user denied",
-                    "user doesn't want to proceed",
-                    "user does not want to proceed",
-                    "permission request was rejected",
-                    "permission request was denied",
-                ],
-            )
-    });
-    if structured_denial || (error_signalled && denial_text) {
-        return TranscriptToolOutcome::Denied;
-    }
-
-    let structured_cancellation = values.iter().any(|value| {
-        has_structured_outcome(value, &["cancelled", "canceled", "aborted", "interrupted"])
-            || has_structured_cancellation(value)
-    });
-    let cancellation_text = values.iter().any(|value| {
-        has_outcome_phrase(
-            value,
-            &[
-                "request interrupted by user",
-                "tool use was cancelled",
-                "tool use was canceled",
-                "operation was cancelled",
-                "operation was canceled",
-                "operation was aborted",
-                "user cancelled",
-                "user canceled",
-            ],
-        )
-    });
-    if structured_cancellation || (error_signalled && cancellation_text) {
-        return TranscriptToolOutcome::Cancelled;
-    }
-
-    if error_signalled {
-        let error = values
-            .iter()
-            .find_map(|value| nonempty_error_text(value))
-            .unwrap_or_else(|| "Tool execution failed".into());
-        TranscriptToolOutcome::Failed(error)
-    } else {
-        TranscriptToolOutcome::Succeeded
-    }
-}
-
-fn has_structured_outcome(value: &Value, outcomes: &[&str]) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    ["status", "outcome", "type"]
-        .into_iter()
-        .filter_map(|key| object.get(key).and_then(Value::as_str))
-        .any(|status| outcomes.contains(&status.trim().to_ascii_lowercase().as_str()))
-}
-
-fn has_structured_error(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        object.get("is_error").and_then(Value::as_bool) == Some(true)
-            || object.get("isError").and_then(Value::as_bool) == Some(true)
-            || object.get("error").is_some_and(|error| {
-                error.as_bool() == Some(true) || nonempty_error_text(error).is_some()
-            })
-            || has_structured_outcome(value, &["error", "failed", "failure"])
-    })
-}
-
-fn has_structured_cancellation(value: &Value) -> bool {
-    value.as_object().is_some_and(|object| {
-        ["interrupted", "cancelled", "canceled", "aborted"]
-            .into_iter()
-            .any(|key| object.get(key).and_then(Value::as_bool) == Some(true))
-    })
-}
-
-fn has_outcome_phrase(value: &Value, phrases: &[&str]) -> bool {
-    match value {
-        Value::String(text) => {
-            let text = text.to_ascii_lowercase();
-            phrases.iter().any(|phrase| text.contains(phrase))
-        }
-        Value::Array(values) => values
-            .iter()
-            .any(|value| has_outcome_phrase(value, phrases)),
-        Value::Object(object) => object
-            .values()
-            .any(|value| has_outcome_phrase(value, phrases)),
-        _ => false,
-    }
-}
-#[derive(Serialize, Deserialize)]
-struct TranscriptTool {
-    call_id: String,
-    tool_name: String,
-    input: Value,
-    output: Option<Value>,
-    approval: Option<ToolApproval>,
-    cancelled: bool,
-    terminal: bool,
-    error: Option<String>,
-    start_ms: i64,
-    end_ms: i64,
-}
-
-impl TranscriptTool {
-    fn metadata(&self) -> Value {
-        let mut metadata = Map::new();
-        metadata.insert("tool_name".into(), json!(self.tool_name));
-        add_tool_approval(&mut metadata, self.approval);
-        metadata.insert("tool_call_id".into(), json!(self.call_id));
-        metadata.insert("recovered_from_transcript".into(), json!(true));
-        if self.cancelled || !self.terminal {
-            metadata.insert("cancelled".into(), json!(true));
-        }
-        Value::Object(metadata)
-    }
-
-    fn into_row(self, span_id: String, root_span_id: String, parent: String) -> SpanRow {
-        SpanRow {
-            span_id,
-            root_span_id,
-            parent_span_ids: vec![parent],
-            name: tool_span_name(
-                &self.tool_name,
-                &self.input,
-                skill_load(&self.tool_name, &self.input).as_ref(),
-            ),
-            span_type: SpanType::Tool,
-            start_ms: Some(self.start_ms),
-            end_ms: Some(self.end_ms),
-            input: Some(self.input.clone()),
-            output: self.output.clone(),
-            metadata: Some(self.metadata()),
-            error: self.error.clone(),
-            ..Default::default()
-        }
-    }
-
-    fn into_update(self, span_id: String, root_span_id: String, parent_id: String) -> SpanRow {
-        SpanRow {
-            span_id,
-            root_span_id,
-            parent_span_ids: vec![parent_id],
-            end_ms: Some(self.end_ms),
-            output: self.output.clone(),
-            metadata: Some(self.metadata()),
-            error: self.error.clone(),
-            ..Default::default()
-        }
-    }
-}
-
 /// Read newline-delimited records forward from `offset`, advancing it past
 /// everything consumed.
 ///
@@ -2650,10 +1928,6 @@ fn tool_output(payload: &Value) -> Option<Value> {
 
 fn tool_name(payload: &Value) -> Option<String> {
     string_field(payload, "tool_name").or_else(|| string_field(payload, "tool"))
-}
-
-fn parse_timestamp_ms(value: &Value) -> Option<i64> {
-    decode::<TimestampEnvelope>(value).and_then(|value| value.timestamp_ms)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {

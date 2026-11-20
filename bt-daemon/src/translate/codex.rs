@@ -38,6 +38,22 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+mod compact_hook;
+mod payload_kind;
+mod read_lines;
+mod rollout_record;
+mod session_start_hook;
+mod subagent_start_hook;
+mod turn_context_payload;
+mod working_directory_payload;
+
+use compact_hook::CompactHook;
+use read_lines::read_new_lines;
+use rollout_record::RolloutRecord;
+use session_start_hook::SessionStartHook;
+use subagent_start_hook::SubagentStartHook;
+use turn_context_payload::TurnContextPayload;
+
 mod tool_output;
 
 const SPAWN_AGENT_TOOL: &str = "spawn_agent";
@@ -46,69 +62,6 @@ const MAX_OPEN_TOOL_SPAN_MS: i64 = 24 * 60 * 60 * 1000;
 /// A hook can arrive after a daemon restart or against an existing rollout.
 /// Keep a single translator batch small even when the unread suffix is large.
 const CATCH_UP_BYTE_BUDGET: usize = 64 * 1024;
-
-// Codex hooks are triggers for the rollout reader. These partial types cover
-// the hook-owned correlation fields while preserving raw rollout JSON for the
-// separately bounded transcript reducer.
-#[derive(Deserialize, Serialize)]
-struct SessionStartHook {
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    permission_mode: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct CompactHook {
-    turn_id: String,
-    #[serde(default)]
-    trigger: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct SubagentStartHook {
-    agent_id: String,
-    #[serde(default)]
-    agent_type: Option<Value>,
-}
-
-/// The stable outer shape of a rollout JSONL row. The payload deliberately
-/// stays untyped here: Codex adds response-item fields regularly and several
-/// handlers preserve those native objects in span input/output.
-#[derive(Deserialize, Serialize)]
-struct RolloutRecord {
-    #[serde(
-        rename = "timestamp",
-        default,
-        deserialize_with = "deserialize_timestamp"
-    )]
-    timestamp_ms: Option<i64>,
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    #[serde(default)]
-    payload: Value,
-}
-
-/// Event and response rows use a second discriminator inside their payload.
-#[derive(Deserialize, Serialize)]
-struct PayloadKind {
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct WorkingDirectoryPayload {
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct TurnContextPayload {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    turn_id: Option<String>,
-}
 
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
     serde_json::from_value(value.clone()).ok()
@@ -677,10 +630,8 @@ impl CodexTranslator {
         let ts = rec.timestamp_ms.unwrap_or(hook_ts);
         let kind = rec.kind.as_deref().unwrap_or("");
         let payload = &rec.payload;
-        if matches!(kind, "session_meta" | "turn_context") {
-            if let Some(cwd) = decode::<WorkingDirectoryPayload>(payload).and_then(|v| v.cwd) {
-                scope.current_cwd = Some(cwd);
-            }
+        if let Some(cwd) = rec.working_directory() {
+            scope.current_cwd = Some(cwd);
         }
 
         match kind {
@@ -730,9 +681,7 @@ impl CodexTranslator {
                 }
             }
             "event_msg" => {
-                let sub = decode::<PayloadKind>(payload)
-                    .and_then(|v| v.kind)
-                    .unwrap_or_default();
+                let sub = rec.payload_kind();
                 match sub.as_str() {
                     "task_started" => self.open_turn(scope, payload, ts, ops),
                     "user_message" => self.set_turn_input(scope, payload, ops),
@@ -743,9 +692,7 @@ impl CodexTranslator {
                 }
             }
             "response_item" => {
-                let sub = decode::<PayloadKind>(payload)
-                    .and_then(|v| v.kind)
-                    .unwrap_or_default();
+                let sub = rec.payload_kind();
                 match sub.as_str() {
                     "message" => self.on_message(scope, payload, ts, ops),
                     "reasoning" => self.on_reasoning(scope, payload, ts, ops),
@@ -2077,218 +2024,14 @@ fn compaction_history(payload: &Value, replacement: Option<&Vec<Value>>) -> Vec<
     })]
 }
 
-fn parse_ts(rec: &Value) -> Option<i64> {
-    rec.get("timestamp").and_then(normalize_timestamp)
-}
-
-/// Deserialize Codex rollout timestamps into Unix milliseconds. Rollouts have
-/// historically used RFC 3339 strings, but imported or newer producers may
-/// supply numeric epoch seconds, milliseconds, microseconds, or nanoseconds.
-/// Unknown values remain absent so the caller can use the hook timestamp.
-fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Value>::deserialize(deserializer)?
-        .as_ref()
-        .and_then(normalize_timestamp))
-}
-
-fn normalize_timestamp(value: &Value) -> Option<i64> {
-    match value {
-        Value::String(value) => {
-            parse_rfc3339_timestamp(value).or_else(|| normalize_numeric_timestamp(value))
-        }
-        Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                normalize_epoch_integer(value)
-            } else if let Some(value) = value.as_u64() {
-                i64::try_from(value).ok().and_then(normalize_epoch_integer)
-            } else {
-                value.as_f64().and_then(normalize_epoch_float)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn normalize_numeric_timestamp(value: &str) -> Option<i64> {
-    value
-        .parse::<i64>()
-        .ok()
-        .and_then(normalize_epoch_integer)
-        .or_else(|| value.parse::<f64>().ok().and_then(normalize_epoch_float))
-}
-
-fn normalize_epoch_integer(value: i64) -> Option<i64> {
-    let magnitude = value.unsigned_abs();
-    if magnitude < 100_000_000_000 {
-        value.checked_mul(1_000)
-    } else if magnitude < 100_000_000_000_000 {
-        Some(value)
-    } else if magnitude < 100_000_000_000_000_000 {
-        Some(value / 1_000)
-    } else {
-        Some(value / 1_000_000)
-    }
-}
-
-fn normalize_epoch_float(value: f64) -> Option<i64> {
-    if !value.is_finite() {
-        return None;
-    }
-    let magnitude = value.abs();
-    let milliseconds = if magnitude < 100_000_000_000.0 {
-        value * 1_000.0
-    } else if magnitude < 100_000_000_000_000.0 {
-        value
-    } else if magnitude < 100_000_000_000_000_000.0 {
-        value / 1_000.0
-    } else {
-        value / 1_000_000.0
-    };
-    if milliseconds < i64::MIN as f64 || milliseconds > i64::MAX as f64 {
-        None
-    } else {
-        Some(milliseconds.trunc() as i64)
-    }
-}
-
-fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.timestamp_millis())
-}
-#[derive(Serialize, Deserialize)]
-struct ReadLines {
-    lines: Vec<String>,
-    complete: bool,
-}
-
-fn read_new_lines(
-    path: &str,
-    offset: &mut u64,
-    through_ms: Option<i64>,
-    through_bytes: Option<u64>,
-    byte_budget: usize,
-) -> ReadLines {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return ReadLines {
-            lines: Vec::new(),
-            complete: true,
-        };
-    };
-    if let Ok(meta) = f.metadata() {
-        if *offset > meta.len() {
-            *offset = 0;
-        }
-    }
-    if f.seek(SeekFrom::Start(*offset)).is_err() {
-        return ReadLines {
-            lines: Vec::new(),
-            complete: true,
-        };
-    }
-    let mut reader = BufReader::new(f);
-    let mut lines = Vec::new();
-    let mut consumed = 0usize;
-    loop {
-        if through_bytes.is_some_and(|limit| *offset >= limit) {
-            break;
-        }
-        if consumed >= byte_budget && !lines.is_empty() {
-            return ReadLines {
-                lines,
-                complete: false,
-            };
-        }
-        let mut line = String::new();
-        let Ok(bytes) = reader.read_line(&mut line) else {
-            break;
-        };
-        if bytes == 0 || !line.ends_with('\n') {
-            break;
-        }
-        if through_bytes.is_some_and(|limit| offset.saturating_add(bytes as u64) > limit) {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if let Some(limit) = through_ms {
-            if serde_json::from_str::<Value>(trimmed)
-                .ok()
-                .and_then(|record| parse_ts(&record))
-                .is_some_and(|timestamp| timestamp > limit)
-            {
-                break;
-            }
-        }
-        *offset += bytes as u64;
-        consumed += bytes;
-        if !trimmed.trim().is_empty() {
-            lines.push(trimmed.to_string());
-        }
-    }
-    ReadLines {
-        lines,
-        complete: true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{basename, normalize_timestamp, RolloutRecord};
-    use serde_json::json;
+    use super::basename;
 
     #[test]
     fn basename_accepts_unix_and_windows_paths() {
         assert_eq!(basename("/tmp/project"), "project");
         assert_eq!(basename(r"C:\Users\agent\project"), "project");
         assert_eq!(basename(r"C:\Users\agent\project\\"), "project");
-    }
-
-    #[test]
-    fn rollout_timestamps_normalize_supported_formats() {
-        let milliseconds = 1_704_067_202_000_i64;
-        assert_eq!(
-            normalize_timestamp(&json!(1_704_067_202_i64)),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!(milliseconds)),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!(1_704_067_202_000_000_i64)),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!(1_704_067_202_000_000_000_i64)),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!("2024-01-01T00:00:02Z")),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!("1704067202000")),
-            Some(milliseconds)
-        );
-        assert_eq!(
-            normalize_timestamp(&json!(1_704_067_202.25_f64)),
-            Some(milliseconds + 250)
-        );
-        assert_eq!(normalize_timestamp(&json!({ "seconds": 1 })), None);
-    }
-
-    #[test]
-    fn rollout_record_treats_unknown_timestamp_formats_as_missing() {
-        let record: RolloutRecord = serde_json::from_value(json!({
-            "timestamp": { "future": "format" },
-            "type": "event_msg",
-            "payload": { "type": "task_started" },
-        }))
-        .unwrap();
-        assert_eq!(record.timestamp_ms, None);
     }
 }
