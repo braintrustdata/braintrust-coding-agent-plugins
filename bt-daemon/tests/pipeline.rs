@@ -2451,6 +2451,81 @@ async fn claude_late_response_survives_acknowledged_idle_replay_and_restart() {
 }
 
 #[tokio::test]
+async fn claude_subagent_late_append_is_captured_after_session_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = test_endpoint(tmp.path());
+    let transcript = tmp.path().join("claude.jsonl");
+    let child = tmp.path().join("agent-worker.jsonl");
+    let recording = Arc::new(RouteRecordingSinkFactory::default());
+    let handle = start_claude_recording_daemon(
+        tmp.path().join("data"),
+        socket.clone(),
+        recording.clone(),
+        0,
+    )
+    .await;
+    claude_stop_before_response(&socket, &transcript).await;
+    let mut start = claude_stop("late-claude", &transcript, 1_790_873_301_000);
+    start.event = "SubagentStart".into();
+    start.payload["agent_id"] = serde_json::json!("worker");
+    start.payload["agent_type"] = serde_json::json!("reviewer");
+    forward_envelope(&start, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let first = serde_json::json!({"type":"assistant","timestamp":"2026-10-01T16:48:22Z","message":{"id":"child-first","model":"test","content":[{"type":"text","text":"first"}]}});
+    std::fs::write(&child, format!("{first}\n")).unwrap();
+    let mut stop = start.clone();
+    stop.event = "SubagentStop".into();
+    stop.ts_ms += 1000;
+    stop.payload["agent_transcript_path"] = serde_json::json!(child);
+    forward_envelope(&stop, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    let mut end = claude_stop("late-claude", &transcript, 1_790_873_304_000);
+    end.event = "SessionEnd".into();
+    forward_envelope(&end, &socket, &dummy_host(), false)
+        .await
+        .unwrap();
+    assert!(
+        flush_session("late-claude", &socket, 5_000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let last = serde_json::json!({"type":"assistant","timestamp":"2026-10-01T16:48:25Z","message":{"id":"child-last","model":"test","content":[{"type":"text","text":"last"}],"usage":{"input_tokens":3,"output_tokens":2}}});
+    std::fs::write(&child, format!("{first}\n{last}\n")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if claude_recorded_ops(&recording).iter().any(|op| matches!(op, SpanOp::Insert(row) if row.metadata.as_ref().and_then(|m| m.get("request_id")).and_then(|v| v.as_str()) == Some("child-last"))) { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("late child response must be delivered");
+    shutdown(&socket).await;
+    handle.await.unwrap();
+    let third = serde_json::json!({"type":"assistant","timestamp":"2026-10-01T16:48:26Z","message":{"id":"child-restart","model":"test","content":[{"type":"text","text":"after restart"}]}});
+    std::fs::write(&child, format!("{first}\n{last}\n{third}\n")).unwrap();
+    let restarted = start_claude_recording_daemon(
+        tmp.path().join("data"),
+        socket.clone(),
+        recording.clone(),
+        0,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if claude_recorded_ops(&recording).iter().any(|op| matches!(op, SpanOp::Insert(row) if row.metadata.as_ref().and_then(|m| m.get("request_id")).and_then(|v| v.as_str()) == Some("child-restart"))) { break; }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("late child response must survive restart");
+    shutdown(&socket).await;
+    restarted.await.unwrap();
+    for request in ["child-first", "child-last", "child-restart"] {
+        let count = claude_recorded_ops(&recording).iter().filter(|op| matches!(op, SpanOp::Insert(row) if row.metadata.as_ref().and_then(|m| m.get("request_id")).and_then(|v| v.as_str()) == Some(request))).count();
+        assert_eq!(count, 1, "{request} must be inserted once across restart");
+    }
+}
+
+#[tokio::test]
 async fn claude_late_response_is_delivered_without_another_hook() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = test_endpoint(tmp.path());

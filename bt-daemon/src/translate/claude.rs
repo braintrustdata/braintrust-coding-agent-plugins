@@ -303,6 +303,8 @@ struct ClaudeTranslator {
     pending_tools: HashMap<String, PendingTool>,
     subagents: HashMap<String, Subagent>,
     subagent_handbacks: HashMap<String, Value>,
+    #[serde(default)]
+    observe_stopped_subagents: bool,
     /// Skills the user asked for on the current (or next) turn: `/skill`
     /// expansions and `SKILL.md` paths named in the prompt. Cleared when a
     /// turn stops, so a turn that ends without a Stop hands its skills to the
@@ -360,6 +362,7 @@ impl ClaudeTranslator {
             pending_tools: HashMap::new(),
             subagents: HashMap::new(),
             subagent_handbacks: HashMap::new(),
+            observe_stopped_subagents: false,
             requested_skills: Vec::new(),
             pending_emission: None,
             claude_version: None,
@@ -947,6 +950,11 @@ impl ClaudeTranslator {
     }
 
     fn stop_subagent(&mut self, event: &Envelope, hook: SubagentHook, ops: &mut Vec<SpanOp>) {
+        if event.payload.get("_bt_import_through_offset").is_none()
+            && hook.agent_transcript_path.is_some()
+        {
+            self.observe_stopped_subagents = true;
+        }
         let agent_id = hook.agent_id.clone();
         let parent = self.ensure_subagent(&hook, event, ops);
         let parent_span_ids = self
@@ -1087,6 +1095,7 @@ impl ClaudeTranslator {
     }
 
     fn release_terminal_state(&mut self) {
+        self.observe_stopped_subagents = false;
         self.main_history = MessageHistory::default();
         self.transcripts.clear();
         self.subagents.clear();
@@ -1432,10 +1441,14 @@ impl ClaudeTranslator {
         }
         self.end_root(event.ts_ms, ops);
         self.root_open = false;
-        if let Some(pending) = &mut self.pending_emission {
-            pending.clear_after = true;
-        } else {
-            self.release_terminal_state();
+        // A stopped live subagent may append after session end. Keep its
+        // deduplication state until the observer is finalized.
+        if !self.observe_stopped_subagents {
+            if let Some(pending) = &mut self.pending_emission {
+                pending.clear_after = true;
+            } else {
+                self.release_terminal_state();
+            }
         }
     }
 }
@@ -1560,6 +1573,23 @@ impl AgentTranslator for ClaudeTranslator {
             "SubagentStop" => {
                 if let Some(hook) = subagent_stop {
                     self.stop_subagent(event, hook, &mut ops);
+                }
+            }
+            "TranscriptUpdate" if event.payload.get("agent_transcript_path").is_some() => {
+                if let (Some(agent_id), Some(path)) = (
+                    string_field(&event.payload, "agent_id"),
+                    string_field(&event.payload, "agent_transcript_path"),
+                ) {
+                    let mut offset = 0;
+                    let records = read_event_records(event, &path, &mut offset);
+                    self.queue_transcript(
+                        records,
+                        PendingHistory::Owned(MessageHistory::default()),
+                        format!("subagent:{agent_id}"),
+                        ids::span_id(&self.session_id, &format!("subagent:{agent_id}")),
+                        self.current_cwd.clone(),
+                        &mut ops,
+                    );
                 }
             }
             "TranscriptUpdate" if self.turn.is_none() => {
