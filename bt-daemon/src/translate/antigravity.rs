@@ -198,7 +198,7 @@ impl AntigravityTranslator {
     }
 
     fn observe_record(&mut self, record: TranscriptRecord, ts_ms: i64, ops: &mut Vec<SpanOp>) {
-        let record_type = normalized_record_type(&record);
+        let record_type = record.normalized_kind().to_owned();
         let source = &record.source;
         if let Some(step) = record.step_index {
             self.records_by_step.insert(step, record.clone());
@@ -207,7 +207,7 @@ impl AntigravityTranslator {
         if record_type == "USER_INPUT"
             && (source.is_empty() || source == "USER_EXPLICIT" || source == "USER")
         {
-            self.start_turn(clean_user_input(record_content(&record)), ts_ms, ops);
+            self.start_turn(clean_user_input(record.message_content()), ts_ms, ops);
         }
 
         if record_type == "CHECKPOINT" {
@@ -608,8 +608,8 @@ fn transcript_source(event: &Envelope) -> Option<TranscriptSource> {
     };
     let snapshot = fields
         .snapshot
-        .filter(|value| value.path == path)
-        .map(|value| value.contents);
+        .filter(|snapshot| snapshot.path == path)
+        .map(|snapshot| snapshot.contents);
     Some(TranscriptSource {
         path: path.to_owned(),
         through,
@@ -666,14 +666,6 @@ fn read_records<R: std::io::Read>(
     records
 }
 
-fn normalized_record_type(record: &TranscriptRecord) -> String {
-    let record_type = &record.kind;
-    record_type
-        .strip_prefix("CORTEX_STEP_TYPE_")
-        .unwrap_or(record_type)
-        .to_string()
-}
-
 fn transcript_message(
     record: &TranscriptRecord,
     record_type: &str,
@@ -687,9 +679,9 @@ fn transcript_message(
         _ => return None,
     };
     let content = match role {
-        "user" => clean_user_input(record_content(record)),
-        "tool" => clean_tool_content(record_content(record)),
-        _ => record_content(record),
+        "user" => clean_user_input(record.message_content()),
+        "tool" => clean_tool_content(record.message_content()),
+        _ => record.message_content(),
     };
     if role == "system" && content.is_null() {
         return None;
@@ -702,16 +694,6 @@ fn transcript_message(
         step_type: record_type.into(),
         message_type: None,
     })
-}
-
-fn record_content(record: &TranscriptRecord) -> Value {
-    record
-        .content
-        .as_ref()
-        .or(record.message.as_ref())
-        .or(record.text.as_ref())
-        .cloned()
-        .unwrap_or(Value::Null)
 }
 
 fn clean_user_input(content: Value) -> Value {
@@ -745,7 +727,7 @@ fn tool_details(record: &TranscriptRecord) -> ToolDetails {
         .tool_calls
         .as_ref()
         .and_then(|calls| calls.iter().next());
-    let record_type = normalized_record_type(record);
+    let record_type = record.normalized_kind().to_owned();
     let name = call.and_then(|call| call.name.clone()).or_else(|| {
         (!matches!(record_type.as_str(), "USER_INPUT" | "PLANNER_RESPONSE"))
             .then(|| record_type.to_ascii_lowercase())
@@ -753,14 +735,14 @@ fn tool_details(record: &TranscriptRecord) -> ToolDetails {
     let input = call.and_then(|call| call.args.clone());
     let output = call
         .and_then(|call| call.output.clone())
-        .or_else(|| nonempty_value(clean_tool_content(record_content(record))));
+        .or_else(|| nonempty_value(clean_tool_content(record.message_content())));
     let error = record
         .error
         .clone()
         .filter(|error| !error.is_empty())
         .or_else(|| {
             (record_type == "ERROR_MESSAGE")
-                .then(|| record_content(record))
+                .then(|| record.message_content())
                 .and_then(|content| content.as_str().map(str::to_owned))
         })
         .or_else(|| {
@@ -768,7 +750,7 @@ fn tool_details(record: &TranscriptRecord) -> ToolDetails {
                 .status
                 .as_ref()
                 .filter(|status| matches!(status.to_ascii_lowercase().as_str(), "error" | "failed"))
-                .map(|status| match record_content(record) {
+                .map(|status| match record.message_content() {
                     Value::String(content) if !content.is_empty() => content,
                     _ => status.clone(),
                 })
@@ -807,15 +789,9 @@ fn planned_tool_start(records: &[TranscriptRecord], name: Option<&str>, step: i6
             .as_ref()?
             .iter()
             .any(|call| call.name.as_deref() == Some(name))
-            .then(|| parse_created_at(record))
+            .then(|| record.created_at_ms())
             .flatten()
     })
-}
-
-fn parse_created_at(record: &TranscriptRecord) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(record.created_at.as_deref()?)
-        .ok()
-        .map(|timestamp| timestamp.timestamp_millis())
 }
 
 fn token_metrics(records: &[TranscriptRecord]) -> Option<Value> {

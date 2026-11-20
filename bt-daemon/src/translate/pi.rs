@@ -1,16 +1,22 @@
 //! Pi coding-agent translator. Pi forwards native extension callbacks and this
 //! state machine owns all span construction and recovery.
 
+mod assistant_message;
+mod compaction;
+mod event;
+use assistant_message::AssistantMessage;
+use compaction::*;
+use event::*;
+
 use super::git::GitMetadataCache;
 use super::tool::{
-    error_text, explicit_skill_metadata, insert_skill_metadata, skill_file_load,
-    with_tool_approval, without_nulls, SkillLoad, ToolApproval,
+    error_text, explicit_skill_metadata, skill_file_load, with_tool_approval, without_nulls,
+    SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::agents::request::RequestConfig;
-use crate::agents::usage::PiUsage as Usage;
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
@@ -46,259 +52,6 @@ impl TranslatorFactory for crate::agents::Pi {
             git: GitMetadataCache::shared(),
         })
     }
-}
-
-// These are deliberately partial native event types. Serde ignores fields we
-// do not model, while `Value` remains at the user-controlled JSON boundaries
-// that we forward without interpreting (messages, tool arguments, results).
-// Keeping this vocabulary local lets the raw journal remain forward-compatible
-// and makes each translator reducer explicit about the fields it consumes.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct BeforeAgentStart {
-    #[serde(default)]
-    prompt: Option<Value>,
-    #[serde(default)]
-    message: Option<Value>,
-    #[serde(default)]
-    images: Option<Vec<PromptImage>>,
-}
-
-/// Pi's before_agent_start images contain base64 data, separate from the prompt.
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptImage {
-    data: String,
-    mime_type: String,
-}
-
-/// `ctx.model`: the selected model, which may be a Pi 1.0 virtual model that
-/// routes each request to a physical model.
-#[derive(Deserialize, Serialize)]
-struct SelectedModel {
-    provider: String,
-    id: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct ContextEvent {
-    #[serde(default)]
-    messages: Vec<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct MessageUpdate {
-    #[serde(default)]
-    assistant_message_event: Option<MessageDelta>,
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct MessageDelta {
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct ThinkingLevel {
-    #[serde(default)]
-    level: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct AssistantMessage {
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default)]
-    response_model: Option<String>,
-    #[serde(default)]
-    routed_model: Option<String>,
-    #[serde(default)]
-    resolved_model: Option<String>,
-    #[serde(default)]
-    actual_model: Option<String>,
-    #[serde(default)]
-    concrete_model: Option<String>,
-    #[serde(default)]
-    output_model: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    usage: Usage,
-    #[serde(default)]
-    content: Vec<AssistantContent>,
-    #[serde(default)]
-    error_message: Option<String>,
-    #[serde(default)]
-    stop_reason: Option<String>,
-    #[serde(default)]
-    response_id: Option<String>,
-    // Pi 1.0 records the level dispatched for this response, which a virtual
-    // model's router may choose independently of the selected level.
-    #[serde(default)]
-    thinking_level: Option<String>,
-    #[serde(default)]
-    provider_thinking_level: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-#[derive(Serialize)]
-enum AssistantContent {
-    #[serde(rename = "text")]
-    Text {
-        #[serde(default)]
-        text: Option<String>,
-    },
-    #[serde(rename = "thinking")]
-    Thinking {
-        #[serde(default)]
-        thinking: Option<String>,
-    },
-    #[serde(rename = "toolCall")]
-    ToolCall {
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        arguments: Option<Value>,
-    },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct ToolExecutionStart {
-    tool_call_id: String,
-    #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
-    args: Value,
-    // Pi 1.0 sets this on calls another tool made through
-    // `ctx.executeTool()`, such as codemode's `tools.<name>()`.
-    #[serde(default)]
-    parent_tool_call_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct ToolExecutionEnd {
-    #[serde(default)]
-    tool_call_id: Option<String>,
-    #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
-    result: Option<Value>,
-    #[serde(default)]
-    is_error: bool,
-    #[serde(default)]
-    parent_tool_call_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct AgentEnd {
-    #[serde(default)]
-    will_retry: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct SessionCompact {
-    #[serde(default)]
-    compaction_entry: Option<CompactionEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct CompactionEntry {
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    tokens_before: Option<u64>,
-    #[serde(default)]
-    timestamp: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct Preparation {
-    #[serde(default)]
-    tokens_before: Option<u64>,
-    #[serde(default)]
-    first_kept_entry_id: Option<String>,
-    #[serde(default)]
-    is_split_turn: Option<bool>,
-    #[serde(default)]
-    messages_to_summarize: Option<Vec<Value>>,
-    #[serde(default)]
-    turn_prefix_messages: Option<Vec<Value>>,
-    #[serde(default)]
-    target_id: Option<String>,
-    #[serde(default)]
-    old_leaf_id: Option<String>,
-    #[serde(default)]
-    common_ancestor_id: Option<String>,
-    #[serde(default)]
-    user_wants_summary: Option<bool>,
-    #[serde(default)]
-    custom_instructions: Option<String>,
-    #[serde(default)]
-    replace_instructions: Option<bool>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    entries_to_summarize: Option<Vec<Value>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct BeforeCompact {
-    #[serde(default)]
-    reason: Option<String>,
-    #[serde(default)]
-    will_retry: Option<bool>,
-    #[serde(default)]
-    custom_instructions: Option<String>,
-    #[serde(default)]
-    preparation: Option<Preparation>,
-    #[serde(default)]
-    branch_entries: Option<Vec<Value>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct BeforeTree {
-    #[serde(default)]
-    preparation: Option<Preparation>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct SessionTree {
-    #[serde(default)]
-    summary_entry: Option<Value>,
 }
 
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {
@@ -408,35 +161,30 @@ impl AgentTranslator for PiTranslator {
                 ops.extend(self.close_turn(envelope.ts_ms, None));
             }
             "session_before_compact" => {
-                if let Some(event) = decode(event) {
+                if let Some(event) = decode::<BeforeCompact>(event) {
                     self.compaction = Some((
                         ids::span_id(&self.session_id, &format!("compaction:{}", envelope.ts_ms)),
                         envelope.ts_ms,
-                        compaction_input(&event),
+                        event.input(),
                     ));
                 }
             }
             "session_compact" => {
                 if let Some(typed) = decode::<SessionCompact>(event) {
-                    self.active_compaction_message = compaction_message(&typed);
+                    self.active_compaction_message = typed.summary_message();
                 }
                 ops.extend(self.finish_special("Compaction", true, event, envelope.ts_ms))
             }
             "session_before_tree" => {
                 if let Some(event) = decode::<BeforeTree>(event) {
-                    if event
-                        .preparation
-                        .as_ref()
-                        .and_then(|preparation| preparation.user_wants_summary)
-                        == Some(true)
-                    {
+                    if event.wants_summary() {
                         self.branch_summary = Some((
                             ids::span_id(
                                 &self.session_id,
                                 &format!("branch-summary:{}", envelope.ts_ms),
                             ),
                             envelope.ts_ms,
-                            branch_summary_input(&event),
+                            event.input(),
                         ));
                     }
                 }
@@ -764,12 +512,12 @@ impl PiTranslator {
         } else {
             self.pending_llms.remove(0)
         };
-        let model = response_model(&message);
+        let model = message.response_model();
         let usage = &message.usage;
         let prompt = usage.input + usage.cache_read + usage.cache_write;
         let completion = usage.output;
         let total = usage.total_tokens.unwrap_or(prompt + completion);
-        let output = normalize_assistant(&message);
+        let output = message.normalized();
         let failed = matches!(message.stop_reason.as_deref(), Some("error" | "aborted"));
         let error = failed.then(|| message.error_message.clone()).flatten();
         if failed {
@@ -786,10 +534,7 @@ impl PiTranslator {
         // Only a virtual selection differs from the physical model that answered.
         let selected_model = pending
             .selected_model
-            .filter(|selected| {
-                message.provider.as_deref() != Some(&selected.provider)
-                    || message.model.as_deref() != Some(&selected.id)
-            })
+            .filter(|selected| !message.matches_model(&selected.provider, &selected.id))
             .map(|selected| format!("{}/{}", selected.provider, selected.id));
         let mut metadata = json!(pending.request_config);
         if let (Value::Object(metadata), Value::Object(fields)) = (
@@ -915,7 +660,7 @@ impl PiTranslator {
             .unwrap_or_else(|| tracked.name.clone());
         let mut skill_metadata = serde_json::Map::new();
         if let Some(skill) = &skill {
-            insert_skill_metadata(&mut skill_metadata, skill, requested_skills);
+            skill.insert_metadata(&mut skill_metadata, requested_skills);
         }
         let row = SpanRow {
             span_id: self.tool_span_id(&call),
@@ -1062,67 +807,6 @@ fn legacy_continuation(payload: &Value) -> Option<LegacyContinuation> {
     })
 }
 
-fn compaction_message(event: &SessionCompact) -> Option<Value> {
-    let entry = event.compaction_entry.as_ref()?;
-    let summary = entry.summary.clone()?;
-    Some(json!({
-        "role": "compactionSummary",
-        "summary": summary,
-        "tokensBefore": entry.tokens_before,
-        "timestamp": entry.timestamp,
-    }))
-}
-
-fn compaction_input(event: &BeforeCompact) -> Value {
-    let preparation = event.preparation.as_ref();
-    json!({
-        "reason": event.reason.clone(),
-        "willRetry": event.will_retry.clone(),
-        "customInstructions": event.custom_instructions.clone(),
-        "tokensBefore": preparation.and_then(|value| value.tokens_before),
-        "firstKeptEntryId": preparation.and_then(|value| value.first_kept_entry_id.clone()),
-        "isSplitTurn": preparation.and_then(|value| value.is_split_turn),
-        "messagesToSummarizeCount": preparation
-            .and_then(|value| value.messages_to_summarize.as_ref())
-            .map(Vec::len),
-        "turnPrefixMessagesCount": preparation
-            .and_then(|value| value.turn_prefix_messages.as_ref())
-            .map(Vec::len),
-        "branchEntryCount": event.branch_entries.as_ref().map(Vec::len),
-    })
-}
-
-fn branch_summary_input(event: &BeforeTree) -> Value {
-    let preparation = event.preparation.as_ref();
-    json!({
-        "targetId": preparation.and_then(|value| value.target_id.clone()),
-        "oldLeafId": preparation.and_then(|value| value.old_leaf_id.clone()),
-        "commonAncestorId": preparation.and_then(|value| value.common_ancestor_id.clone()),
-        "userWantsSummary": preparation.and_then(|value| value.user_wants_summary),
-        "customInstructions": preparation.and_then(|value| value.custom_instructions.clone()),
-        "replaceInstructions": preparation.and_then(|value| value.replace_instructions),
-        "label": preparation.and_then(|value| value.label.clone()),
-        "entriesToSummarizeCount": preparation
-            .and_then(|value| value.entries_to_summarize.as_ref())
-            .map(Vec::len),
-    })
-}
-
-fn response_model(message: &AssistantMessage) -> Option<String> {
-    [
-        &message.response_model,
-        &message.routed_model,
-        &message.resolved_model,
-        &message.actual_model,
-        &message.concrete_model,
-        &message.output_model,
-        &message.model,
-    ]
-    .into_iter()
-    .flatten()
-    .next()
-    .cloned()
-}
 /// The request configuration the instrumentation spec allows on LLM spans,
 /// read individually from the provider-native payload: sampling settings plus
 /// the available tool definitions and controls. Pi's API adapters name these
@@ -1331,45 +1015,6 @@ fn tool_metadata(name: &str, call: &str, parent_call: Option<&str>, extra: Value
         metadata.extend(extra);
     }
     with_tool_approval(without_nulls(metadata), Some(ToolApproval::Approved))
-}
-fn normalize_assistant(message: &AssistantMessage) -> Value {
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut calls = Vec::new();
-    for part in &message.content {
-        match part {
-            AssistantContent::Text {
-                text: Some(content),
-            } => text.push_str(content),
-            AssistantContent::Thinking {
-                thinking: Some(content),
-            } => reasoning.push_str(content),
-            AssistantContent::ToolCall {
-                id,
-                name,
-                arguments,
-            } => calls.push(json!({
-                "id": id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": serde_json::to_string(
-                        arguments.as_ref().unwrap_or(&Value::Null),
-                    )
-                    .unwrap_or_default(),
-                },
-            })),
-            _ => {}
-        }
-    }
-    let mut out = json!({"role":"assistant","content":text});
-    if !reasoning.is_empty() {
-        out["reasoning"] = json!([{"id":"reasoning","content":reasoning}])
-    }
-    if !calls.is_empty() {
-        out["tool_calls"] = Value::Array(calls)
-    }
-    out
 }
 fn skill_from_read(tool: &str, args: &Value) -> Option<SkillLoad> {
     if tool != "read" {

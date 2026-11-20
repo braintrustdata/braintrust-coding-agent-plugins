@@ -197,7 +197,7 @@ async fn retained_references(data_dir: &std::path::Path) -> anyhow::Result<HashS
         while let Some(event) = events.try_next().await? {
             mirrors(&event.payload, &mut protected);
         }
-        let env = journal::envelope_from_redacted(identity);
+        let env = identity.into_envelope();
         let key = automatic_link_key(&env);
         protected.insert(correlation_state_path(data_dir, &key));
         protected.insert(active_parent_snapshot_path(data_dir, &key));

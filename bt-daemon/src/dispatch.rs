@@ -437,11 +437,7 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     let Ok(fields) = TranscriptPayload::decode(&env.payload) else {
         return;
     };
-    if fields.claude_mirrors.is_some()
-        || fields.mirror.is_some()
-        || fields.snapshot.is_some()
-        || fields.replay.is_some()
-    {
+    if fields.has_claude_capture() {
         return;
     }
     // Claude writes the subagent's ancestry alongside its transcript by the
@@ -482,13 +478,7 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     }
     let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
     let mut mirrors = std::collections::BTreeMap::new();
-    for path in [
-        fields.transcript_path.as_deref(),
-        fields.agent_transcript_path.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for path in fields.native_paths() {
         if mirrors.contains_key(path) {
             continue;
         }

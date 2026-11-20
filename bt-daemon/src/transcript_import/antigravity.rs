@@ -131,7 +131,7 @@ pub(super) fn envelopes(
     for (index, record) in records.iter().enumerate() {
         let record_type = record.kind.as_str();
         let step = record.step_index.unwrap_or(index as i64);
-        let ts = created_at_ms(record).unwrap_or(start_ms);
+        let ts = record.created_at_ms().unwrap_or(start_ms);
         if record_type == "PLANNER_RESPONSE" {
             let before = index
                 .checked_sub(1)
@@ -240,7 +240,10 @@ fn is_tool_result(record: &AntigravityRecord) -> bool {
 }
 
 fn timestamp_bounds_created(records: &[AntigravityRecord]) -> (i64, i64) {
-    let timestamps = records.iter().filter_map(created_at_ms).collect::<Vec<_>>();
+    let timestamps = records
+        .iter()
+        .filter_map(AntigravityRecord::created_at_ms)
+        .collect::<Vec<_>>();
     timestamps
         .iter()
         .copied()
@@ -251,12 +254,4 @@ fn timestamp_bounds_created(records: &[AntigravityRecord]) -> (i64, i64) {
                 (min.min(value), max.max(value))
             }
         })
-}
-
-fn created_at_ms(record: &AntigravityRecord) -> Option<i64> {
-    record
-        .created_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.timestamp_millis())
 }

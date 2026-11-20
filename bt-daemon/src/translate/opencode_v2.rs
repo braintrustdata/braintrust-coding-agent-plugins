@@ -1,6 +1,8 @@
 //! OpenCode 2 native event translation.
+mod context;
 mod event;
 mod span;
+mod tool_content;
 
 use self::event::*;
 use self::span::*;
@@ -9,7 +11,7 @@ use super::{
     local_username,
     opencode::{requested_skills, skill_load},
     recent::RecentSet,
-    tool::{push_unique, skill_was_requested, SkillLoad, ToolApproval},
+    tool::{push_unique, SkillLoad, ToolApproval},
     AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType,
 };
 use crate::{ids, wire::Envelope};
@@ -526,7 +528,12 @@ impl AgentTranslator for OpenCodeV2Translator {
                 })]
             }
             NativeEvent::ToolSuccess(data) => {
-                let output = normalize_tool_content(data.content.unwrap_or_default());
+                let output = data
+                    .content
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(ToolContent::into_span_part)
+                    .collect();
                 self.finish_tool(
                     &data.session_id,
                     &data.message_id,
@@ -796,11 +803,7 @@ impl OpenCodeV2Translator {
             metadata.tool_kind = Some("skill");
             metadata.skill_name = Some(skill.name.as_deref());
             metadata.skill_path = skill.path.as_deref();
-            metadata.skill_load_trigger = skill
-                .name
-                .as_deref()
-                .is_some_and(|name| skill_was_requested(&s.turn_skills, name))
-                .then_some("explicit");
+            metadata.skill_load_trigger = skill.was_requested(&s.turn_skills).then_some("explicit");
         }
         vec![SpanOp::Merge(SpanRow {
             span_id: tool.span_id,
@@ -849,7 +852,7 @@ impl OpenCodeV2Translator {
                 content: reasoning,
             }]);
         }
-        let input = step.context.map(normalize_context).unwrap_or_else(|| {
+        let input = step.context.map(Context::into_messages).unwrap_or_else(|| {
             let window = s
                 .native_window
                 .as_ref()
@@ -960,7 +963,7 @@ impl OpenCodeV2Translator {
         );
         let output = match native_messages {
             Some(NativeMessages::Messages(messages)) => {
-                let messages = normalize_context(Context {
+                let messages = Context {
                     session_id: sid.to_owned(),
                     system: Vec::new(),
                     messages: messages
@@ -970,7 +973,8 @@ impl OpenCodeV2Translator {
                             content: message.content,
                         })
                         .collect(),
-                });
+                }
+                .into_messages();
                 if error.is_none() {
                     s.native_window = Some(NativeWindow {
                         model: model.clone(),
@@ -1033,104 +1037,4 @@ impl OpenCodeV2Translator {
             ..Default::default()
         })]
     }
-}
-fn normalize_context(context: Context) -> Vec<Message> {
-    let mut messages = Vec::new();
-    let system = context.system.join("\n\n");
-    if !system.is_empty() {
-        messages.push(Message::new("system", Content::Text(system)));
-    }
-    for message in context.messages {
-        match message.content {
-            MessageContent::Text(text) => {
-                messages.push(Message::new(message.role, Content::Text(text)))
-            }
-            MessageContent::Other(content) => {
-                messages.push(Message::new(message.role, Content::Dynamic(content)))
-            }
-            MessageContent::Parts(parts) => {
-                let mut content = Vec::new();
-                let mut calls = Vec::new();
-                let mut single_text = None;
-                for part in parts {
-                    match part {
-                        ContextPart::Known(KnownContextPart::Text { text }) => {
-                            single_text = Some(text.clone());
-                            content.push(ContentPart::text(text));
-                        }
-                        ContextPart::Known(KnownContextPart::Media {
-                            media_type,
-                            data,
-                            media,
-                            extra,
-                        }) => {
-                            let source = media.as_ref().and_then(|media| media.source.as_ref());
-                            let mime = source
-                                .and_then(|source| source.media_type.as_deref())
-                                .or(media_type.as_deref());
-                            let bytes = source
-                                .and_then(|source| source.data.as_deref())
-                                .or(data.as_deref());
-                            if let Some((mime, bytes)) = mime
-                                .zip(bytes)
-                                .filter(|(mime, _)| mime.starts_with("image/"))
-                            {
-                                content.push(ContentPart::image(format!(
-                                    "data:{mime};base64,{bytes}"
-                                )));
-                            } else {
-                                content.push(ContentPart::Native(KnownContextPart::Media {
-                                    media_type,
-                                    data,
-                                    media,
-                                    extra,
-                                }));
-                            }
-                        }
-                        ContextPart::Known(KnownContextPart::ToolCall { id, name, input }) => {
-                            calls.push(ToolCall::new(id, name, &input))
-                        }
-                        ContextPart::Known(KnownContextPart::ToolResult { id, result }) => {
-                            let value = match serde_json::from_value::<Vec<ToolContent>>(
-                                result.value.clone(),
-                            ) {
-                                Ok(parts) => Content::Parts(normalize_tool_content(parts)),
-                                Err(_) => Content::Dynamic(result.value),
-                            };
-                            messages.push(Message::tool(id, value));
-                        }
-                        ContextPart::Other(value) => content.push(ContentPart::Dynamic(value)),
-                    }
-                }
-                if message.role == "tool" && content.is_empty() && calls.is_empty() {
-                    continue;
-                }
-                let value = if content.is_empty() {
-                    Content::Text(String::new())
-                } else if content.len() == 1 && single_text.is_some() {
-                    Content::Text(single_text.unwrap_or_default())
-                } else {
-                    Content::Parts(content)
-                };
-                let mut normalized = Message::new(message.role, value);
-                normalized.tool_calls = calls;
-                messages.push(normalized);
-            }
-        }
-    }
-    messages
-}
-
-fn normalize_tool_content(parts: Vec<ToolContent>) -> Vec<ContentPart> {
-    parts
-        .into_iter()
-        .map(|part| match part {
-            ToolContent::Known(KnownToolContent::File { mime, uri, .. })
-                if mime.starts_with("image/") =>
-            {
-                ContentPart::image(uri)
-            }
-            other => ContentPart::Tool(other),
-        })
-        .collect()
 }

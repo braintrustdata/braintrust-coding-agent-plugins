@@ -4,6 +4,9 @@
 //! This module only encodes the common Braintrust representation once that
 //! source-specific interpretation has been made.
 
+mod skill_load;
+pub use skill_load::SkillLoad;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -58,32 +61,6 @@ pub fn compile_skill_regex(pattern: &str) -> Option<Regex> {
             tracing::error!(%error, pattern, "could not compile skill metadata pattern");
             None
         }
-    }
-}
-
-/// A tool call that loaded a skill, as far as the source reveals it.
-#[derive(Default, Serialize, Deserialize)]
-pub struct SkillLoad {
-    pub name: Option<String>,
-    pub path: Option<String>,
-}
-
-/// Records a skill load on a tool span. Only a load the user asked for is
-/// explicit; the model choosing a skill on its own carries no trigger.
-pub fn insert_skill_metadata(
-    metadata: &mut Map<String, Value>,
-    load: &SkillLoad,
-    requested: &[String],
-) {
-    metadata.insert("tool_kind".into(), json!("skill"));
-    if let Some(name) = &load.name {
-        metadata.insert("skill_name".into(), json!(name));
-        if skill_was_requested(requested, name) {
-            metadata.insert("skill_load_trigger".into(), json!("explicit"));
-        }
-    }
-    if let Some(path) = &load.path {
-        metadata.insert("skill_path".into(), json!(path));
     }
 }
 

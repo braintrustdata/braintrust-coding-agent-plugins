@@ -3,46 +3,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(test)]
 use crate::wire::SessionRoute;
-
-/// Apply one invocation-local JSON metadata override to a non-secret route.
-///
-/// The route is then carried unchanged through live hooks, managed runs, and
-/// transcript import. Keeping validation here gives every public command the
-/// same contract and prevents individual agent shims from parsing JSON.
-pub(crate) fn apply_additional_metadata(
-    route: &mut SessionRoute,
-    additional_metadata: Option<&str>,
-) -> anyhow::Result<()> {
-    let Some(metadata) = additional_metadata else {
-        return Ok(());
-    };
-    let value: serde_json::Value = serde_json::from_str(metadata)
-        .map_err(|e| anyhow::anyhow!("invalid --additional-metadata JSON: {e}"))?;
-    if !value.is_object() {
-        anyhow::bail!("--additional-metadata must be a JSON object");
-    }
-    route.additional_metadata = Some(value);
-    Ok(())
-}
-
-/// Apply invocation-local root-span tags to a route. Trim whitespace and reject
-/// empty tags here; the set keeps route tags unique.
-pub(crate) fn apply_tags(route: &mut SessionRoute, tags: &[String]) -> anyhow::Result<()> {
-    if tags.is_empty() {
-        return Ok(());
-    }
-    let mut normalized = std::collections::BTreeSet::new();
-    for tag in tags {
-        let tag = tag.trim();
-        if tag.is_empty() {
-            anyhow::bail!("--tag must not be empty");
-        }
-        normalized.insert(tag.to_string());
-    }
-    route.tags = normalized;
-    Ok(())
-}
 
 pub(crate) fn resolve_span_plugin_paths(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let paths: Vec<_> = paths
@@ -95,15 +57,19 @@ mod tests {
             additional_metadata: Some(serde_json::json!({"saved": true})),
             ..SessionRoute::default()
         };
-        apply_additional_metadata(&mut route, Some(r#"{"run_id":"123"}"#)).unwrap();
+        route
+            .apply_additional_metadata(Some(r#"{"run_id":"123"}"#))
+            .unwrap();
         assert_eq!(
             route.additional_metadata,
             Some(serde_json::json!({"run_id": "123"}))
         );
 
-        let error = apply_additional_metadata(&mut route, Some("[]")).unwrap_err();
+        let error = route.apply_additional_metadata(Some("[]")).unwrap_err();
         assert!(error.to_string().contains("must be a JSON object"));
-        let error = apply_additional_metadata(&mut route, Some("not-json")).unwrap_err();
+        let error = route
+            .apply_additional_metadata(Some("not-json"))
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("invalid --additional-metadata JSON"));
@@ -115,13 +81,15 @@ mod tests {
             tags: ["saved".into()].into_iter().collect(),
             ..SessionRoute::default()
         };
-        apply_tags(&mut route, &[" ci ".into(), "ci".into(), "docs".into()]).unwrap();
+        route
+            .apply_tags(&[" ci ".into(), "ci".into(), "docs".into()])
+            .unwrap();
         assert_eq!(
             route.tags,
             ["ci".into(), "docs".into()].into_iter().collect()
         );
 
-        let error = apply_tags(&mut route, &[" ".into()]).unwrap_err();
+        let error = route.apply_tags(&[" ".into()]).unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
     }
 }

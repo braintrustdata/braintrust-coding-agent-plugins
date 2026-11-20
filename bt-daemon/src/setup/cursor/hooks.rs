@@ -5,9 +5,7 @@
 //! marked with their process identity, which later runs remove once that
 //! process has exited.
 
-use crate::agents::schema::{
-    CursorCommandHook, CursorHookEntries, CursorHookEntry, CursorHooks, HookFile,
-};
+use crate::agents::schema::{CursorCommandHook, CursorHooks, HookFile};
 #[cfg(test)]
 use crate::setup::common::load_object;
 use crate::setup::common::{edit_json, load_json, FileAccess};
@@ -125,8 +123,7 @@ fn capture_entry_is_registered(config: &CursorHooks, event: &str, command: &str)
     let Ok(expected) = capture_registration(event, command) else {
         return false;
     };
-    matches!(config.hooks.as_ref().and_then(|hooks| hooks.get(event)), Some(CursorHookEntries::Entries(entries))
-        if entries.iter().any(|entry| matches!(entry, CursorHookEntry::Command(entry) if entry == &expected)))
+    config.contains_registration(event, &expected)
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -186,17 +183,9 @@ fn remove_stale_managed_hooks(
     config: &mut CursorHooks,
     mut process_is_alive: impl FnMut(&ProcessIdentity) -> bool,
 ) {
-    let Some(hooks) = &mut config.hooks else {
-        return;
-    };
-    for entries in hooks.values_mut() {
-        if let CursorHookEntries::Entries(entries) = entries {
-            entries.retain(|entry| {
-                managed_process_identity(entry.command().unwrap_or_default())
-                    .is_none_or(|identity| process_is_alive(&identity))
-            });
-        }
-    }
+    config.retain_commands(|command| {
+        managed_process_identity(command).is_none_or(|identity| process_is_alive(&identity))
+    });
 }
 
 #[cfg(test)]
@@ -215,36 +204,23 @@ fn apply_specs(
         config.version.get_or_insert(1);
     }
     if enable || config.hooks.is_some() {
-        let hooks = config.hooks.get_or_insert_with(Default::default);
         let persistent = specs == persistent_specs()?;
         if persistent {
-            for entries in hooks.values_mut() {
-                if let CursorHookEntries::Entries(entries) = entries {
-                    entries.retain(|entry| !entry.command().is_some_and(is_persistent_command));
-                }
-            }
+            config.retain_commands(|command| !is_persistent_command(command));
         }
         for (event, command) in specs {
-            if !enable && !hooks.contains_key(event) {
-                continue;
-            }
-            let entries = hooks
-                .entry(event.clone())
-                .or_insert_with(|| CursorHookEntries::Entries(Vec::new()));
-            let CursorHookEntries::Entries(entries) = entries else {
-                anyhow::bail!(
-                    "Cursor hook event `{event}` must be an array: {}",
-                    path.display()
-                );
-            };
-            entries.retain(|entry| entry.command() != Some(command.as_str()));
-            if enable {
-                entries.push(CursorHookEntry::Command(if persistent {
+            let replacement = if enable {
+                Some(if persistent {
                     capture_registration(event, command)?
                 } else {
                     CursorCommandHook::capture(command.clone(), None)
-                }));
-            }
+                })
+            } else {
+                None
+            };
+            config
+                .replace_registration(event, command, replacement)
+                .map_err(|error| anyhow::anyhow!("{error}: {}", path.display()))?;
         }
     }
     Ok(())
