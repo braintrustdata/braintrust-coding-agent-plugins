@@ -145,7 +145,15 @@ pub(super) async fn serve_connection(
             }
             .await;
             if shutdown_after_response {
-                daemon.trigger_shutdown();
+                // Keep accepting connections during the drain so late hooks
+                // receive a handover response and retry with the replacement.
+                // The shutdown acknowledgement itself must not wait for it.
+                daemon.begin_quiesce();
+                let draining = daemon.clone();
+                tokio::spawn(async move {
+                    drain_all(&draining).await;
+                    draining.trigger_shutdown();
+                });
             }
             write_result?;
             if stop_after_response {
