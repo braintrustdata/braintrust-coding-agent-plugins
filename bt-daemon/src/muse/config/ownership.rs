@@ -1,7 +1,7 @@
 //! Strict owned-file recognition, separate from preservable foreign documents.
 use super::hooks::{opaque_contains_braintrust, CommandType, HookDocument};
 use super::{HOOK_COMMAND, LEGACY_HOOK_COMMAND};
-use crate::muse::field::Field;
+use crate::json::Field;
 use crate::muse::hooks::HookName;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};

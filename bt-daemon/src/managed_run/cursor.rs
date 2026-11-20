@@ -128,9 +128,8 @@ fn write_cursor_managed_plugin_for_platform(
         hook_dir.join("hooks.json"),
         serde_json::to_vec(&HookFile {
             hooks,
-            extra: [("version".to_string(), serde_json::json!(1))]
-                .into_iter()
-                .collect(),
+            version: crate::json::Field::Value(1),
+            extra: Default::default(),
         })?,
     )?;
 

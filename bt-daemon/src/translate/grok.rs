@@ -10,8 +10,9 @@ use super::tool::nonempty_error_text;
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
-use crate::agents::usage::{CamelCaseUsage as NativeUsage, Extensions};
+use crate::agents::usage::CamelCaseUsage as NativeUsage;
 use crate::ids;
+use crate::json::Extensions;
 use crate::transcript_mirror::{Reference, TranscriptPayload};
 use crate::wire::Envelope;
 use serde::{Deserialize, Serialize};
@@ -45,10 +46,7 @@ struct NativeRecord {
     ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp: Option<i64>,
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -57,10 +55,7 @@ struct NativeParams {
     update: Option<NativeUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     meta: Option<NativeMeta>,
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -106,10 +101,7 @@ struct NativeUpdate {
         rename = "stop_reason"
     )]
     stop_reason: Option<String>,
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -125,10 +117,7 @@ struct NativeMeta {
     stream_start_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_timestamp_ms: Option<i64>,
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     extra: Extensions,
 }
 #[derive(Clone, Serialize, Deserialize)]

@@ -1,10 +1,10 @@
 //! Hook wire DTOs shared by live decoding and export synthesis. Unknown events
 //! are ignored; known events decode once before any tracing policy executes.
-use super::field::Field;
 use super::ids::{RequestId, ToolCallId, TurnId};
 pub(crate) use super::messages::*;
 pub(crate) use super::outcome::*;
 use super::usage::{TokenUsage, UsageScope};
+use crate::json::Field;
 use crate::wire::Envelope;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;

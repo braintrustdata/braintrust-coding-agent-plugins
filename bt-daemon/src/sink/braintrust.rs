@@ -400,7 +400,8 @@ impl BraintrustSink {
                     format!("{api}/{}/{}", creds.org_id, attachment.digest).as_bytes(),
                 )
                 .to_string();
-                let reference = json!({"type":"braintrust_attachment", "key":key, "filename":attachment.filename, "content_type":attachment.content_type});
+                let reference =
+                    crate::attachments::AttachmentReference::uploaded(key.clone(), attachment);
                 if !uploads.completed.contains(&key) {
                     uploads
                         .backend
@@ -427,7 +428,7 @@ impl BraintrustSink {
             if let Some(metadata) = metadata.as_object_mut() {
                 metadata.insert(
                     "braintrust.attachments".into(),
-                    Value::Array(references.into_values().collect()),
+                    json!(references.into_values().collect::<Vec<_>>()),
                 );
             }
             row.attachments.clear();

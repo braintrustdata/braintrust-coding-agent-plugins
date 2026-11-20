@@ -24,6 +24,30 @@ impl Attachment {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AttachmentReference {
+    #[serde(rename = "type")]
+    kind: AttachmentReferenceType,
+    key: String,
+    filename: crate::json::Field<String>,
+    content_type: crate::json::Field<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+enum AttachmentReferenceType {
+    #[serde(rename = "braintrust_attachment")]
+    BraintrustAttachment,
+}
+impl AttachmentReference {
+    pub fn uploaded(key: String, attachment: &Attachment) -> Self {
+        Self {
+            kind: AttachmentReferenceType::BraintrustAttachment,
+            key,
+            filename: crate::json::Field::Value(attachment.filename.clone()),
+            content_type: crate::json::Field::Value(attachment.content_type.clone()),
+        }
+    }
+}
+
 /// Recognize native attachment-bearing content without opening files or fetching URLs.
 pub(crate) fn contains(value: &Value) -> bool {
     match value {
@@ -176,7 +200,7 @@ fn decode_url(url: &str) -> Option<(String, Vec<u8>)> {
 
 pub(crate) fn materialize(
     value: &mut Value,
-    references: &std::collections::HashMap<String, Value>,
+    references: &std::collections::HashMap<String, AttachmentReference>,
 ) {
     if value.get("type").and_then(Value::as_str) == Some("_bt_attachment") {
         if let Some(reference) = value
@@ -184,13 +208,24 @@ pub(crate) fn materialize(
             .and_then(Value::as_str)
             .and_then(|id| references.get(id))
         {
-            let mut replacement = reference.clone();
-            for key in ["filename", "content_type"] {
-                if let Some(field) = value.get(key) {
-                    replacement[key] = field.clone();
-                }
+            #[derive(Deserialize)]
+            struct Marker {
+                #[serde(default)]
+                filename: crate::json::Field<String>,
+                #[serde(default)]
+                content_type: crate::json::Field<String>,
             }
-            *value = replacement;
+            let Ok(marker) = Marker::deserialize(&*value) else {
+                return;
+            };
+            let mut replacement = reference.clone();
+            if !marker.filename.is_missing() {
+                replacement.filename = marker.filename;
+            }
+            if !marker.content_type.is_missing() {
+                replacement.content_type = marker.content_type;
+            }
+            *value = json!(replacement);
         }
         return;
     }
@@ -224,10 +259,8 @@ mod tests {
         let references = attachments
             .into_iter()
             .map(|a| {
-                (
-                    a.digest,
-                    json!({"type":"braintrust_attachment","key":"uploaded"}),
-                )
+                let reference = AttachmentReference::uploaded("uploaded".into(), &a);
+                (a.digest, reference)
             })
             .collect();
         materialize(&mut value, &references);

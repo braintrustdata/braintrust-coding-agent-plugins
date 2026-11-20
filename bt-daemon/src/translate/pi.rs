@@ -9,6 +9,7 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::request::RequestConfig;
 use crate::agents::usage::PiUsage as Usage;
 use crate::ids;
 use crate::wire::Envelope;
@@ -308,7 +309,7 @@ struct PendingLlm {
     start_ms: i64,
     input: Value,
     first_token_ms: Option<i64>,
-    request_config: Map<String, Value>,
+    request_config: RequestConfig,
     selected_model: Option<SelectedModel>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -377,8 +378,9 @@ impl AgentTranslator for PiTranslator {
             }
             "before_provider_request" => {
                 if let Some(call) = self.pending_llms.last_mut() {
-                    call.request_config =
-                        request_config(event.get("payload").unwrap_or(&Value::Null));
+                    call.request_config = serde_json::from_value(Value::Object(request_config(
+                        event.get("payload").unwrap_or(&Value::Null),
+                    )))?;
                 }
             }
             "message_update" => {
@@ -501,7 +503,7 @@ impl PiTranslator {
                 end_ms: Some(ts),
                 input: Some(pending.input),
                 metadata: (!pending.request_config.is_empty())
-                    .then_some(Value::Object(pending.request_config)),
+                    .then(|| json!(pending.request_config)),
                 error: Some(error.into()),
                 ..Default::default()
             }));
@@ -721,7 +723,7 @@ impl PiTranslator {
             start_ms: ts,
             input,
             first_token_ms: None,
-            request_config: Map::new(),
+            request_config: RequestConfig::default(),
             selected_model,
         });
     }
@@ -756,7 +758,7 @@ impl PiTranslator {
                 start_ms: ts,
                 input: json!([]),
                 first_token_ms: None,
-                request_config: Map::new(),
+                request_config: RequestConfig::default(),
                 selected_model: None,
             }
         } else {
@@ -789,17 +791,20 @@ impl PiTranslator {
                     || message.model.as_deref() != Some(&selected.id)
             })
             .map(|selected| format!("{}/{}", selected.provider, selected.id));
-        let mut metadata = pending.request_config;
-        if let Value::Object(fields) = without_nulls(json!({
-            "model": model,
-            "provider": message.provider,
-            "api": message.api,
-            "stop_reason": message.stop_reason,
-            "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
-            "provider_thinking_level": message.provider_thinking_level,
-            "selected_model": selected_model,
-            "response_id": message.response_id,
-        })) {
+        let mut metadata = json!(pending.request_config);
+        if let (Value::Object(metadata), Value::Object(fields)) = (
+            &mut metadata,
+            without_nulls(json!({
+                "model": model,
+                "provider": message.provider,
+                "api": message.api,
+                "stop_reason": message.stop_reason,
+                "thinking_level": message.thinking_level.as_ref().or(self.thinking_level.as_ref()),
+                "provider_thinking_level": message.provider_thinking_level,
+                "selected_model": selected_model,
+                "response_id": message.response_id,
+            })),
+        ) {
             metadata.extend(fields);
         }
         // Pi prices unknown models at zero, which would override the backend's
@@ -823,7 +828,7 @@ impl PiTranslator {
             end_ms: Some(ts),
             input: Some(pending.input),
             output: Some(json!([output])),
-            metadata: Some(Value::Object(metadata)),
+            metadata: Some(metadata),
             metrics: Some(without_nulls(json!({
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,

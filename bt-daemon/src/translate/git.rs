@@ -25,12 +25,24 @@ struct GitFingerprint {
     worktree_config: Option<FileStamp>,
 }
 
+#[derive(Clone, Default)]
+struct GitMetadata {
+    origin_url: Option<String>,
+    branch: Option<String>,
+    commit_sha: Option<String>,
+}
+impl GitMetadata {
+    fn is_empty(&self) -> bool {
+        self.origin_url.is_none() && self.branch.is_none() && self.commit_sha.is_none()
+    }
+}
+
 #[derive(Clone)]
 struct RepoEntry {
     git_dir: PathBuf,
     common_dir: PathBuf,
     fingerprint: GitFingerprint,
-    metadata: Map<String, Value>,
+    metadata: GitMetadata,
 }
 
 struct NegativeEntry {
@@ -98,16 +110,16 @@ impl GitMetadataCache {
         SHARED.get_or_init(Arc::default).clone()
     }
 
-    pub(super) fn metadata(&self, cwd: &str) -> Map<String, Value> {
+    fn metadata(&self, cwd: &str) -> GitMetadata {
         if cwd.is_empty() {
-            return Map::new();
+            return GitMetadata::default();
         }
         let cwd = canonical_or_original(Path::new(cwd));
         let mut state = self.state.lock();
 
         if let Some(negative) = state.negative.get(&cwd) {
             if negative.observed_at.elapsed() < NEGATIVE_TTL {
-                return Map::new();
+                return GitMetadata::default();
             }
             state.negative.remove(&cwd);
             state.negative_order.retain(|key| key != &cwd);
@@ -140,7 +152,7 @@ impl GitMetadataCache {
             );
             touch(&mut state.negative_order, &cwd);
             state.trim_negative();
-            return Map::new();
+            return GitMetadata::default();
         };
         let metadata = entry.metadata.clone();
         state.cwd_to_repo.insert(cwd.clone(), repo_root.clone());
@@ -168,15 +180,21 @@ impl GitMetadataCache {
     }
 }
 
-fn merge_metadata(row: &mut SpanRow, git: &Map<String, Value>) {
+fn merge_metadata(row: &mut SpanRow, git: &GitMetadata) {
     let metadata = row
         .metadata
         .get_or_insert_with(|| Value::Object(Map::new()));
     let Some(metadata) = metadata.as_object_mut() else {
         return;
     };
-    for (key, value) in git {
-        metadata.insert(key.clone(), value.clone());
+    for (key, value) in [
+        ("git_origin_url", &git.origin_url),
+        ("git_branch", &git.branch),
+        ("git_commit_sha", &git.commit_sha),
+    ] {
+        if let Some(value) = value {
+            metadata.insert(key.into(), Value::String(value.clone()));
+        }
     }
 }
 
@@ -188,19 +206,11 @@ fn discover_repo(cwd: &Path) -> Option<(PathBuf, RepoEntry)> {
 fn inspect_repo(cwd: &Path) -> Option<RepoEntry> {
     let git_dir = absolute_git_path(cwd, &git(cwd, &["rev-parse", "--absolute-git-dir"])?);
     let common_dir = absolute_git_path(cwd, &git(cwd, &["rev-parse", "--git-common-dir"])?);
-    let mut metadata = Map::new();
-    if let Some(origin) = git(cwd, &["remote", "get-url", "origin"]) {
-        metadata.insert(
-            "git_origin_url".into(),
-            Value::String(redact_remote(origin)),
-        );
-    }
-    if let Some(branch) = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        metadata.insert("git_branch".into(), Value::String(branch));
-    }
-    if let Some(commit) = git(cwd, &["rev-parse", "HEAD"]) {
-        metadata.insert("git_commit_sha".into(), Value::String(commit));
-    }
+    let metadata = GitMetadata {
+        origin_url: git(cwd, &["remote", "get-url", "origin"]).map(redact_remote),
+        branch: git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+        commit_sha: git(cwd, &["rev-parse", "HEAD"]),
+    };
     Some(RepoEntry {
         fingerprint: fingerprint(&git_dir, &common_dir),
         git_dir,
@@ -330,8 +340,11 @@ mod tests {
 
         let cache = GitMetadataCache::default();
         let first = cache.metadata(subdir.to_str().unwrap());
-        assert_eq!(first["git_branch"], "main");
-        assert_eq!(first["git_origin_url"], "https://example.com/acme/a.git");
+        assert_eq!(first.branch.as_deref(), Some("main"));
+        assert_eq!(
+            first.origin_url.as_deref(),
+            Some("https://example.com/acme/a.git")
+        );
 
         run(&repo, &["checkout", "-b", "feature"]);
         fs::write(repo.join("b"), "b").unwrap();
@@ -347,8 +360,11 @@ mod tests {
             ],
         );
         let second = cache.metadata(subdir.to_str().unwrap());
-        assert_eq!(second["git_branch"], "feature");
-        assert_eq!(second["git_origin_url"], "https://example.com/acme/b.git");
-        assert_ne!(first["git_commit_sha"], second["git_commit_sha"]);
+        assert_eq!(second.branch.as_deref(), Some("feature"));
+        assert_eq!(
+            second.origin_url.as_deref(),
+            Some("https://example.com/acme/b.git")
+        );
+        assert_ne!(first.commit_sha, second.commit_sha);
     }
 }

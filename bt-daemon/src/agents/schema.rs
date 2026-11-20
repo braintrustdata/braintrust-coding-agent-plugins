@@ -2,12 +2,15 @@
 //!
 //! Unknown extension fields are preserved when editing an agent-owned file.
 //! Known fields are decoded here and used as concrete Rust values internally.
+use crate::json::Field;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HookFile<Group> {
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    pub version: Field<u32>,
     pub hooks: BTreeMap<String, Vec<Group>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -42,6 +45,8 @@ pub(crate) struct CommandHook {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OpenCodeConfig {
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
+    pub model: Field<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -218,6 +223,29 @@ mod tests {
         assert_eq!(encoded["hooks"]["stop"][0], raw["hooks"]["stop"][0]);
         assert_eq!(encoded["hooks"]["stop"][1], raw["hooks"]["stop"][1]);
         assert_eq!(encoded["future"], true);
+    }
+
+    #[test]
+    fn known_config_fields_are_typed_without_normalizing_missing_or_null() {
+        for raw in [
+            serde_json::json!({"hooks":{}}),
+            serde_json::json!({"hooks":{},"version":null}),
+            serde_json::json!({"hooks":{},"version":1}),
+        ] {
+            let file: HookFile<HookGroup> = serde_json::from_value(raw.clone()).unwrap();
+            assert!(!file.extra.contains_key("version"));
+            assert_eq!(serde_json::to_value(file).unwrap(), raw);
+        }
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"model":null}),
+            serde_json::json!({"model":"vendor/model"}),
+        ] {
+            let config: OpenCodeConfig = serde_json::from_value(raw.clone()).unwrap();
+            assert!(!config.extra.contains_key("model"));
+            assert_eq!(serde_json::to_value(config).unwrap(), raw);
+        }
+        assert!(serde_json::from_value::<OpenCodeConfig>(serde_json::json!({"model":42})).is_err());
     }
 
     #[test]

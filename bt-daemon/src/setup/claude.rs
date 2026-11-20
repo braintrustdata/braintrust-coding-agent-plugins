@@ -8,7 +8,6 @@ use crate::paths;
 use crate::setup::Setup;
 use anyhow::{bail, Context};
 use serde::Deserialize;
-use serde_json::Value;
 use std::path::Path;
 
 const MARKETPLACE_NAME: &str = "braintrust-claude-plugin";
@@ -121,7 +120,7 @@ fn legacy_tracing_env_keys(path: &Path) -> anyhow::Result<Vec<&'static str>> {
     };
     #[derive(Deserialize)]
     struct Settings {
-        env: Option<std::collections::BTreeMap<String, Value>>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     }
     let settings: Settings = serde_json::from_slice(&raw)
         .with_context(|| format!("Claude settings are not valid JSON: {}", path.display()))?;

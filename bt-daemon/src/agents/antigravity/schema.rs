@@ -1,5 +1,6 @@
 //! Antigravity native records shared by live translation and transcript import.
-use crate::agents::usage::{Extensions, ProviderUsage};
+use crate::agents::usage::ProviderUsage;
+use crate::json::Extensions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,10 +42,7 @@ pub(crate) struct TranscriptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ProviderUsage>,
     /// Unknown native extensions are retained without inspecting their contents.
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     pub extra: Extensions,
 }
 
@@ -99,10 +97,7 @@ pub(crate) struct ToolCall {
         deserialize_with = "crate::agents::schema::deserialize_present"
     )]
     pub output: Option<Value>,
-    #[serde(
-        flatten,
-        deserialize_with = "crate::agents::usage::deserialize_extensions"
-    )]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     pub extra: Extensions,
 }
 

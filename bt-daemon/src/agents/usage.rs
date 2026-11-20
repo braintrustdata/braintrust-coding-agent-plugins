@@ -4,28 +4,10 @@
 //! format, not a guessed provider identity: OpenAI-compatible and Anthropic
 //! payloads can share field names. Only explicitly modeled usage fields become
 //! metrics. Unknown extensions round-trip as opaque JSON and are never scanned.
+use crate::json::Extensions;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
-
-pub(crate) type Extensions = BTreeMap<String, Box<RawValue>>;
-
-/// Serde buffers flattened fields, so RawValue cannot deserialize them
-/// directly. Materialize JSON only at this decoding boundary, then retain
-/// unknown values as opaque encodings rather than traversable data bags.
-pub(crate) fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Extensions, D::Error> {
-    let fields = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
-    fields
-        .into_iter()
-        .map(|(key, value)| {
-            serde_json::value::to_raw_value(&value)
-                .map(|raw| (key, raw))
-                .map_err(serde::de::Error::custom)
-        })
-        .collect()
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -163,7 +145,7 @@ pub(crate) struct SnakeCaseUsage {
     pub total_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
-    #[serde(flatten, deserialize_with = "deserialize_extensions")]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     pub extra: Extensions,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -176,7 +158,7 @@ pub(crate) struct TokenDetails {
     pub cache_write_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
-    #[serde(flatten, deserialize_with = "deserialize_extensions")]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     pub extra: Extensions,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -218,7 +200,7 @@ pub(crate) struct CamelCaseUsage {
     pub model_calls: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_usage: Option<BTreeMap<String, CamelCaseUsage>>,
-    #[serde(flatten, deserialize_with = "deserialize_extensions")]
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
     pub extra: Extensions,
 }
 /// Typed normalized metrics for the readers that historically emit floats.

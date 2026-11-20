@@ -1,5 +1,5 @@
 //! Native operation outcomes, including open future statuses.
-use super::field::Field;
+use crate::json::Field;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

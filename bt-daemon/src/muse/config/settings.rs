@@ -1,10 +1,10 @@
 //! Settings projection with lossless unrelated fields and explicit missing/null
 //! semantics. The caller holds Muse's native lock while loading and writing.
 use super::hooks::HookOverlay;
-use crate::muse::field::Field;
+use crate::json::Extensions;
+use crate::json::Field;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -15,8 +15,8 @@ pub(crate) struct MuseSettings {
     pub managed_hooks_path: Field<PathBuf>,
     #[serde(default, skip_serializing_if = "Field::is_missing")]
     pub hooks: Field<HookOverlay>,
-    #[serde(flatten)]
-    extra: BTreeMap<String, serde_json::Value>,
+    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
+    extra: Extensions,
 }
 impl MuseSettings {
     pub fn load(path: &Path) -> anyhow::Result<Self> {

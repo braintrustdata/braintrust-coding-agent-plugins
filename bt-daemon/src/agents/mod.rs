@@ -13,6 +13,7 @@ mod grok;
 mod muse;
 mod opencode;
 mod pi;
+pub(crate) mod request;
 pub(crate) mod schema;
 pub(crate) mod usage;
 

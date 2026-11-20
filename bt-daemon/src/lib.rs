@@ -27,6 +27,7 @@ mod hook;
 mod hook_executable;
 mod ids;
 mod journal;
+mod json;
 mod managed_run;
 mod muse;
 mod pipeline;

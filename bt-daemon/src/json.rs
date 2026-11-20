@@ -1,5 +1,6 @@
-//! Optional wire fields whose explicit null differs from absence in authored
-//! metadata and replay fingerprints. Ordinary optional data uses Option instead.
+//! Shared JSON-boundary helpers. Preserve explicit null versus absence in
+//! authored metadata and replay fingerprints, and retain unknown extensions as
+//! opaque encodings. Ordinary optional data uses Option instead.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Field<T> {
@@ -44,4 +45,26 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(Option::<T>::deserialize(d)?.into())
     }
+}
+
+use serde_json::value::RawValue;
+use std::collections::BTreeMap;
+
+pub(crate) type Extensions = BTreeMap<String, Box<RawValue>>;
+
+/// Serde buffers flattened fields, so RawValue cannot deserialize them
+/// directly. Materialize JSON only at this decoding boundary, then retain
+/// unknown values as opaque encodings rather than traversable data bags.
+pub(crate) fn deserialize_extensions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Extensions, D::Error> {
+    let fields = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    fields
+        .into_iter()
+        .map(|(key, value)| {
+            serde_json::value::to_raw_value(&value)
+                .map(|raw| (key, raw))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
 }
