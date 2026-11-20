@@ -411,14 +411,17 @@ mod tests {
             // The SDK consumes its pending batch even when delivery is rejected.
             let pending = std::mem::take(&mut self.pending);
             if self.record.reject.swap(false, Ordering::SeqCst) {
-                return Err(braintrust_sdk_rust::BraintrustError::Api {
-                    status: if self.record.unauthorized.load(Ordering::SeqCst) {
-                        401
-                    } else {
-                        503
-                    },
-                    message: "unavailable".into(),
-                }
+                return Err(braintrust_api_client::backend::HttpError::new(
+                    reqwest::StatusCode::from_u16(
+                        if self.record.unauthorized.load(Ordering::SeqCst) {
+                            401
+                        } else {
+                            503
+                        },
+                    )
+                    .unwrap(),
+                    "unavailable".into(),
+                )
                 .into());
             }
             self.record.accepted.fetch_add(pending, Ordering::SeqCst);

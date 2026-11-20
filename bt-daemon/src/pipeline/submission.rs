@@ -54,32 +54,43 @@ impl std::error::Error for Failure {
 
 impl Failure {
     fn classify(cause: anyhow::Error) -> Self {
-        let cause = if let Some(error) =
-            cause.downcast_ref::<braintrust_api_client::backend::HttpError>()
-        {
-            anyhow::Error::new(braintrust_sdk_rust::BraintrustError::Api {
-                status: error.status.as_u16(),
-                message: error.to_string(),
+        let sdk_error = cause
+            .downcast_ref::<braintrust_sdk_rust::BraintrustError>()
+            .or_else(
+                || match cause.downcast_ref::<braintrust_sdk_rust::FlushError>() {
+                    Some(braintrust_sdk_rust::FlushError::Delivery(failure)) => {
+                        failure.cause().cause().downcast_ref()
+                    }
+                    _ => None,
+                },
+            )
+            .or_else(
+                || match cause.downcast_ref::<braintrust_sdk_rust::WriteError>() {
+                    Some(braintrust_sdk_rust::WriteError::Delivery(failure)) => {
+                        failure.cause().downcast_ref()
+                    }
+                    _ => None,
+                },
+            );
+        let status = sdk_error
+            .and_then(|error| match error {
+                braintrust_sdk_rust::BraintrustError::Api { status, .. } => Some(*status),
+                _ => None,
             })
-        } else {
-            cause
-        };
-        let retry = match cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
-            Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
-                RetryCondition::Credentials
-            }
-            Some(braintrust_sdk_rust::BraintrustError::Api {
-                status: 403 | 404, ..
-            }) => RetryCondition::Configuration { recheck: true },
-            Some(braintrust_sdk_rust::BraintrustError::Api {
-                status: 408 | 429 | 500..=599,
-                ..
-            })
-            | Some(braintrust_sdk_rust::BraintrustError::Http(_))
-            | Some(braintrust_sdk_rust::BraintrustError::Network(_))
-            | Some(braintrust_sdk_rust::BraintrustError::ChannelClosed)
-            | None => RetryCondition::Transient,
-            Some(_) => RetryCondition::Configuration { recheck: false },
+            .or_else(|| {
+                cause
+                    .downcast_ref::<braintrust_api_client::backend::HttpError>()
+                    .map(|error| error.status.as_u16())
+            });
+        let retry = match (status, sdk_error) {
+            (Some(401), _) => RetryCondition::Credentials,
+            (Some(403 | 404), _) => RetryCondition::Configuration { recheck: true },
+            (Some(408 | 429 | 500..=599), _)
+            | (_, Some(braintrust_sdk_rust::BraintrustError::Http(_)))
+            | (_, Some(braintrust_sdk_rust::BraintrustError::Network(_)))
+            | (_, Some(braintrust_sdk_rust::BraintrustError::ChannelClosed))
+            | (None, None) => RetryCondition::Transient,
+            _ => RetryCondition::Configuration { recheck: false },
         };
         Self { cause, retry }
     }
@@ -128,6 +139,50 @@ impl Stage for Submission {
                     state: self.state(),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use braintrust_sdk_rust::{BraintrustClient, ParentSpanInfo, SpanLog};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[tokio::test]
+    async fn classifies_delivery_errors_from_both_flush_and_write() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(
+                ResponseTemplate::new(400).set_delay(std::time::Duration::from_millis(50)),
+            )
+            .mount(&server)
+            .await;
+        let client = BraintrustClient::builder()
+            .skip_login(true)
+            .api_url(server.uri())
+            .app_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        let span = client
+            .span_builder_with_credentials("token", "org")
+            .parent_info(ParentSpanInfo::ProjectLogs {
+                object_id: "project".into(),
+            })
+            .build();
+        let write = span.log(SpanLog::builder().build().unwrap());
+        let flush = client.flush().await.unwrap_err();
+        let write = write.await.unwrap_err();
+        for error in [anyhow::Error::new(flush), anyhow::Error::new(write)] {
+            assert!(matches!(
+                Failure::classify(error).retry,
+                RetryCondition::Configuration { recheck: false }
+            ));
         }
     }
 }

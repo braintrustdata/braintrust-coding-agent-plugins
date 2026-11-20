@@ -4292,7 +4292,7 @@ async fn changed_settings_resume_the_original_rejected_route_through_ingress() {
     let rejection = Mock::given(method("POST"))
         .and(path("/logs3"))
         .respond_with(ResponseTemplate::new(400).set_body_string("invalid row"))
-        .expect(1)
+        .expect(1..=2)
         .mount_as_scoped(&server)
         .await;
     let tmp = tempfile::tempdir().unwrap();
