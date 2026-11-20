@@ -1,6 +1,7 @@
 //! Antigravity native records shared by live translation and transcript import.
+use crate::agents::usage::{Extensions, ProviderUsage};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Native transcript records are decoded before entering translator state.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -37,9 +38,14 @@ pub(crate) struct TranscriptRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
-    // Provider-specific usage and future native extensions are open-ended.
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+    /// Unknown native extensions are retained without inspecting their contents.
+    #[serde(
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
+    )]
+    pub extra: Extensions,
 }
 
 pub(crate) fn optional_integer<'de, D: serde::Deserializer<'de>>(
@@ -93,8 +99,11 @@ pub(crate) struct ToolCall {
         deserialize_with = "crate::agents::schema::deserialize_present"
     )]
     pub output: Option<Value>,
-    #[serde(flatten)]
-    pub extra: Map<String, Value>,
+    #[serde(
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
+    )]
+    pub extra: Extensions,
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Partial OpenCode 2 wire types. Unknown fields are accepted; arbitrary tool
 //! inputs, outputs and provider-specific content remain JSON values.
+pub(super) use crate::agents::usage::OpenCodeTokens as Tokens;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -152,24 +153,6 @@ pub(super) struct StepEnded {
     pub message_id: String,
     pub tokens: Option<Tokens>,
     pub error: Option<NativeError>,
-}
-#[derive(Default, Deserialize, Serialize)]
-pub(super) struct Tokens {
-    #[serde(default)]
-    pub input: i64,
-    #[serde(default)]
-    pub output: i64,
-    #[serde(default)]
-    pub reasoning: i64,
-    #[serde(default)]
-    pub cache: CacheTokens,
-}
-#[derive(Default, Deserialize, Serialize)]
-pub(super) struct CacheTokens {
-    #[serde(default)]
-    pub read: i64,
-    #[serde(default)]
-    pub write: i64,
 }
 #[derive(Deserialize)]
 pub(super) struct TextEnded {

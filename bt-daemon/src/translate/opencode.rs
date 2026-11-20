@@ -10,6 +10,7 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::usage::OpenCodeTokens as MessageTokens;
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
@@ -399,26 +400,6 @@ struct MessageTime {
     created: Option<i64>,
     #[serde(default)]
     completed: Option<i64>,
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-struct MessageTokens {
-    #[serde(default)]
-    input: i64,
-    #[serde(default)]
-    output: i64,
-    #[serde(default)]
-    reasoning: i64,
-    #[serde(default)]
-    cache: MessageCacheTokens,
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-struct MessageCacheTokens {
-    #[serde(default)]
-    read: i64,
-    #[serde(default)]
-    write: i64,
 }
 
 fn decode<T: DeserializeOwned>(value: &Value) -> Option<T> {

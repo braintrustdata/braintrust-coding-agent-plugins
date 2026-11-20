@@ -10,6 +10,7 @@ use super::tool::nonempty_error_text;
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::usage::{CamelCaseUsage as NativeUsage, Extensions};
 use crate::ids;
 use crate::transcript_mirror::{Reference, TranscriptPayload};
 use crate::wire::Envelope;
@@ -44,8 +45,11 @@ struct NativeRecord {
     ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp: Option<i64>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
+    #[serde(
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
+    )]
+    extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct NativeParams {
@@ -53,8 +57,11 @@ struct NativeParams {
     update: Option<NativeUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     meta: Option<NativeMeta>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
+    #[serde(
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
+    )]
+    extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,8 +106,11 @@ struct NativeUpdate {
         rename = "stop_reason"
     )]
     stop_reason: Option<String>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
+    #[serde(
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
+    )]
+    extra: Extensions,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,38 +125,11 @@ struct NativeMeta {
     stream_start_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_timestamp_ms: Option<i64>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NativeUsage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    total_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cached_read_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_creation_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reasoning_tokens: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    api_duration_ms: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cost_usd_ticks: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model_calls: Option<u64>,
     #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::agents::schema::deserialize_present"
+        flatten,
+        deserialize_with = "crate::agents::usage::deserialize_extensions"
     )]
-    model_usage: Option<Value>,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
+    extra: Extensions,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -915,7 +898,7 @@ impl GrokTranslator {
                     metadata.insert("stop_reason".into(), json!(stop_reason));
                 }
                 if let Some(model_usage) = usage.and_then(|value| value.model_usage.as_ref()) {
-                    metadata.insert("model_usage".into(), model_usage.clone());
+                    metadata.insert("model_usage".into(), json!(model_usage));
                 }
                 if native_model_calls.is_some_and(|native| native != reconstructed_model_calls) {
                     metadata.insert(

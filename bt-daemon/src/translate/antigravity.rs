@@ -11,11 +11,12 @@ use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::agents::antigravity::schema::{optional_integer, ToolCall, ToolCalls, TranscriptRecord};
+use crate::agents::usage::UsageMetrics;
 use crate::ids;
 use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
@@ -818,61 +819,11 @@ fn parse_created_at(record: &TranscriptRecord) -> Option<i64> {
 }
 
 fn token_metrics(records: &[TranscriptRecord]) -> Option<Value> {
-    let mut found = HashMap::<&'static str, f64>::new();
-    for record in records {
-        collect_metric_fields(&record.extra, &mut found);
-        for content in [&record.content, &record.message, &record.text]
-            .into_iter()
-            .flatten()
-        {
-            collect_token_metrics(content, &mut found);
-        }
+    let mut metrics = UsageMetrics::default();
+    for usage in records.iter().filter_map(|record| record.usage.as_ref()) {
+        metrics.observe(usage.metrics());
     }
-    if found.is_empty() {
-        return None;
-    }
-    let mut metrics = Map::new();
-    for (key, value) in found {
-        metrics.insert(key.to_string(), json!(value));
-    }
-    Some(Value::Object(metrics))
-}
-
-fn collect_token_metrics(value: &Value, found: &mut HashMap<&'static str, f64>) {
-    match value {
-        Value::Object(object) => {
-            collect_metric_fields(object, found);
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_token_metrics(value, found);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_metric_fields(object: &Map<String, Value>, found: &mut HashMap<&'static str, f64>) {
-    for (key, value) in object {
-        if let Some(number) = value.as_f64() {
-            let metric = match key.as_str() {
-                "input_tokens" | "inputTokens" | "prompt_tokens" | "promptTokens" => {
-                    Some("prompt_tokens")
-                }
-                "output_tokens" | "outputTokens" | "completion_tokens" | "completionTokens" => {
-                    Some("completion_tokens")
-                }
-                "total_tokens" | "totalTokens" => Some("tokens"),
-                "thinking_tokens" | "thinkingTokens" => Some("thinking_tokens"),
-                "cache_read_tokens" | "cacheReadTokens" => Some("prompt_cached_tokens"),
-                _ => None,
-            };
-            if let Some(metric) = metric {
-                found.insert(metric, number);
-            }
-        }
-        collect_token_metrics(value, found);
-    }
+    (!metrics.is_empty()).then(|| json!(metrics))
 }
 
 fn nonempty_value(value: Value) -> Option<Value> {
@@ -882,5 +833,42 @@ fn nonempty_value(value: Value) -> Option<Value> {
         Value::Array(values) if values.is_empty() => None,
         Value::Object(object) if object.is_empty() => None,
         _ => Some(value),
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_usage_fields_become_metrics() {
+        let records: Vec<TranscriptRecord> = serde_json::from_value(json!([
+            {"usage":{"inputTokens":10,"outputTokens":2,"totalTokens":12},
+             "content":{"inputTokens":10000},
+             "future":{"input_tokens":20000},
+             "tool_calls":[{"name":"test","args":{"totalTokens":30000}}]},
+            {"content":{"outputTokens":40000}},
+            {"usage":{"vendor":{"inputTokens":50000}}}
+        ]))
+        .unwrap();
+        assert_eq!(
+            token_metrics(&records).unwrap(),
+            json!({"prompt_tokens":10.0,"completion_tokens":2.0,"tokens":12.0})
+        );
+        assert!(token_metrics(&records[1..]).is_none());
+    }
+
+    #[test]
+    fn usage_snapshots_merge_known_counts_without_summing_or_inventing_totals() {
+        let records: Vec<TranscriptRecord> = serde_json::from_value(json!([
+            {"usage":{"inputTokens":10,"cacheReadTokens":3}},
+            {"usage":{"outputTokens":2}},
+            {"usage":{"inputTokens":12}}
+        ]))
+        .unwrap();
+        assert_eq!(
+            token_metrics(&records).unwrap(),
+            json!({"prompt_tokens":12.0,"completion_tokens":2.0,"prompt_cached_tokens":3.0})
+        );
     }
 }

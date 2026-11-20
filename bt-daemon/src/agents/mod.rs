@@ -14,6 +14,7 @@ mod muse;
 mod opencode;
 mod pi;
 pub(crate) mod schema;
+pub(crate) mod usage;
 
 pub(crate) use antigravity::Antigravity;
 pub(crate) use claude::Claude;

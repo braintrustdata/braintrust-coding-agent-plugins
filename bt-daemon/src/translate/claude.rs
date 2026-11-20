@@ -15,6 +15,7 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::usage::SnakeCaseUsage;
 use crate::ids;
 use crate::transcript_mirror::TranscriptPayload;
 use crate::wire::Envelope;
@@ -2077,24 +2078,33 @@ impl LlmCall {
                 }
             }
         }
-        if let Some(usage) = message.get("usage") {
-            self.prompt_tokens = self.prompt_tokens.max(u64_field(usage, "input_tokens"));
-            self.completion_tokens = self
-                .completion_tokens
-                .max(u64_field(usage, "output_tokens"));
+        #[derive(Deserialize)]
+        struct UsageRecord {
+            message: Option<UsageMessage>,
+        }
+        #[derive(Deserialize)]
+        struct UsageMessage {
+            usage: Option<SnakeCaseUsage>,
+        }
+        if let Some(usage) = decode::<UsageRecord>(record)
+            .and_then(|record| record.message)
+            .and_then(|message| message.usage)
+        {
+            self.prompt_tokens = self.prompt_tokens.max(usage.input_tokens.unwrap_or(0));
+            self.completion_tokens = self.completion_tokens.max(usage.output_tokens.unwrap_or(0));
             self.cache_creation_tokens = self
                 .cache_creation_tokens
-                .max(u64_field(usage, "cache_creation_input_tokens"));
+                .max(usage.cache_creation_input_tokens.unwrap_or(0));
             self.cache_read_tokens = self
                 .cache_read_tokens
-                .max(u64_field(usage, "cache_read_input_tokens"));
-            if let Some(cache) = usage.get("cache_creation") {
+                .max(usage.cache_read_input_tokens.unwrap_or(0));
+            if let Some(cache) = usage.cache_creation {
                 self.cache_creation_5m_tokens = self
                     .cache_creation_5m_tokens
-                    .max(u64_field(cache, "ephemeral_5m_input_tokens"));
+                    .max(cache.ephemeral_5m_input_tokens.unwrap_or(0));
                 self.cache_creation_1h_tokens = self
                     .cache_creation_1h_tokens
-                    .max(u64_field(cache, "ephemeral_1h_input_tokens"));
+                    .max(cache.ephemeral_1h_input_tokens.unwrap_or(0));
             }
         }
     }
@@ -2584,10 +2594,6 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     })
-}
-
-fn u64_field(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 fn basename(path: &str) -> String {

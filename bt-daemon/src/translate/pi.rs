@@ -9,6 +9,7 @@ use super::tool::{
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
+use crate::agents::usage::PiUsage as Usage;
 use crate::ids;
 use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
@@ -147,37 +148,6 @@ struct AssistantMessage {
     thinking_level: Option<String>,
     #[serde(default)]
     provider_thinking_level: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Serialize)]
-struct Usage {
-    #[serde(default)]
-    input: i64,
-    #[serde(default)]
-    output: i64,
-    // Pi reports `reasoning` as a subset of `output`, and only for providers
-    // that expose the breakdown.
-    #[serde(default)]
-    reasoning: Option<i64>,
-    #[serde(default)]
-    cache_read: i64,
-    // `cacheWrite1h` is the subset of `cacheWrite` written with 1h retention.
-    #[serde(default)]
-    cache_write: i64,
-    #[serde(default)]
-    cache_write1h: Option<i64>,
-    #[serde(default)]
-    total_tokens: Option<i64>,
-    #[serde(default)]
-    cost: Option<Cost>,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct Cost {
-    #[serde(default)]
-    total: Option<f64>,
 }
 
 #[derive(Deserialize)]

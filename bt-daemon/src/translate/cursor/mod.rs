@@ -11,6 +11,7 @@ use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
 };
 use crate::agents::cursor::schema::{Role, TranscriptRecord};
+use crate::agents::usage::TokenMetrics;
 use crate::{ids, wire::Envelope};
 use hooks::{
     CursorHook, Hook, ImportStopHook, PromptHook, ResponseHook, SessionEndHook, Specialized,
@@ -113,7 +114,7 @@ struct Turn {
     boundary: i64,
     model_seq: u64,
     emitted_text: String,
-    usage: serde_json::Map<String, Value>,
+    usage: TokenMetrics,
 }
 #[derive(PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -399,7 +400,7 @@ impl CursorTranslator {
             boundary: ts,
             model_seq: 0,
             emitted_text: String::new(),
-            usage: serde_json::Map::new(),
+            usage: TokenMetrics::default(),
         };
         if let Some(g) = generation {
             self.prompt_generations.insert(g.into(), turn.clone());
@@ -1333,32 +1334,34 @@ impl CursorTranslator {
         else {
             return;
         };
-        let mut metrics = serde_json::Map::new();
-        for (count, metric) in [
-            (usage.input_tokens, "prompt_tokens"),
-            (usage.output_tokens, "completion_tokens"),
-            (usage.cache_read_tokens, "prompt_cached_tokens"),
-            (usage.cache_write_tokens, "prompt_cache_creation_tokens"),
-        ] {
-            if let Some(count) = count {
-                metrics.insert(metric.into(), json!(count));
-            }
-        }
-        if metrics.is_empty() {
+        if usage.input_tokens.is_none()
+            && usage.output_tokens.is_none()
+            && usage.cache_read_tokens.is_none()
+            && usage.cache_write_tokens.is_none()
+        {
             return;
         }
-        // Response and stop can report partial snapshots for the same turn.
-        // Merge known counts rather than fabricating missing values or summing
-        // repeated observations. Cache counts remain subsets of prompt usage.
-        turn.usage.extend(metrics);
+        // Response and stop carry partial snapshots. Replace known fields,
+        // never sum snapshots or fabricate counters missing from both.
+        if let Some(count) = usage.input_tokens {
+            turn.usage.prompt_tokens = Some(count);
+        }
+        if let Some(count) = usage.output_tokens {
+            turn.usage.completion_tokens = Some(count);
+        }
+        if let Some(count) = usage.cache_read_tokens {
+            turn.usage.prompt_cached_tokens = Some(count);
+        }
+        if let Some(count) = usage.cache_write_tokens {
+            turn.usage.prompt_cache_creation_tokens = Some(count);
+        }
         if let Some(total) = turn
             .usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .zip(turn.usage.get("completion_tokens").and_then(Value::as_u64))
+            .prompt_tokens
+            .zip(turn.usage.completion_tokens)
             .and_then(|(prompt, completion)| prompt.checked_add(completion))
         {
-            turn.usage.insert("tokens".into(), json!(total));
+            turn.usage.tokens = Some(total);
         }
         let mut row = self.row(
             turn.id.clone(),
@@ -1366,7 +1369,7 @@ impl CursorTranslator {
             &format!("Turn {}", turn.ordinal),
             SpanType::Task,
         );
-        let metrics = Value::Object(turn.usage.clone());
+        let metrics = json!(turn.usage);
         let metrics_id = ids::span_id(&self.namespace, &metrics.to_string());
         row.metrics = Some(metrics);
         row.metadata = Some(json!({"token_usage_scope":"turn"}));
