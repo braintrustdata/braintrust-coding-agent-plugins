@@ -2991,37 +2991,49 @@ async fn pending_restart_preserves_current_candidates_and_decided_legacy_links()
         let saved_database = std::fs::read(&backup).unwrap();
         shutdown_daemon(&socket).await.unwrap();
         daemon.await.unwrap();
-        // Restore the accepted-but-undelivered checkpoint, as after an abrupt
-        // process exit. Shutdown itself is covered separately above.
+        // Restore the crash image into a new directory. Windows cannot unlink
+        // SQLite files while an exiting task still owns a connection. Backup
+        // the other databases through SQLite, preserving their committed WAL.
+        let restored_dir = tmp.path().join("restored-data");
+        let mut dirs = vec![(data_dir.clone(), restored_dir.clone())];
+        let child_database = journal_store::path(&data_dir, "claude-code", "bounded-child");
+        while let Some((from, to)) = dirs.pop() {
+            tokio::fs::create_dir_all(&to).await.unwrap();
+            let mut entries = tokio::fs::read_dir(&from).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let source = entry.path();
+                let target = to.join(entry.file_name());
+                if entry.file_type().await.unwrap().is_dir() {
+                    dirs.push((source, target));
+                } else if source.extension().is_some_and(|ext| ext == "sqlite") {
+                    if source != child_database {
+                        bt_daemon::storage_inspect::Inspector::open(&source)
+                            .unwrap()
+                            .backup(&target)
+                            .unwrap();
+                    }
+                } else if !source.to_string_lossy().ends_with("-wal")
+                    && !source.to_string_lossy().ends_with("-shm")
+                {
+                    tokio::fs::copy(&source, &target).await.unwrap();
+                }
+            }
+        }
+        let path = restored_dir.join(path.strip_prefix(&data_dir).unwrap());
+        let journal_path = restored_dir.join(journal_path.strip_prefix(&data_dir).unwrap());
+        let data_dir = restored_dir;
         tokio::fs::create_dir_all(journal_path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&journal_path, journal).await.unwrap();
-        // This crash fixture rolls back source persistence as well as delivery.
-        let id = journal_path
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .rsplit("--")
-            .next()
-            .unwrap();
-        for suffix in [".sqlite", ".sqlite-wal", ".sqlite-shm"] {
-            let path = data_dir.join("pipeline").join(format!("{id}{suffix}"));
-            if path.exists() {
-                tokio::fs::remove_file(path).await.unwrap();
-            }
-        }
         if format == "current" {
-            // A current-version crash preserves the SQLite collection and its
-            // exact IDs, rather than manufacturing a legacy NDJSON replacement.
-            tokio::fs::remove_file(&journal_path).await.unwrap();
             tokio::fs::write(
                 journal_store::path(&data_dir, "claude-code", "bounded-child"),
                 saved_database,
             )
             .await
             .unwrap();
+        } else {
+            tokio::fs::write(&journal_path, journal).await.unwrap();
         }
         let mut legacy_route = original_route.clone();
         legacy_route.destination = Some(external_parent());
