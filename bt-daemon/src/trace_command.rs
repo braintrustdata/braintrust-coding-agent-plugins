@@ -21,8 +21,8 @@ pub struct TraceArgs {
 #[allow(clippy::large_enum_variant)]
 pub enum TraceCommand {
     /// Install and configure the Braintrust tracing plugin for a coding agent.
-    #[command(name = "install", visible_alias = "setup")]
-    Setup(SetupArgs),
+    #[command(visible_alias = "setup")]
+    Install(SetupArgs),
     /// Enable tracing, setting it up when needed or when settings are supplied.
     Enable(EnableArgs),
     /// Disable tracing while preserving the plugin and its configuration.
@@ -221,7 +221,7 @@ mod tests {
     fn every_public_trace_ingress_accepts_additional_metadata() {
         let setup = Cli::try_parse_from([
             "bt",
-            "setup",
+            "install",
             "claude",
             "--additional-metadata",
             r#"{"setup":true}"#,
@@ -229,7 +229,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             setup.trace.command,
-            TraceCommand::Setup(SetupArgs {
+            TraceCommand::Install(SetupArgs {
                 agent: SetupAgent::Claude,
                 additional_metadata: Some(ref value),
                 ..
@@ -239,7 +239,7 @@ mod tests {
         let legacy_setup = Cli::try_parse_from(["bt", "setup", "codex"]).unwrap();
         assert!(matches!(
             legacy_setup.trace.command,
-            TraceCommand::Setup(SetupArgs {
+            TraceCommand::Install(SetupArgs {
                 agent: SetupAgent::Codex,
                 ..
             })
@@ -312,7 +312,7 @@ mod tests {
             Cli::try_parse_from(["bt", "setup", "claude", "--tag", "ci", "--tag", "docs"]).unwrap();
         assert!(matches!(
             setup.trace.command,
-            TraceCommand::Setup(SetupArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
+            TraceCommand::Install(SetupArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
         ));
 
         let run = Cli::try_parse_from(["bt", "run", "codex", "--tag", "ci,docs", "--", "status"])
@@ -398,7 +398,7 @@ mod tests {
             let parsed = Cli::try_parse_from(["bt", "setup", "antigravity"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
                     agent: SetupAgent::Antigravity,
                     ..
                 })
@@ -423,7 +423,7 @@ mod tests {
             let parsed = Cli::try_parse_from(["bt", "setup", "grok"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
                     agent: SetupAgent::Grok,
                     ..
                 })
@@ -449,7 +449,7 @@ mod tests {
             ] {
                 let parsed = Cli::try_parse_from(args).unwrap();
                 let scope = match parsed.trace.command {
-                    TraceCommand::Setup(args) => args.scope,
+                    TraceCommand::Install(args) => args.scope,
                     TraceCommand::Enable(args) => args.scope,
                     TraceCommand::Disable(args) | TraceCommand::Uninstall(args) => args.scope,
                     _ => panic!("wrong command"),
@@ -573,7 +573,7 @@ mod tests {
         ] {
             let parsed = Cli::try_parse_from(args).unwrap();
             let plugins = match parsed.trace.command {
-                TraceCommand::Setup(args) => args.plugin,
+                TraceCommand::Install(args) => args.plugin,
                 TraceCommand::Run(args) => args.plugin,
                 TraceCommand::Import(args) => args.plugin,
                 _ => unreachable!(),

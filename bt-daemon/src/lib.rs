@@ -68,7 +68,8 @@ pub use client::{
 pub use collections::inspect as storage_inspect;
 pub use command_output::{
     AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
-    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    InstallCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput,
+    TraceCommandOutput,
 };
 pub use hook::run_hook;
 pub use hook_executable::delegate_hook_executable;

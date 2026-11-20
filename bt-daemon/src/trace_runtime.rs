@@ -697,7 +697,7 @@ async fn doctor_output_at(
     }
 }
 
-async fn run_setup_command(
+async fn run_install_command(
     mut args: crate::SetupArgs,
     host: &TraceHostContext,
     configuration: Option<&'static str>,
@@ -737,7 +737,7 @@ async fn run_setup_command(
     let codex = matches!(args.agent, SetupAgent::Codex);
     let mut output = crate::run_setup(args, route)?;
     if let Some(configuration) = configuration {
-        if let TraceCommandOutput::Setup(mut setup) = output {
+        if let TraceCommandOutput::Install(mut setup) = output {
             setup.configuration = Some(configuration);
             output = TraceCommandOutput::Enable(setup);
         }
@@ -791,7 +791,7 @@ pub async fn run_trace_with_matches(
         || selection.auth.org_name.is_some()
         || selection.project_name.is_some();
     match args.command {
-        TraceCommand::Setup(args) => run_setup_command(args, &host, None, &selection).await,
+        TraceCommand::Install(args) => run_install_command(args, &host, None, &selection).await,
         TraceCommand::Enable(args) => {
             if args.scope == SettingsScope::Project {
                 if args.additional_metadata.is_some()
@@ -811,7 +811,7 @@ pub async fn run_trace_with_matches(
                         tags: args.tags,
                         plugin: args.plugin,
                     };
-                    return run_setup_command(setup, &host, Some("updated"), &selection).await;
+                    return run_install_command(setup, &host, Some("updated"), &selection).await;
                 }
                 return print_output(
                     crate::setup::run_scoped_toggle(args.agent, args.scope, true)?,
@@ -843,7 +843,7 @@ pub async fn run_trace_with_matches(
                     },
                     plugin: args.plugin,
                 };
-                run_setup_command(
+                run_install_command(
                     setup,
                     &host,
                     Some(if configured { "updated" } else { "created" }),
@@ -1437,7 +1437,7 @@ mod tests {
         .unwrap();
         for (command, persistent_auth, destination_required) in [
             (
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
                     no_inherit_plugins: false,
                     inherit_plugins: false,
                     disable: false,

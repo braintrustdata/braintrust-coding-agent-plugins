@@ -115,8 +115,8 @@ pub(crate) fn run_project_setup(
     let existed = path.exists();
     write_project_setup_at(&path, &args, &selection)?;
     let id = args.agent.identity();
-    let output =
-        TraceCommandOutput::project_setup(id.id, id.display_name, path).with_enabled(!args.disable);
+    let output = TraceCommandOutput::project_install(id.id, id.display_name, path)
+        .with_enabled(!args.disable);
     Ok(if as_enable {
         output.into_enable(if existed { "updated" } else { "created" })
     } else {
@@ -223,7 +223,7 @@ pub fn run_setup(args: SetupArgs, route: SessionRoute) -> anyhow::Result<TraceCo
     let identity = agent.identity();
     let settings_path = enable_tracing(identity.id, route, !args.disable, args.no_inherit_plugins)?;
     Ok(
-        TraceCommandOutput::setup(identity.id, identity.display_name, settings_path)
+        TraceCommandOutput::install(identity.id, identity.display_name, settings_path)
             .with_enabled(!args.disable),
     )
 }

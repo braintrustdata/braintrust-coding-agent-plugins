@@ -54,7 +54,7 @@ impl From<Option<StatusResult>> for StatusCommandOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SetupCommandOutput {
+pub struct InstallCommandOutput {
     pub source: String,
     pub display_name: String,
     pub settings_path: PathBuf,
@@ -69,6 +69,9 @@ pub struct SetupCommandOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
+
+/// Backwards-compatible name for the shared install and enable output.
+pub type SetupCommandOutput = InstallCommandOutput;
 
 fn is_false(value: &bool) -> bool {
     !value
@@ -185,11 +188,10 @@ pub struct DoctorCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Doctor(Box<DoctorCommandOutput>),
-    #[serde(rename = "install")]
-    Setup(SetupCommandOutput),
-    Enable(SetupCommandOutput),
-    Disable(SetupCommandOutput),
-    Uninstall(SetupCommandOutput),
+    Install(InstallCommandOutput),
+    Enable(InstallCommandOutput),
+    Disable(InstallCommandOutput),
+    Uninstall(InstallCommandOutput),
     Update(UpdateCommandOutput),
     Stop(StopCommandOutput),
     Import {
@@ -207,13 +209,13 @@ impl TraceCommandOutput {
         Self::Doctor(Box::new(output))
     }
 
-    pub fn setup(
+    pub fn install(
         source: impl Into<String>,
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
         let source = source.into();
-        Self::Setup(SetupCommandOutput {
+        Self::Install(InstallCommandOutput {
             source,
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -226,12 +228,21 @@ impl TraceCommandOutput {
         })
     }
 
+    /// Compatibility alias for creating install output.
+    pub fn setup(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::install(source, display_name, settings_path)
+    }
+
     pub fn enable(
         source: impl Into<String>,
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::Enable(SetupCommandOutput {
+        Self::Enable(InstallCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -244,13 +255,13 @@ impl TraceCommandOutput {
         })
     }
 
-    pub fn project_setup(
+    pub fn project_install(
         source: impl Into<String>,
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        let mut output = Self::setup(source, display_name, settings_path).with_scope("project");
-        if let Self::Setup(setup) = &mut output {
+        let mut output = Self::install(source, display_name, settings_path).with_scope("project");
+        if let Self::Install(setup) = &mut output {
             setup.warnings.push("Settings not specified here must be supplied by each user's configuration. Each user needs a user-level installation and usable Braintrust credentials for their sessions to be captured.".into());
             setup.warnings.push(
                 "This shared project configuration applies to all coding agents in the repository."
@@ -262,7 +273,7 @@ impl TraceCommandOutput {
 
     pub(crate) fn with_scope(mut self, scope: &'static str) -> Self {
         match &mut self {
-            Self::Setup(output)
+            Self::Install(output)
             | Self::Enable(output)
             | Self::Disable(output)
             | Self::Uninstall(output) => {
@@ -275,7 +286,7 @@ impl TraceCommandOutput {
     }
 
     pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
-        if let Self::Setup(output) = &mut self {
+        if let Self::Install(output) = &mut self {
             output.enabled = Some(enabled);
         }
         self
@@ -283,13 +294,13 @@ impl TraceCommandOutput {
 
     pub(crate) fn into_enable(mut self, configuration: &'static str) -> Self {
         match &mut self {
-            Self::Setup(output) | Self::Enable(output) => {
+            Self::Install(output) | Self::Enable(output) => {
                 output.configuration = Some(configuration)
             }
             _ => return self,
         }
         match self {
-            Self::Setup(output) => Self::Enable(output),
+            Self::Install(output) => Self::Enable(output),
             _ => self,
         }
     }
@@ -307,7 +318,7 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::Disable(SetupCommandOutput {
+        Self::Disable(InstallCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -325,7 +336,7 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::Uninstall(SetupCommandOutput {
+        Self::Uninstall(InstallCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
@@ -437,10 +448,10 @@ impl TraceCommandOutput {
                 "Braintrust tracing configuration {} for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
                 setup.configuration.unwrap_or_default(), setup.display_name, setup.scope, setup.settings_path.display()
             )),
-            Self::Setup(setup) if setup.scope == "project" => Ok(format!(
+            Self::Install(setup) if setup.scope == "project" => Ok(format!(
                 "Project tracing settings for {} were written to {}.\nTracing is {}.\n{}", setup.display_name, setup.settings_path.display(), if setup.enabled == Some(false) { "disabled" } else { "enabled" }, setup.warnings.join("\n")
             )),
-            Self::Setup(setup) => Ok(format!(
+            Self::Install(setup) => Ok(format!(
                 "The Braintrust tracing plugin is installed for {} and configured in {}.{}\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
                 setup.settings_path.display(),
@@ -563,8 +574,8 @@ mod tests {
     }
 
     #[test]
-    fn enable_json_contains_stable_selection_fields_without_prose() {
-        let output = TraceCommandOutput::setup(
+    fn install_json_contains_stable_selection_fields_without_prose() {
+        let output = TraceCommandOutput::install(
             "opencode",
             "OpenCode",
             PathBuf::from("/tmp/opencode/braintrust.json"),
@@ -609,7 +620,7 @@ mod tests {
     #[test]
     fn codex_setup_and_updates_do_not_request_manual_trust() {
         for output in [
-            TraceCommandOutput::setup("codex", "Codex", PathBuf::from("braintrust.json")),
+            TraceCommandOutput::install("codex", "Codex", PathBuf::from("braintrust.json")),
             TraceCommandOutput::update("codex", "Codex"),
         ] {
             let human = output.render(OutputFormat::Human).unwrap();
