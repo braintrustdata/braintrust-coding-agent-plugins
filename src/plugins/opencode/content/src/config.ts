@@ -25,6 +25,8 @@ export interface PluginConfig {
   enable_tools?: boolean;
   debug?: boolean;
   additional_metadata?: Record<string, unknown>;
+  tags?: string[];
+  inherit_plugins?: boolean;
   route?: DaemonSessionRoute;
 }
 
@@ -74,7 +76,7 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
     if (pluginConfig.org_name) defaults.orgName = pluginConfig.org_name;
     if (pluginConfig.project) defaults.projectName = pluginConfig.project;
     // A nested route is canonical. Top-level fields are a compatibility
-    // fallback only for files that `bt trace enable` has not migrated yet.
+    // fallback only for files that `bt trace install` has not migrated yet.
     if (auth?.profile) defaults.profile = auth.profile;
     if (auth?.org_name) defaults.orgName = auth.org_name;
     if (
@@ -106,11 +108,12 @@ export function loadConfig(pluginConfig?: PluginConfig): BraintrustConfig {
       ...(defaults.orgName ? { org_name: defaults.orgName } : {}),
     },
   };
-  if (!pluginConfig?.route || pluginConfig.project !== undefined) {
+  if (!pluginConfig?.route || pluginConfig.route.destination === undefined) {
     persistentRoute.destination = { type: "project_logs", project_name: defaults.projectName };
   }
   if (defaults.additionalMetadata)
     persistentRoute.additional_metadata = defaults.additionalMetadata;
+  if (pluginConfig?.tags !== undefined) persistentRoute.tags = pluginConfig.tags;
   const traceSettings = resolveDaemonTraceSettings({
     trace_to_braintrust: defaults.tracingEnabled,
     route: persistentRoute,

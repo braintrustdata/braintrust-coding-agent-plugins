@@ -1,13 +1,15 @@
 import { spawnBackground } from "./background-process.ts"
 import { createHash } from "node:crypto"
+import { existsSync, realpathSync } from "node:fs"
 import { createConnection, type Socket } from "node:net"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 
 export const DAEMON_PROTOCOL_VERSION = 1
 
 export interface DaemonSessionRoute {
   auth?: {
+    source?: "auto" | "saved_profile" | "environment"
     /** Immutable saved-profile identifier. Preferred over legacy `profile`. */
     profile_id?: string
     /** Mutable display name retained to read settings written before profile IDs. */
@@ -18,11 +20,64 @@ export interface DaemonSessionRoute {
   flush_mode?: "fire_and_forget" | "flush_on_turn_end"
   additional_metadata?: Record<string, unknown>
   span_plugins?: string[]
+  tags?: string[]
 }
 
 export interface DaemonTraceSettings {
   trace_to_braintrust?: boolean
   route?: DaemonSessionRoute
+}
+
+/** Find project settings at the Git root, or in the starting directory outside Git. */
+export function projectSettingsPath(directory: string): string {
+  const start = resolve(directory)
+  let current = start
+  while (true) {
+    if (existsSync(join(current, ".git"))) return join(current, ".braintrust.json")
+    const parent = dirname(current)
+    if (parent === current) return join(start, ".braintrust.json")
+    current = parent
+  }
+}
+
+/** Recursively overlay objects and append arrays; scalar values replace. */
+export function mergeConfigObjects(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...base }
+  for (const [key, value] of Object.entries(overlay)) {
+    const prior = Object.hasOwn(result, key) ? result[key] : undefined
+    const merged = Array.isArray(prior) && Array.isArray(value) ? [...prior, ...value] : prior !== null && typeof prior === "object" && !Array.isArray(prior) && value !== null && typeof value === "object" && !Array.isArray(value)
+      ? mergeConfigObjects(prior as Record<string, unknown>, value as Record<string, unknown>)
+      : value
+    Object.defineProperty(result, key, { value: merged, enumerable: true, writable: true, configurable: true })
+  }
+  return result
+}
+
+/** Apply project-relative span plugins after inherited user plugins. */
+export function mergeProjectRoute(base: DaemonSessionRoute | undefined, overlay: DaemonSessionRoute | undefined, configPath: string, inheritPlugins = true): DaemonSessionRoute | undefined {
+  if (!base && !overlay) return undefined
+  if (!overlay && inheritPlugins) return base
+  const original = structuredClone(base ?? { destination: undefined }) as DaemonSessionRoute
+  if (!inheritPlugins) original.span_plugins = []
+  if (!overlay) return original
+  const safe = structuredClone(overlay)
+  if (safe.span_plugins !== undefined) {
+    if (!Array.isArray(safe.span_plugins) || !safe.span_plugins.every((plugin) => typeof plugin === "string" && plugin.length > 0)) {
+      throw new TypeError("project span_plugins must be an array of paths")
+    }
+    safe.span_plugins = safe.span_plugins.map((plugin) => {
+      const absolute = resolve(dirname(configPath), plugin)
+      try { return realpathSync(absolute) } catch { return absolute }
+    })
+  }
+  if (safe.auth?.profile && !safe.auth.profile_id && original.auth) {
+    delete original.auth.profile_id
+    original.auth.source = "saved_profile"
+  }
+  const nextDestination = safe.destination as Record<string, unknown> | undefined
+  const oldDestination = original.destination as Record<string, unknown> | undefined
+  if (nextDestination?.project_name && !nextDestination.project_id && oldDestination) delete oldDestination.project_id
+  return mergeConfigObjects(original as unknown as Record<string, unknown>, safe as unknown as Record<string, unknown>) as unknown as DaemonSessionRoute
 }
 
 const MANAGED_INSTANCE_CLAIMS = Symbol.for("braintrust.coding-agent.managed-instance-claims")

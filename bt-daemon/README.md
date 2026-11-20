@@ -58,6 +58,53 @@ or `bt trace doctor <agent>` for configuration, authentication, and recent
 session diagnostics. Hook exit codes can be observed by the caller while the
 coding agent decides whether to continue its turn.
 
+## Project-scoped tracing
+
+Each developer installs the agent integration once. To trace only repositories
+that opt in, install it with tracing disabled by default:
+
+```bash
+bt trace install claude --disable --project my-default-project
+```
+
+A repository owner can configure tracing from anywhere inside the Git repository:
+
+```bash
+bt trace install claude --scope project --project my-repository-project
+bt trace disable claude --scope project
+bt trace enable claude --scope project
+bt trace uninstall claude --scope project
+```
+
+Project install writes `.braintrust.json` at the Git repository root. The same
+file applies to every coding-agent integration. It contains the tracing switch
+and explicitly supplied settings; commit it to share the opt-in. Each developer
+still needs a user-level installation and usable credentials. Credentials are
+never stored in project files. Project-scoped uninstall deletes the entire shared
+`.braintrust.json`; user-level installations and settings remain in place.
+
+Project settings overlay user settings recursively: missing fields inherit,
+objects merge by field, arrays append, and explicit scalar values replace
+inherited values. Tags are deduplicated. Project span plugins are run after
+user-level plugins, and their paths are relative to `.braintrust.json`:
+
+```bash
+bt trace install claude --scope project --plugin ./scripts/redact.mjs
+```
+
+Use `--no-inherit-plugins` to run only the project's plugins; use
+`--inherit-plugins` to restore the default. A project configuration can execute
+the JavaScript plugins it names when tracing runs, so review them before using
+tracing in a repository.
+
+Managed `bt trace run` takes precedence over both scopes. For example,
+`bt trace run codex --inherit` starts from user and project settings before
+applying invocation options; `--no-inherit-plugins` replaces the inherited
+plugin chain for that invocation. `bt trace doctor <agent>` shows the current
+repository's effective configuration. For multi-root Cursor and Antigravity
+workspaces, the first root with a project file supplies the settings. `setup`
+remains an alias for `install`.
+
 ## Per-agent plugin settings
 
 Each coding agent reads an independent non-credential `braintrust.json` file:
@@ -146,7 +193,7 @@ Register both transforms persistently for ordinary Codex sessions. The
 redactor runs first and its returned span becomes the tagger's input:
 
 ```bash
-bt trace enable codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
+bt trace install codex --plugin ./redact.mjs --plugin ./tag-ci.mjs
 ```
 
 `run` and `import` plugins apply only to that command. They replace, rather than
@@ -228,12 +275,12 @@ or provide it for one invocation with `bt trace run`. Both accept
 `--additional-metadata` or `BRAINTRUST_ADDITIONAL_METADATA`:
 
 ```bash
-bt trace enable claude --additional-metadata '{"team":"platform"}'
+bt trace install claude --additional-metadata '{"team":"platform"}'
 BRAINTRUST_ADDITIONAL_METADATA='{"ci":true,"run_id":"'"$JOB_ID"'"}' \
   bt trace run codex -- "summarize this change"
 ```
 
-`bt trace enable`, `bt trace run`, and `bt trace import` are explicit,
+`bt trace install`, `bt trace run`, and `bt trace import` are explicit,
 user-invoked commands, so all three accept routing (profile, organization,
 project, destination) and `additional_metadata` from either a flag or the
 matching `BRAINTRUST_*` environment variable, with the flag winning if both
@@ -251,7 +298,7 @@ span produced by a route. The option is available on persistent setup, one-off
 runs, and transcript imports.
 
 ```bash
-bt trace enable claude --tag ci --tag release-validation
+bt trace install claude --tag ci --tag release-validation
 bt trace run codex --tag ci -- "summarize this change"
 bt trace import claude session-id --tag historical-import
 ```
@@ -263,9 +310,13 @@ one of those commands:
 BRAINTRUST_TAGS=ci,release-validation bt trace run codex -- "summarize this change"
 ```
 
-Use `bt trace disable <agent>` to remove the installed tracing plugin and its
-Braintrust settings. `bt trace setup <agent>` remains an alias for `bt trace
-enable <agent>` for backwards compatibility.
+Use `bt trace disable <agent>` to pause tracing while keeping the plugin and settings.
+Use `bt trace enable <agent>` to resume. If there is no saved configuration, or you provide
+explicit configuration options, `enable` runs installation and reports the result. Environment
+defaults do not change an existing configuration during a plain `enable`.
+Use `bt trace uninstall <agent>` to remove
+the plugin and its Braintrust settings. Use `bt trace install <agent>` to install or
+change the configuration.
 
 ## Build and test
 

@@ -69,7 +69,8 @@ pub use client::{
 pub use collections::inspect as storage_inspect;
 pub use command_output::{
     AuthDiagnostic, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, ImportSummary,
-    OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput, TraceCommandOutput,
+    InstallCommandOutput, OutputFormat, SetupCommandOutput, StatusCommandOutput, StopCommandOutput,
+    TraceCommandOutput,
 };
 pub use hook::run_hook;
 pub use hook_executable::delegate_hook_executable;
@@ -81,14 +82,15 @@ pub use server::{
     braintrust_serve_options, debug_serve_options, run_serve, AuthLease, AuthProvider,
     AuthResolveReason, ServeOptions,
 };
-pub use setup::{run_disable, run_enable, run_setup, run_update};
+pub use setup::{run_disable, run_enable, run_setup, run_uninstall, run_update};
 pub use sink::{BraintrustSinkConfig, BraintrustSinkFactory, DebugSinkFactory, Sink, SinkFactory};
 pub use trace_command::{
-    DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SetupAgent, SetupArgs, StopArgs, TraceArgs,
-    TraceCommand, UpdateArgs,
+    DisableArgs, DoctorAgent, DoctorArgs, EnableArgs, SettingsScope, SetupAgent, SetupArgs,
+    StopArgs, TraceArgs, TraceCommand, UpdateArgs,
 };
 pub use trace_runtime::{
-    run_trace, HostRouteSelection, RouteRequirements, TraceHostContext, TraceHostServices,
+    run_trace, run_trace_with_matches, HostRouteSelection, RouteRequirements, TraceHostContext,
+    TraceHostServices,
 };
 pub use transcript_import::{import_transcript, import_transcripts, run_import, ImportTarget};
 pub use translate::{

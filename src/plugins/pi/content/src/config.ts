@@ -1,8 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type DaemonSessionRoute, resolveDaemonTraceSettings } from "./runtime/daemon-client.ts";
-import { runningPiPackage } from "./pi-package.ts";
+import {
+  type DaemonSessionRoute,
+  projectSettingsPath,
+  mergeConfigObjects,
+  mergeProjectRoute,
+  resolveDaemonTraceSettings,
+} from "./runtime/daemon-client.ts";
 
 export interface PiConfig {
   enabled: boolean;
@@ -16,8 +21,6 @@ export interface PiConfig {
 }
 
 type ConfigRecord = Record<string, unknown>;
-
-const PROJECT_CONFIG_DIR_NAME = runningPiPackage().configDir;
 
 function record(value: unknown): ConfigRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -71,11 +74,20 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   config.orgName = orgName ?? config.orgName;
   config.projectName = projectName ?? config.projectName;
   config.enabled = boolean(source.trace_to_braintrust) ?? config.enabled;
-  config.additionalMetadata = record(source.additional_metadata) ?? config.additionalMetadata;
+  const metadata = record(source.additional_metadata);
+  config.additionalMetadata = metadata
+    ? mergeConfigObjects(
+        config.additionalMetadata ?? config.route.additional_metadata ?? {},
+        metadata,
+      )
+    : config.additionalMetadata;
   config.showUi = boolean(source.show_ui) ?? config.showUi;
   config.showTraceLink = boolean(source.show_trace_link) ?? config.showTraceLink;
 
   const additionalMetadata = record(source.additional_metadata);
+  if (Array.isArray(source.tags) && source.tags.every((tag) => typeof tag === "string")) {
+    config.route.tags = [...new Set([...(config.route.tags ?? []), ...source.tags])];
+  }
   if (profile || orgName) {
     config.route.auth = {
       ...config.route.auth,
@@ -86,7 +98,11 @@ function applyConfig(config: PiConfig, source: ConfigRecord | undefined): void {
   if (projectName) {
     config.route.destination = { type: "project_logs", project_name: projectName };
   }
-  if (additionalMetadata) config.route.additional_metadata = additionalMetadata;
+  if (additionalMetadata)
+    config.route.additional_metadata = mergeConfigObjects(
+      config.route.additional_metadata ?? {},
+      additionalMetadata,
+    );
 }
 
 export function loadConfig(cwd = process.cwd()): PiConfig {
@@ -101,8 +117,44 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
     },
   };
 
-  applyConfig(config, readConfig(join(homedir(), ".pi", "agent", "braintrust.json")));
-  applyConfig(config, readConfig(join(cwd, PROJECT_CONFIG_DIR_NAME, "braintrust.json")));
+  const userConfig = readConfig(join(homedir(), ".pi", "agent", "braintrust.json"));
+  applyConfig(config, userConfig);
+  const projectPath = projectSettingsPath(cwd);
+  const projectConfig = readConfig(projectPath);
+  if (projectConfig) {
+    try {
+      const {
+        route: projectRoute,
+        inherit_plugins: inheritPlugins,
+        ...safeProjectConfig
+      } = projectConfig;
+      if (projectRoute !== undefined && !record(projectRoute))
+        throw new TypeError("project route must be an object");
+      if (inheritPlugins !== undefined && typeof inheritPlugins !== "boolean")
+        throw new TypeError("inherit_plugins must be a boolean");
+      if (record(projectRoute) || inheritPlugins === false) {
+        config.route =
+          mergeProjectRoute(
+            config.route,
+            projectRoute as DaemonSessionRoute | undefined,
+            projectPath,
+            inheritPlugins !== false,
+          ) ?? config.route;
+        applyConfig(config, { route: config.route });
+        if (config.route.additional_metadata)
+          config.additionalMetadata = config.route.additional_metadata;
+      }
+      if (nonEmptyString(safeProjectConfig.profile) && config.route.auth) {
+        delete config.route.auth.profile_id;
+        config.route.auth.source = "saved_profile";
+      }
+      applyConfig(config, safeProjectConfig);
+    } catch {
+      config.enabled = false;
+    }
+  } else if (existsSync(projectPath)) {
+    config.enabled = false;
+  }
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
   config.showTraceLink = boolean(process.env.BRAINTRUST_SHOW_TRACE_LINK) ?? config.showTraceLink;

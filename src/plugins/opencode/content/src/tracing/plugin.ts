@@ -1,6 +1,11 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import { loadConfig, type PluginConfig } from "../config";
-import { claimManagedTracingInstance } from "../runtime/daemon-client";
+import {
+  claimManagedTracingInstance,
+  mergeConfigObjects,
+  mergeProjectRoute,
+  projectSettingsPath,
+} from "../runtime/daemon-client";
 import { createDaemonTracingHooks } from "./daemon";
 
 export async function readPluginConfig(input: {
@@ -14,16 +19,79 @@ export async function readPluginConfig(input: {
     const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
     const configPaths = [
       path.join(configHome, "opencode", "braintrust.json"),
-      path.join(input.directory, ".opencode", "braintrust.json"),
+      projectSettingsPath(input.directory),
     ];
-    for (const configPath of configPaths) {
+    for (const [index, configPath] of configPaths.entries()) {
       try {
         if (fs.existsSync(configPath)) {
           const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as PluginConfig;
-          pluginConfig = pluginConfig ? { ...pluginConfig, ...parsed } : parsed;
+          if (index === 0) {
+            pluginConfig = parsed;
+          } else {
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+              throw new TypeError("project settings must be an object");
+            const { route: projectRoute, inherit_plugins: inheritPlugins, ...safe } = parsed;
+            if (
+              projectRoute !== undefined &&
+              (!projectRoute || typeof projectRoute !== "object" || Array.isArray(projectRoute))
+            )
+              throw new TypeError("project route must be an object");
+            if (inheritPlugins !== undefined && typeof inheritPlugins !== "boolean")
+              throw new TypeError("inherit_plugins must be a boolean");
+            const userRoute = mergeProjectRoute(
+              pluginConfig?.route,
+              projectRoute,
+              configPath,
+              inheritPlugins !== false,
+            );
+            if (safe.tags) {
+              safe.tags = [
+                ...new Set([...(userRoute?.tags ?? pluginConfig?.tags ?? []), ...safe.tags]),
+              ];
+            }
+            if (safe.additional_metadata) {
+              safe.additional_metadata = mergeConfigObjects(
+                userRoute?.additional_metadata ?? pluginConfig?.additional_metadata ?? {},
+                safe.additional_metadata,
+              );
+            } else if (projectRoute?.additional_metadata) {
+              safe.additional_metadata = userRoute?.additional_metadata;
+            }
+            const auth = userRoute?.auth;
+            const projectAuth =
+              safe.profile || safe.org_name
+                ? {
+                    ...auth,
+                    ...(safe.profile
+                      ? {
+                          source: "saved_profile" as const,
+                          profile_id: undefined,
+                          profile: safe.profile,
+                        }
+                      : {}),
+                    ...(safe.org_name ? { org_name: safe.org_name } : {}),
+                  }
+                : auth;
+            pluginConfig = {
+              ...pluginConfig,
+              ...safe,
+              ...(userRoute
+                ? {
+                    route: {
+                      ...userRoute,
+                      ...(projectAuth ? { auth: projectAuth } : {}),
+                      ...(safe.project
+                        ? { destination: { type: "project_logs", project_name: safe.project } }
+                        : {}),
+                    },
+                  }
+                : {}),
+            };
+          }
         }
       } catch {
-        // Malformed optional config is fail-open; continue to the next layer.
+        // Do not bypass a project opt-out when its settings cannot be read.
+        if (index === 1) pluginConfig = { ...pluginConfig, trace_to_braintrust: false };
       }
     }
   } catch {

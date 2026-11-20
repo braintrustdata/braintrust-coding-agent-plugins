@@ -38,7 +38,7 @@ Install Codex and the
 
 ```bash
 bt login
-bt trace enable codex --project my-coding-agent
+bt trace install codex --project my-coding-agent
 ```
 
 Setup adds the published marketplace, installs the plugin, and saves routing

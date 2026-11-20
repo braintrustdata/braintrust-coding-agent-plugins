@@ -136,7 +136,7 @@ impl<List: serde::de::DeserializeOwned, Entry> Marketplace<List, Entry> {
 
     /// Refresh the marketplace, which must already be the published one.
     /// `display_name` and `agent` phrase the error that tells the user to
-    /// run `bt trace enable <agent>` instead.
+    /// run `bt trace install <agent>` instead.
     pub fn refresh_published(
         &self,
         runner: &mut dyn CommandRunner,
@@ -146,12 +146,12 @@ impl<List: serde::de::DeserializeOwned, Entry> Marketplace<List, Entry> {
         let marketplaces = self.list(runner)?;
         let marketplace = (self.find)(&marketplaces).ok_or_else(|| {
             anyhow::anyhow!(
-                "{display_name} tracing marketplace is not installed; run `bt trace enable {agent}`"
+                "{display_name} tracing marketplace is not installed; run `bt trace install {agent}`"
             )
         })?;
         if !(self.is_published)(marketplace) {
             bail!(
-                "{display_name} tracing marketplace is not the published Braintrust marketplace; run `bt trace enable {agent}`"
+                "{display_name} tracing marketplace is not the published Braintrust marketplace; run `bt trace install {agent}`"
             );
         }
         runner.run(

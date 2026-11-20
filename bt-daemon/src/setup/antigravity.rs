@@ -82,7 +82,7 @@ fn update_at(runner: &mut dyn CommandRunner, config_dir: &Path) -> anyhow::Resul
     let installed = plugins.imports.iter().any(|plugin| plugin.name == PLUGIN);
     if !installed {
         bail!(
-            "Google Antigravity tracing plugin is not installed; run `bt trace enable antigravity`"
+            "Google Antigravity tracing plugin is not installed; run `bt trace install antigravity`"
         );
     }
     runner.run_in_home("agy", &["plugin", "install", PLUGIN_SOURCE], home)

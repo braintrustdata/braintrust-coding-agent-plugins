@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 const PACKAGE: &str = "@braintrust/trace-opencode";
 const PACKAGE_MANIFEST: &str = plugin_source!("opencode/content/package.json");
 const NOT_INSTALLED: &str =
-    "OpenCode tracing plugin is not installed; run `bt trace enable opencode`";
+    "OpenCode tracing plugin is not installed; run `bt trace install opencode`";
 
 /// The plugin entry for the bundled major version, e.g. `…@^1`.
 fn plugin_spec() -> anyhow::Result<String> {

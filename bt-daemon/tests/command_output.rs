@@ -106,6 +106,69 @@ fn standalone_hook_exit_status_distinguishes_capture_failures_from_disabled_trac
 }
 
 #[test]
+fn all_hook_integrations_honor_pause_and_managed_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = temp.path().join("braintrust.json");
+    std::fs::write(&settings, r#"{"trace_to_braintrust":false}"#).unwrap();
+    #[cfg(unix)]
+    let socket = temp.path().join("absent.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-daemon-{}",
+        uuid::Uuid::new_v4()
+    ));
+    for source in [
+        "antigravity",
+        "claude-code",
+        "codex",
+        "cursor",
+        "grok",
+        "muse",
+    ] {
+        for managed in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_bt-daemon"));
+            command
+                .args(["hook", "--source", source, "--no-spawn", "--socket"])
+                .arg(&socket)
+                .env("BRAINTRUST_DAEMON_CONFIG", &settings)
+                .env_remove("BT_TRACE_INVOCATION_SETTINGS")
+                .env_remove("_BT_TRACE_MANAGED_RUN")
+                .env_remove("CURSOR_PLUGIN_ROOT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if managed {
+                command.env("BT_TRACE_INVOCATION_SETTINGS", r#"{"trace_to_braintrust":true,"route":{"destination":{"type":"project_logs","project_name":"test"}}}"#);
+            }
+            let mut child = command.spawn().unwrap();
+            let _ = child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id":"test","hook_event_name":"SessionStart"}"#);
+            let output = child.wait_with_output().unwrap();
+            if managed {
+                assert!(
+                    !output.status.success(),
+                    "{source}: managed run did not attempt capture"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("--no-spawn is set"),
+                    "{source}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{source}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn standalone_hook_honors_deprecated_bt_env_names() {
     let temp = tempfile::tempdir().unwrap();
     let old_config = temp.path().join("old.json");
@@ -198,5 +261,100 @@ fn standalone_run_mirrors_an_explicit_socket_to_the_deprecated_name() {
             vec![explicit.as_str(), explicit.as_str()],
             "stale deprecated socket: {stale:?}"
         );
+    }
+}
+
+#[test]
+fn project_settings_control_hook_capture_from_native_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let user = temp.path().join("user.json");
+    #[cfg(unix)]
+    let socket = temp.path().join("missing.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-daemon-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&user, r#"{"trace_to_braintrust":false}"#).unwrap();
+    for (source, dir, payload) in [
+        (
+            "claude",
+            ".claude",
+            serde_json::json!({"cwd":repo,"session_id":"s","hook_event_name":"Stop"}),
+        ),
+        (
+            "cursor",
+            ".cursor",
+            serde_json::json!({"workspace_roots":[repo],"conversation_id":"s","hook_event_name":"stop"}),
+        ),
+        (
+            "codex",
+            ".codex",
+            serde_json::json!({"cwd":repo,"session_id":"s","hook_event_name":"Stop"}),
+        ),
+        (
+            "muse",
+            ".muse",
+            serde_json::json!({"cwd":repo,"session_id":"s","hook_event_name":"Stop"}),
+        ),
+        (
+            "grok",
+            ".grok",
+            serde_json::json!({"cwd":repo,"session_id":"s","hook_event_name":"Stop"}),
+        ),
+        (
+            "antigravity",
+            ".gemini",
+            serde_json::json!({"workspacePaths":[repo],"session_id":"s","hook_event_name":"Stop"}),
+        ),
+    ] {
+        let _ = dir;
+        let config = repo.join(".braintrust.json");
+        let run = |enabled: bool| {
+            std::fs::write(
+                &config,
+                format!(r#"{{"trace_to_braintrust":{enabled},"project":"test"}}"#),
+            )
+            .unwrap();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_bt-daemon"))
+                .args([
+                    "hook",
+                    "--source",
+                    source,
+                    "--no-spawn",
+                    "--session-id-field",
+                    if source == "cursor" {
+                        "conversation_id"
+                    } else {
+                        "session_id"
+                    },
+                ])
+                .env("BRAINTRUST_DAEMON_CONFIG", &user)
+                .env("BRAINTRUST_DAEMON_SOCKET", &socket)
+                .env("HOME", temp.path())
+                .env_remove("BT_TRACE_INVOCATION_SETTINGS")
+                .env_remove("_BT_TRACE_MANAGED_RUN")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        assert!(run(false).status.success());
+        let enabled = run(true);
+        assert!(
+            !enabled.status.success(),
+            "enabled hook should try to connect to the absent daemon"
+        );
+        assert!(!enabled.stderr.is_empty());
     }
 }

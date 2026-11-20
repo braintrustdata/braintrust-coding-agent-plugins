@@ -125,6 +125,125 @@ describe("BraintrustPlugin", () => {
     expect(hooks.tool).toBeUndefined();
   });
 
+  it("lets project tracing override the user default and managed runs override both", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = directory;
+    mkdirSync(global, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
+    writeFileSync(join(project, ".braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    const { BraintrustPlugin } = await import("./index");
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false }),
+    );
+    const paused = await BraintrustPlugin(createInput(directory));
+    expect(paused.event).toBeUndefined();
+    expect(paused.tool).toBeDefined();
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "managed" } },
+    });
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+  });
+
+  it("does not bypass a project opt-out when its plugin list is invalid", async () => {
+    const global = join(directory, ".config", "opencode");
+    mkdirSync(global, { recursive: true });
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(
+      join(directory, ".braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false, route: { span_plugins: [null] } }),
+    );
+    const { BraintrustPlugin } = await import("./index");
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeUndefined();
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "run" } },
+    });
+    expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
+  });
+
+  it("recursively merges project metadata and appends arrays", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = directory;
+    mkdirSync(global, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(
+      join(global, "braintrust.json"),
+      JSON.stringify({
+        trace_to_braintrust: false,
+        route: {
+          destination: { type: "project_logs", project_name: "global" },
+          additional_metadata: { nested: { a: 1, b: 2 }, list: [1, 2] },
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({
+        trace_to_braintrust: true,
+        route: { additional_metadata: { nested: { b: 3 }, list: [4] } },
+      }),
+    );
+    const { readPluginConfig } = await import("./tracing/plugin");
+    const { loadConfig } = await import("./config");
+    const config = loadConfig(await readPluginConfig({ directory }));
+    expect(config.tracingEnabled).toBe(true);
+    expect(config.route.additional_metadata).toEqual({ nested: { a: 1, b: 3 }, list: [1, 2, 4] });
+  });
+
+  it("inherits the user route while applying explicit project selections", async () => {
+    const global = join(directory, ".config", "opencode");
+    const project = directory;
+    mkdirSync(global, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    mkdirSync(join(directory, ".git"));
+    const nested = join(directory, "src");
+    mkdirSync(nested);
+    writeFileSync(
+      join(global, "braintrust.json"),
+      JSON.stringify({
+        trace_to_braintrust: true,
+        route: {
+          auth: { source: "environment", profile_id: "old", org_name: "org" },
+          destination: { type: "project_logs", project_name: "global" },
+          span_plugins: ["trusted.js"],
+        },
+      }),
+    );
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({
+        project: "local",
+        profile: "new",
+        route: { span_plugins: ["untrusted.js"] },
+      }),
+    );
+    const { readPluginConfig } = await import("./tracing/plugin");
+    const { loadConfig } = await import("./config");
+    const config = loadConfig(await readPluginConfig({ directory: nested }));
+    expect(config.route.destination).toEqual({ type: "project_logs", project_name: "local" });
+    expect(config.route.auth).toMatchObject({
+      source: "saved_profile",
+      profile: "new",
+      org_name: "org",
+    });
+    expect(config.route.auth?.profile_id).toBeUndefined();
+    expect(config.route.span_plugins).toEqual(["trusted.js", join(directory, "untrusted.js")]);
+    writeFileSync(
+      join(project, ".braintrust.json"),
+      JSON.stringify({
+        inherit_plugins: false,
+        route: { span_plugins: ["project.js"] },
+      }),
+    );
+    const replaced = loadConfig(await readPluginConfig({ directory: nested }));
+    expect(replaced.route.span_plugins).toEqual([join(directory, "project.js")]);
+  });
+
   it("provides a trace-only managed entrypoint without data tools", async () => {
     process.env.BT_TRACE_MANAGED_RUN_ID = `trace-only-${Date.now()}`;
     process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({

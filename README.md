@@ -33,15 +33,18 @@ then authenticate and enable tracing. For example:
 
 ```bash
 bt login
-bt trace enable claude --project my-coding-agent
+bt trace install claude --project my-coding-agent
 ```
 
 Replace `claude` with your agent's CLI name below. Restart the agent after
-setup and follow any plugin or hook trust prompts.
+installation and follow any plugin or hook trust prompts. To opt a Git repository
+in or out independently, run `bt trace enable claude --scope project` or
+`bt trace disable claude --scope project` inside it. The repository's `.braintrust.json` applies to every agent; its settings
+override user settings, and `bt trace run` overrides both.
 
 ## Supported agents
 
-All six support `bt trace enable`, `update`, `disable`, and `doctor`.
+All support `bt trace install`, `enable`, `update`, `disable`, and `doctor`.
 
 | Agent and setup guide | CLI name | One-off traced run | Import / live attach | Distribution |
 |---|---|---|---|---|
@@ -77,7 +80,7 @@ bt trace disable claude
 
 `doctor` shows which configuration is in use and whether the running tracing
 daemon can authenticate it. `status` reports trace delivery.
-`update` keeps your settings; `disable` removes the plugin and its settings.
+`disable` pauses tracing and keeps your settings. Use `enable` to resume; it also sets up tracing when needed or when you pass new settings. Use `uninstall` to remove the plugin and its settings.
 
 For command hooks, `bt trace hook` exits nonzero when it cannot capture an
 event. Exit `0` means the daemon accepted the event into its journal; delivery

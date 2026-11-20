@@ -20,11 +20,15 @@ pub struct TraceArgs {
 // clearer than boxing individual command variants for stack-size savings.
 #[allow(clippy::large_enum_variant)]
 pub enum TraceCommand {
-    /// Install or enable the published Braintrust tracing plugin for a coding agent.
-    #[command(name = "enable", alias = "setup")]
-    Setup(EnableArgs),
-    /// Uninstall the Braintrust tracing plugin and remove its saved configuration.
+    /// Install and configure the Braintrust tracing plugin for a coding agent.
+    #[command(visible_alias = "setup")]
+    Install(SetupArgs),
+    /// Enable tracing, setting it up when needed or when settings are supplied.
+    Enable(EnableArgs),
+    /// Disable tracing while preserving the plugin and its configuration.
     Disable(DisableArgs),
+    /// Uninstall the tracing plugin or remove the shared project configuration.
+    Uninstall(DisableArgs),
     /// Update an already installed Braintrust tracing plugin without changing its configuration.
     Update(UpdateArgs),
     /// Run the tracing daemon (foreground).
@@ -91,32 +95,70 @@ impl DoctorAgent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum SettingsScope {
+    #[default]
+    User,
+    Project,
+}
+
 #[derive(Debug, Clone, Args)]
-pub struct EnableArgs {
+pub struct SetupArgs {
+    /// Install with tracing disabled until explicitly enabled.
+    #[arg(long, global = true)]
+    pub disable: bool,
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
     #[command(subcommand)]
     pub agent: SetupAgent,
     /// JSON object persisted in this agent's tracing route and merged into root-span metadata.
-    #[arg(long, global = true, env = "BRAINTRUST_ADDITIONAL_METADATA")]
+    #[arg(long, global = true)]
     pub additional_metadata: Option<String>,
     /// Tag applied to each root span. May be repeated or comma-separated.
-    #[arg(
-        long = "tag",
-        global = true,
-        env = "BRAINTRUST_TAGS",
-        value_delimiter = ','
-    )]
+    #[arg(long = "tag", global = true, value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// Replace inherited span plugins instead of appending to them.
+    #[arg(long, global = true, conflicts_with = "inherit_plugins")]
+    pub no_inherit_plugins: bool,
+    /// Restore inheritance of user-level span plugins.
+    #[arg(long, global = true)]
+    pub inherit_plugins: bool,
     /// JavaScript span transform to persist for this agent. Repeat to compose
     /// transforms in order.
     #[arg(long, global = true, value_name = "PATH")]
     pub plugin: Vec<PathBuf>,
 }
 
-/// Backwards-compatible API name for hosts that mounted the former setup command.
-pub type SetupArgs = EnableArgs;
+#[derive(Debug, Clone, Args)]
+pub struct EnableArgs {
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
+    #[command(subcommand)]
+    pub agent: SetupAgent,
+    /// JSON object merged into root-span metadata.
+    #[arg(long, global = true)]
+    pub additional_metadata: Option<String>,
+    /// Tag applied to each root span. May be repeated or comma-separated.
+    #[arg(long = "tag", global = true, value_delimiter = ',')]
+    pub tags: Vec<String>,
+    /// Replace inherited span plugins instead of appending to them.
+    #[arg(long, global = true, conflicts_with = "inherit_plugins")]
+    pub no_inherit_plugins: bool,
+    /// Restore inheritance of user-level span plugins.
+    #[arg(long, global = true)]
+    pub inherit_plugins: bool,
+    /// JavaScript span transform to persist. May be repeated.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub plugin: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct DisableArgs {
+    /// Where the tracing settings are stored.
+    #[arg(long, global = true, value_enum, default_value_t = SettingsScope::User)]
+    pub scope: SettingsScope,
     #[command(subcommand)]
     pub agent: SetupAgent,
 }
@@ -179,7 +221,7 @@ mod tests {
     fn every_public_trace_ingress_accepts_additional_metadata() {
         let setup = Cli::try_parse_from([
             "bt",
-            "setup",
+            "install",
             "claude",
             "--additional-metadata",
             r#"{"setup":true}"#,
@@ -187,7 +229,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             setup.trace.command,
-            TraceCommand::Setup(SetupArgs {
+            TraceCommand::Install(SetupArgs {
                 agent: SetupAgent::Claude,
                 additional_metadata: Some(ref value),
                 ..
@@ -197,7 +239,7 @@ mod tests {
         let legacy_setup = Cli::try_parse_from(["bt", "setup", "codex"]).unwrap();
         assert!(matches!(
             legacy_setup.trace.command,
-            TraceCommand::Setup(SetupArgs {
+            TraceCommand::Install(SetupArgs {
                 agent: SetupAgent::Codex,
                 ..
             })
@@ -270,7 +312,7 @@ mod tests {
             Cli::try_parse_from(["bt", "setup", "claude", "--tag", "ci", "--tag", "docs"]).unwrap();
         assert!(matches!(
             setup.trace.command,
-            TraceCommand::Setup(SetupArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
+            TraceCommand::Install(SetupArgs { ref tags, .. }) if tags.as_slice() == ["ci", "docs"]
         ));
 
         let run = Cli::try_parse_from(["bt", "run", "codex", "--tag", "ci,docs", "--", "status"])
@@ -313,6 +355,7 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Run(RunArgs {
+                inherit: false,
                 source: crate::RunSource::Cursor,
                 parent: Some(ref parent),
                 ref agent_args,
@@ -351,11 +394,11 @@ mod tests {
 
     #[test]
     fn antigravity_uses_shared_enable_and_disable_commands() {
-        for command in ["enable", "setup"] {
-            let parsed = Cli::try_parse_from(["bt", command, "antigravity"]).unwrap();
+        {
+            let parsed = Cli::try_parse_from(["bt", "setup", "antigravity"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
                     agent: SetupAgent::Antigravity,
                     ..
                 })
@@ -366,20 +409,21 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Disable(DisableArgs {
-                agent: SetupAgent::Antigravity
+                agent: SetupAgent::Antigravity,
+                ..
             })
         ));
 
-        assert!(Cli::try_parse_from(["bt", "setup", "antigravity", "--disable"]).is_err());
+        assert!(Cli::try_parse_from(["bt", "install", "antigravity", "--disable"]).is_ok());
     }
 
     #[test]
     fn grok_uses_shared_enable_and_disable_commands() {
-        for command in ["enable", "setup"] {
-            let parsed = Cli::try_parse_from(["bt", command, "grok"]).unwrap();
+        {
+            let parsed = Cli::try_parse_from(["bt", "setup", "grok"]).unwrap();
             assert!(matches!(
                 parsed.trace.command,
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
                     agent: SetupAgent::Grok,
                     ..
                 })
@@ -390,7 +434,86 @@ mod tests {
         assert!(matches!(
             parsed.trace.command,
             TraceCommand::Disable(DisableArgs {
-                agent: SetupAgent::Grok
+                agent: SetupAgent::Grok,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scoped_commands_accept_project_before_or_after_agent() {
+        for command in ["install", "setup", "enable", "disable", "uninstall"] {
+            for args in [
+                vec!["bt", command, "--scope", "project", "claude"],
+                vec!["bt", command, "claude", "--scope", "project"],
+            ] {
+                let parsed = Cli::try_parse_from(args).unwrap();
+                let scope = match parsed.trace.command {
+                    TraceCommand::Install(args) => args.scope,
+                    TraceCommand::Enable(args) => args.scope,
+                    TraceCommand::Disable(args) | TraceCommand::Uninstall(args) => args.scope,
+                    _ => panic!("wrong command"),
+                };
+                assert_eq!(scope, SettingsScope::Project);
+            }
+        }
+    }
+
+    #[test]
+    fn project_plugin_inheritance_flags_are_exclusive() {
+        assert!(Cli::try_parse_from([
+            "bt",
+            "install",
+            "claude",
+            "--scope",
+            "project",
+            "--no-inherit-plugins"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "bt",
+            "enable",
+            "claude",
+            "--scope",
+            "project",
+            "--inherit-plugins"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "bt",
+            "install",
+            "claude",
+            "--no-inherit-plugins",
+            "--inherit-plugins"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["bt", "run", "codex", "--inherit", "--no-inherit-plugins"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn enable_accepts_explicit_tracing_settings() {
+        let parsed = Cli::try_parse_from(["bt", "enable", "pi"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Enable(EnableArgs {
+                agent: SetupAgent::Pi,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["bt", "enable", "pi", "--tag", "changed"]).is_ok());
+    }
+
+    #[test]
+    fn uninstall_accepts_an_agent() {
+        let parsed = Cli::try_parse_from(["bt", "uninstall", "pi"]).unwrap();
+        assert!(matches!(
+            parsed.trace.command,
+            TraceCommand::Uninstall(DisableArgs {
+                agent: SetupAgent::Pi,
+                ..
             })
         ));
     }
@@ -450,7 +573,7 @@ mod tests {
         ] {
             let parsed = Cli::try_parse_from(args).unwrap();
             let plugins = match parsed.trace.command {
-                TraceCommand::Setup(args) => args.plugin,
+                TraceCommand::Install(args) => args.plugin,
                 TraceCommand::Run(args) => args.plugin,
                 TraceCommand::Import(args) => args.plugin,
                 _ => unreachable!(),

@@ -141,7 +141,7 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
                 .any(|plugin| plugin.id == PLUGIN && plugin.installed && plugin.enabled);
             anyhow::ensure!(
                 installed,
-                "Codex tracing plugin is not installed and enabled; rerun `bt trace enable codex`"
+                "Codex tracing plugin is not installed and enabled; rerun `bt trace install codex`"
             );
             let hooks: HooksList = request(
                 &mut stdin,
