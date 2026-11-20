@@ -181,7 +181,7 @@ fn update_muse_at(config_dir: &Path) -> anyhow::Result<()> {
     if !settings.hook_overlay()?.contains_braintrust_hook()
         && owned_managed_path(config_dir, &settings)?.is_none()
     {
-        bail!("Muse tracing hooks are not installed; run `bt trace enable muse`");
+        bail!("Muse tracing hooks are not installed; run `bt trace install muse`");
     }
     setup_muse_at(config_dir)
 }
@@ -230,7 +230,7 @@ pub(crate) fn muse_doctor_warnings(config_dir: &Path) -> Vec<String> {
             upgraded.remove_owned();
             upgraded.append_owned(MUSE_HOOK_COMMAND);
             if current != upgraded {
-                warnings.push("Muse Braintrust hooks are missing or outdated; run `bt trace update muse` or `bt trace enable muse`".into());
+                warnings.push("Muse Braintrust hooks are missing or outdated; run `bt trace update muse` or `bt trace install muse`".into());
             }
         }
     }

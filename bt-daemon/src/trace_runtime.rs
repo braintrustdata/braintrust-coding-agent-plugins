@@ -6,7 +6,7 @@
 //! the coding-agent integrations.
 
 use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
-use crate::trace_command::{DoctorAgent, DoctorArgs, SetupAgent, TraceCommand};
+use crate::trace_command::{DoctorAgent, DoctorArgs, SettingsScope, SetupAgent, TraceCommand};
 use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
@@ -501,16 +501,63 @@ fn daemon_warnings(
 
 async fn doctor_output(host: &TraceHostContext, args: DoctorArgs) -> DoctorCommandOutput {
     let source = args.agent.identity().id;
-    let settings = crate::settings::AgentSettings::load(source);
+    let resolved = std::env::current_dir().and_then(|cwd| {
+        crate::settings::AgentSettings::load_for_directory(source, &cwd)
+            .map_err(std::io::Error::other)
+    });
+    let (settings, project_path, error) = match resolved {
+        Ok((settings, path)) => (settings, path, None),
+        Err(error) => (
+            crate::settings::AgentSettings::default(),
+            None,
+            Some(error.to_string()),
+        ),
+    };
     let socket = paths::socket_path(None);
-    doctor_output_at(
+    let mut output = doctor_output_at(
         host,
         args,
         &socket,
         paths::agent_settings_path(source, None),
         settings,
     )
-    .await
+    .await;
+    if let Some(path) = project_path {
+        fn collect_fields(prefix: &str, value: &serde_json::Value, fields: &mut Vec<String>) {
+            if let Some(object) = value.as_object().filter(|object| !object.is_empty()) {
+                for (key, child) in object {
+                    let name = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_fields(&name, child, fields);
+                }
+            } else {
+                fields.push(prefix.to_owned());
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str(&raw) {
+                collect_fields("", &value, &mut output.project_settings_fields);
+            }
+        }
+        output.project_settings_path = Some(path);
+        if output.route_source == "settings_file" {
+            output.route_source = if output.settings_present {
+                "user_and_project_settings"
+            } else {
+                "project_settings"
+            }
+            .into();
+        }
+    }
+    if let Some(error) = error {
+        output
+            .warnings
+            .push(format!("effective settings could not be read: {error}"));
+    }
+    output
 }
 
 async fn doctor_output_at(
@@ -527,7 +574,7 @@ async fn doctor_output_at(
 
     if !settings_present {
         warnings.push(format!(
-            "settings file is missing; run `bt trace enable {source}`"
+            "settings file is missing; run `bt trace install {source}`"
         ));
     } else if !enabled {
         warnings.push(format!(
@@ -638,6 +685,8 @@ async fn doctor_output_at(
         display_name: args.agent.identity().display_name.into(),
         settings_path,
         settings_present,
+        project_settings_path: None,
+        project_settings_fields: Vec::new(),
         enabled,
         route_source,
         route,
@@ -648,33 +697,180 @@ async fn doctor_output_at(
     }
 }
 
+async fn run_install_command(
+    mut args: crate::SetupArgs,
+    host: &TraceHostContext,
+    configuration: Option<&'static str>,
+    explicit: &HostRouteSelection,
+) -> anyhow::Result<()> {
+    if args.scope == SettingsScope::Project {
+        return print_output(
+            crate::setup::run_project_setup(args, explicit.clone(), configuration.is_some())?,
+            host.output_format,
+        );
+    }
+    if args.additional_metadata.is_none() {
+        args.additional_metadata = crate::env::var("BRAINTRUST_ADDITIONAL_METADATA");
+    }
+    if args.tags.is_empty() {
+        args.tags = crate::env::var("BRAINTRUST_TAGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    let mut route = resolve_command_route(
+        host,
+        RouteRequirements {
+            destination_required: true,
+            interactive_auth: true,
+            persistent_auth: true,
+        },
+    )
+    .await?;
+    apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
+    apply_tags(&mut route, &args.tags)?;
+    if !args.plugin.is_empty() {
+        route.span_plugins = resolve_span_plugin_paths(&args.plugin)?;
+    }
+    let codex = matches!(args.agent, SetupAgent::Codex);
+    let mut output = crate::run_setup(args, route)?;
+    if let Some(configuration) = configuration {
+        if let TraceCommandOutput::Install(mut setup) = output {
+            setup.configuration = Some(configuration);
+            output = TraceCommandOutput::Enable(setup);
+        }
+    }
+    if codex {
+        crate::codex_hooks::activate().await?;
+    }
+    print_output(output, host.output_format)
+}
+
+fn enable_needs_setup(configured: bool, args: &crate::EnableArgs, explicit_route: bool) -> bool {
+    !configured
+        || explicit_route
+        || args.additional_metadata.is_some()
+        || !args.tags.is_empty()
+        || !args.plugin.is_empty()
+        || args.no_inherit_plugins
+        || args.inherit_plugins
+}
+
 /// Execute the complete mounted trace command.
 pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Result<()> {
+    run_trace_with_matches(args, host, None).await
+}
+
+/// Run mounted commands with the host's parsed arguments and their value sources.
+pub async fn run_trace_with_matches(
+    args: TraceArgs,
+    host: TraceHostContext,
+    matches: Option<&clap::ArgMatches>,
+) -> anyhow::Result<()> {
+    fn explicit(matches: &clap::ArgMatches, id: &str) -> Option<String> {
+        if matches.try_contains_id(id).is_ok()
+            && matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            return matches.try_get_one::<String>(id).ok().flatten().cloned();
+        }
+        matches
+            .subcommand()
+            .and_then(|(_, child)| explicit(child, id))
+    }
+    let selection = HostRouteSelection {
+        auth: AuthSelection {
+            profile: matches.and_then(|m| explicit(m, "profile")),
+            org_name: matches.and_then(|m| explicit(m, "org_name")),
+            ..AuthSelection::default()
+        },
+        project_name: matches.and_then(|m| explicit(m, "project")),
+    };
+    let has_explicit = selection.auth.profile.is_some()
+        || selection.auth.org_name.is_some()
+        || selection.project_name.is_some();
     match args.command {
-        TraceCommand::Setup(enable_args) => {
-            let mut route = resolve_command_route(
-                &host,
-                RouteRequirements {
-                    destination_required: true,
-                    interactive_auth: true,
-                    persistent_auth: true,
-                },
-            )
-            .await?;
-            apply_additional_metadata(&mut route, enable_args.additional_metadata.as_deref())?;
-            apply_tags(&mut route, &enable_args.tags)?;
-            if !enable_args.plugin.is_empty() {
-                route.span_plugins = resolve_span_plugin_paths(&enable_args.plugin)?;
+        TraceCommand::Install(args) => run_install_command(args, &host, None, &selection).await,
+        TraceCommand::Enable(args) => {
+            if args.scope == SettingsScope::Project {
+                if args.additional_metadata.is_some()
+                    || !args.tags.is_empty()
+                    || !args.plugin.is_empty()
+                    || args.no_inherit_plugins
+                    || args.inherit_plugins
+                    || has_explicit
+                {
+                    let setup = crate::SetupArgs {
+                        no_inherit_plugins: args.no_inherit_plugins,
+                        inherit_plugins: args.inherit_plugins,
+                        disable: false,
+                        scope: args.scope,
+                        agent: args.agent,
+                        additional_metadata: args.additional_metadata,
+                        tags: args.tags,
+                        plugin: args.plugin,
+                    };
+                    return run_install_command(setup, &host, Some("updated"), &selection).await;
+                }
+                return print_output(
+                    crate::setup::run_scoped_toggle(args.agent, args.scope, true)?,
+                    host.output_format,
+                );
             }
-            let codex = matches!(enable_args.agent, SetupAgent::Codex);
-            let output = run_enable(enable_args, route)?;
-            if codex {
-                crate::codex_hooks::activate().await?;
+            let configured = crate::setup::has_saved_setup(args.agent)?;
+            if !enable_needs_setup(configured, &args, has_explicit) {
+                print_output(run_enable(args.agent)?, host.output_format)
+            } else {
+                let setup = crate::SetupArgs {
+                    no_inherit_plugins: args.no_inherit_plugins,
+                    inherit_plugins: args.inherit_plugins,
+                    disable: false,
+                    scope: args.scope,
+                    agent: args.agent,
+                    additional_metadata: args
+                        .additional_metadata
+                        .or_else(|| crate::env::var("BRAINTRUST_ADDITIONAL_METADATA")),
+                    tags: if args.tags.is_empty() {
+                        crate::env::var("BRAINTRUST_TAGS")
+                            .unwrap_or_default()
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    } else {
+                        args.tags
+                    },
+                    plugin: args.plugin,
+                };
+                run_install_command(
+                    setup,
+                    &host,
+                    Some(if configured { "updated" } else { "created" }),
+                    &selection,
+                )
+                .await
             }
-            print_output(output, host.output_format)
         }
         TraceCommand::Disable(disable_args) => {
-            print_output(run_disable(disable_args.agent)?, host.output_format)
+            if disable_args.scope == SettingsScope::Project {
+                print_output(
+                    crate::setup::run_scoped_toggle(disable_args.agent, disable_args.scope, false)?,
+                    host.output_format,
+                )
+            } else {
+                print_output(run_disable(disable_args.agent)?, host.output_format)
+            }
+        }
+        TraceCommand::Uninstall(args) => {
+            if args.scope == SettingsScope::Project {
+                print_output(
+                    crate::setup::run_project_uninstall(args.agent)?,
+                    host.output_format,
+                )
+            } else {
+                print_output(crate::run_uninstall(args.agent)?, host.output_format)
+            }
         }
         TraceCommand::Update(update_args) => {
             let codex = matches!(update_args.agent, SetupAgent::Codex);
@@ -707,8 +903,12 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
                     )
                     .await;
                 }
-                let settings = crate::settings::AgentSettings::load_for_hook(&hook_args.source)?;
-                run_hook_command(hook_args, &host, settings).await
+                let payload = crate::hook::read_project_hook_payload(&hook_args)?;
+                let settings = crate::settings::AgentSettings::load_for_hook_payload(
+                    &hook_args.source,
+                    payload.as_ref(),
+                )?;
+                run_hook_command_with_payload(hook_args, &host, settings, payload).await
             }
             .await;
             if let Some(response) = response {
@@ -762,17 +962,88 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
         }
         TraceCommand::Run(run_args) => {
             run_args.validate_parent()?;
-            let mut route = resolve_command_route(
-                &host,
-                RouteRequirements {
-                    destination_required: run_args.parent.is_none(),
-                    interactive_auth: true,
-                    persistent_auth: false,
-                },
-            )
-            .await?;
+            let requirements = RouteRequirements {
+                destination_required: run_args.parent.is_none(),
+                interactive_auth: true,
+                persistent_auth: false,
+            };
+            let inherited = if run_args.inherit {
+                crate::settings::AgentSettings::load_for_directory(
+                    run_args.source.identity().id,
+                    &std::env::current_dir()?,
+                )?
+                .0
+                .route
+            } else {
+                None
+            };
+            let mut route = if let Some(mut route) = inherited {
+                if let Some(profile) = &selection.auth.profile {
+                    route.auth.source = crate::wire::AuthSource::SavedProfile;
+                    route.auth.profile_id = None;
+                    route.auth.profile = Some(profile.clone());
+                }
+                if let Some(org) = &selection.auth.org_name {
+                    route.auth.org_name = Some(org.clone());
+                }
+                if let Some(project) = &selection.project_name {
+                    route.destination = Some(crate::wire::TraceDestination::ProjectLogs {
+                        project_id: None,
+                        project_name: Some(project.clone()),
+                    });
+                }
+                let needs_auth = route.auth.source == crate::wire::AuthSource::Auto
+                    && route.auth.profile.is_none()
+                    && route.auth.profile_id.is_none();
+                let needs_destination = route.destination.is_none() && run_args.parent.is_none();
+                if needs_auth || needs_destination {
+                    let defaults = resolve_host_route(
+                        &host,
+                        RouteRequirements {
+                            destination_required: needs_destination,
+                            ..requirements
+                        },
+                    )
+                    .await?;
+                    if needs_auth {
+                        let selected_org = route.auth.org_name.take();
+                        route.auth = defaults.auth;
+                        if selected_org.is_some() {
+                            route.auth.org_name = selected_org;
+                        }
+                    }
+                    if needs_destination {
+                        route.destination = defaults.destination;
+                    }
+                }
+                let lease = host
+                    .services
+                    .resolve_auth(&route.auth, AuthResolveReason::Initial)
+                    .await?;
+                let org = require_resolved_org(&route, &lease)?;
+                route.auth = lease.selection;
+                route.auth.org_name = Some(org);
+                route
+            } else {
+                resolve_command_route(&host, requirements).await?
+            };
+            let inherited_metadata = if run_args.inherit {
+                route.additional_metadata.take()
+            } else {
+                None
+            };
             apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
+            if let Some(mut metadata) = inherited_metadata {
+                if let Some(overlay) = route.additional_metadata.take() {
+                    crate::settings::merge_json(&mut metadata, overlay);
+                }
+                route.additional_metadata = Some(metadata);
+            }
+            let inherited_tags = run_args.inherit.then(|| route.tags.clone());
             apply_tags(&mut route, &run_args.tags)?;
+            if let Some(tags) = inherited_tags {
+                route.tags.extend(tags);
+            }
             let hook_command = child_command(&host.command, "hook");
             let status =
                 run_traced_with_host(run_args, hook_command, route, host_info(&host)).await?;
@@ -785,20 +1056,36 @@ pub async fn run_trace(args: TraceArgs, host: TraceHostContext) -> anyhow::Resul
     }
 }
 
+#[cfg(test)]
 async fn run_hook_command(
     hook_args: crate::HookArgs,
     host: &TraceHostContext,
     settings: crate::settings::AgentSettings,
+) -> anyhow::Result<()> {
+    run_hook_command_with_payload(hook_args, host, settings, None).await
+}
+
+async fn run_hook_command_with_payload(
+    hook_args: crate::HookArgs,
+    host: &TraceHostContext,
+    settings: crate::settings::AgentSettings,
+    payload: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     if !settings.tracing_enabled() {
         return Ok(());
     }
     crate::hook::with_hook_capture_timeout(hook_args.capture_timeout_ms, async {
         let route = match settings.route {
+            Some(mut route) if route.destination.is_none() => {
+                route.destination = resolve_host_route(host, RouteRequirements::default())
+                    .await?
+                    .destination;
+                route
+            }
             Some(route) => route,
             None => resolve_host_route(host, RouteRequirements::default()).await?,
         };
-        crate::hook::run_hook_with_route(hook_args, route, host_info(host)).await
+        crate::hook::run_hook_with_payload(hook_args, route, host_info(host), payload).await
     })
     .await
 }
@@ -811,6 +1098,144 @@ mod tests {
     use crate::{ImportArgs, ImportSource, RunArgs, RunSource, StatusArgs, TraceCommand};
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn enable_uses_setup_only_when_missing_or_explicitly_changed() {
+        let mut args = crate::EnableArgs {
+            no_inherit_plugins: false,
+            inherit_plugins: false,
+            scope: SettingsScope::User,
+            agent: SetupAgent::Pi,
+            additional_metadata: None,
+            tags: vec![],
+            plugin: vec![],
+        };
+        assert!(enable_needs_setup(false, &args, false));
+        assert!(!enable_needs_setup(true, &args, false));
+        assert!(enable_needs_setup(true, &args, true));
+        args.tags.push("tag".into());
+        assert!(enable_needs_setup(true, &args, false));
+        args.tags.clear();
+        args.additional_metadata = Some("{}".into());
+        assert!(enable_needs_setup(true, &args, false));
+        args.additional_metadata = None;
+        args.plugin.push("plugin.js".into());
+        assert!(enable_needs_setup(true, &args, false));
+    }
+
+    #[tokio::test]
+    async fn plain_enable_resumes_without_host_resolution_or_route_changes() {
+        const CHILD_ENV: &str = "BRAINTRUST_TEST_RESUME_EXISTING";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let args = crate::EnableArgs {
+                no_inherit_plugins: false,
+                inherit_plugins: false,
+                scope: SettingsScope::User,
+                agent: SetupAgent::Pi,
+                additional_metadata: None,
+                tags: vec![],
+                plugin: vec![],
+            };
+            run_trace(
+                TraceArgs {
+                    command: TraceCommand::Enable(args),
+                },
+                test_host(Arc::new(PanicHost)),
+            )
+            .await
+            .unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        let original = serde_json::json!({"trace_to_braintrust": false, "route": {"destination": {"type": "project_logs", "project_name": "saved"}, "auth": {"profile": "saved"}}, "other": "kept"});
+        std::fs::write(&path, original.to_string()).unwrap();
+        let output = crate::subprocess::interactive_command(std::env::current_exe().unwrap())
+            .args(["--exact", "trace_runtime::tests::plain_enable_resumes_without_host_resolution_or_route_changes", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env(crate::paths::SETTINGS_ENV, &path)
+            .env("BRAINTRUST_TAGS", "environment-default")
+            .env("BRAINTRUST_ADDITIONAL_METADATA", "{\"environment\":true}")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let updated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(updated["route"], original["route"]);
+        assert_eq!(updated["other"], original["other"]);
+        assert_eq!(updated["trace_to_braintrust"], true);
+        assert!(String::from_utf8_lossy(&output.stdout).contains(r#""command":"enable""#));
+    }
+
+    #[tokio::test]
+    async fn enable_sets_up_when_missing_or_options_are_explicit() {
+        const CHILD_ENV: &str = "BRAINTRUST_TEST_ENABLE_SETUP";
+        if let Ok(mode) = std::env::var(CHILD_ENV) {
+            let services = Arc::new(RecordingHost::new(None, None));
+            let args = crate::EnableArgs {
+                no_inherit_plugins: false,
+                inherit_plugins: false,
+                scope: SettingsScope::User,
+                agent: SetupAgent::OpenCode,
+                additional_metadata: None,
+                tags: if mode == "updated" {
+                    vec!["explicit".into()]
+                } else {
+                    vec![]
+                },
+                plugin: vec![],
+            };
+            run_trace(
+                TraceArgs {
+                    command: TraceCommand::Enable(args),
+                },
+                test_host(services.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(services.route_requests.lock().unwrap().len(), 1);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("braintrust.json");
+        for mode in ["created", "updated"] {
+            let output = crate::subprocess::interactive_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trace_runtime::tests::enable_sets_up_when_missing_or_options_are_explicit",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, mode)
+                .env(crate::paths::SETTINGS_ENV, &path)
+                .env("HOME", temp.path())
+                .env("XDG_CONFIG_HOME", temp.path())
+                .env_remove("BRAINTRUST_TAGS")
+                .env_remove("BRAINTRUST_ADDITIONAL_METADATA")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.contains(&format!(r#""configuration":"{mode}""#)),
+                "{output}"
+            );
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            saved["route"]["destination"]["project_name"],
+            "test-project"
+        );
+        assert_eq!(saved["route"]["tags"], serde_json::json!(["explicit"]));
+    }
 
     #[test]
     fn mounted_child_commands_preserve_the_host_prefix() {
@@ -994,6 +1419,8 @@ mod tests {
     #[tokio::test]
     async fn setup_and_run_request_a_destination_only_when_needed() {
         let run = RunArgs {
+            no_inherit_plugins: false,
+            inherit: false,
             source: RunSource::Codex,
             parent: None,
             additional_metadata: None,
@@ -1010,7 +1437,11 @@ mod tests {
         .unwrap();
         for (command, persistent_auth, destination_required) in [
             (
-                TraceCommand::Setup(SetupArgs {
+                TraceCommand::Install(SetupArgs {
+                    no_inherit_plugins: false,
+                    inherit_plugins: false,
+                    disable: false,
+                    scope: SettingsScope::User,
                     agent: SetupAgent::OpenCode,
                     additional_metadata: None,
                     tags: Default::default(),
@@ -1052,6 +1483,8 @@ mod tests {
         )
         .unwrap();
         let args = RunArgs {
+            no_inherit_plugins: false,
+            inherit: false,
             source: RunSource::Claude,
             parent: Some(parent),
             additional_metadata: None,
@@ -1243,7 +1676,19 @@ mod tests {
             if user_hook {
                 child.env(crate::setup::cursor::USER_HOOK_ENV, "1");
             }
-            let output = child.output().unwrap();
+            use std::io::Write;
+            child
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut process = child.spawn().unwrap();
+            process
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"workspace_roots":[]}"#)
+                .unwrap();
+            let output = process.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "user_hook={user_hook}: {}\n{}",
@@ -1331,7 +1776,7 @@ mod tests {
             _: AuthResolveReason,
         ) -> anyhow::Result<AuthLease> {
             anyhow::bail!(
-                "saved profile ID 'daemon-only' no longer exists; run `bt trace enable` to select a profile"
+                "saved profile ID 'daemon-only' no longer exists; run `bt trace install` to select a profile"
             )
         }
     }

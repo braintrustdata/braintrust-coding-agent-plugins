@@ -54,11 +54,27 @@ impl From<Option<StatusResult>> for StatusCommandOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SetupCommandOutput {
+pub struct InstallCommandOutput {
     pub source: String,
     pub display_name: String,
     pub settings_path: PathBuf,
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<&'static str>,
+    pub scope: &'static str,
+    #[serde(skip_serializing_if = "is_false")]
+    pub applies_to_all_agents: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Backwards-compatible name for the shared install and enable output.
+pub type SetupCommandOutput = InstallCommandOutput;
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +169,10 @@ pub struct DoctorCommandOutput {
     pub display_name: String,
     pub settings_path: PathBuf,
     pub settings_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_settings_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_settings_fields: Vec<String>,
     pub enabled: bool,
     pub route_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,11 +188,16 @@ pub struct DoctorCommandOutput {
 pub enum TraceCommandOutput {
     Status(StatusCommandOutput),
     Doctor(Box<DoctorCommandOutput>),
-    Enable(SetupCommandOutput),
-    Disable(SetupCommandOutput),
+    Install(InstallCommandOutput),
+    Enable(InstallCommandOutput),
+    Disable(InstallCommandOutput),
+    Uninstall(InstallCommandOutput),
     Update(UpdateCommandOutput),
     Stop(StopCommandOutput),
-    Import { summaries: Vec<ImportSummary> },
+    Import {
+        /// Summaries for the imported sessions.
+        summaries: Vec<ImportSummary>,
+    },
 }
 
 impl TraceCommandOutput {
@@ -184,18 +209,100 @@ impl TraceCommandOutput {
         Self::Doctor(Box::new(output))
     }
 
-    pub fn setup(
+    pub fn install(
         source: impl Into<String>,
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
         let source = source.into();
-        Self::Enable(SetupCommandOutput {
+        Self::Install(InstallCommandOutput {
             source,
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: None,
+            scope: "user",
+            applies_to_all_agents: false,
+            enabled: None,
+            warnings: Vec::new(),
         })
+    }
+
+    /// Compatibility alias for creating install output.
+    pub fn setup(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::install(source, display_name, settings_path)
+    }
+
+    pub fn enable(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Enable(InstallCommandOutput {
+            source: source.into(),
+            display_name: display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+            configuration: Some("reused"),
+            scope: "user",
+            applies_to_all_agents: false,
+            enabled: None,
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn project_install(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut output = Self::install(source, display_name, settings_path).with_scope("project");
+        if let Self::Install(setup) = &mut output {
+            setup.warnings.push("Settings not specified here must be supplied by each user's configuration. Each user needs a user-level installation and usable Braintrust credentials for their sessions to be captured.".into());
+            setup.warnings.push(
+                "This shared project configuration applies to all coding agents in the repository."
+                    .into(),
+            );
+        }
+        output
+    }
+
+    pub(crate) fn with_scope(mut self, scope: &'static str) -> Self {
+        match &mut self {
+            Self::Install(output)
+            | Self::Enable(output)
+            | Self::Disable(output)
+            | Self::Uninstall(output) => {
+                output.scope = scope;
+                output.applies_to_all_agents = scope == "project";
+            }
+            _ => {}
+        }
+        self
+    }
+
+    pub(crate) fn with_enabled(mut self, enabled: bool) -> Self {
+        if let Self::Install(output) = &mut self {
+            output.enabled = Some(enabled);
+        }
+        self
+    }
+
+    pub(crate) fn into_enable(mut self, configuration: &'static str) -> Self {
+        match &mut self {
+            Self::Install(output) | Self::Enable(output) => {
+                output.configuration = Some(configuration)
+            }
+            _ => return self,
+        }
+        match self {
+            Self::Install(output) => Self::Enable(output),
+            _ => self,
+        }
     }
 
     pub fn stop(running: bool, stopped: bool) -> Self {
@@ -211,11 +318,34 @@ impl TraceCommandOutput {
         display_name: impl Into<String>,
         settings_path: impl Into<PathBuf>,
     ) -> Self {
-        Self::Disable(SetupCommandOutput {
+        Self::Disable(InstallCommandOutput {
             source: source.into(),
             display_name: display_name.into(),
             settings_path: settings_path.into(),
             restart_required: true,
+            configuration: None,
+            scope: "user",
+            applies_to_all_agents: false,
+            enabled: None,
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn uninstall(
+        source: impl Into<String>,
+        display_name: impl Into<String>,
+        settings_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::Uninstall(InstallCommandOutput {
+            source: source.into(),
+            display_name: display_name.into(),
+            settings_path: settings_path.into(),
+            restart_required: true,
+            configuration: None,
+            scope: "user",
+            applies_to_all_agents: false,
+            enabled: None,
+            warnings: Vec::new(),
         })
     }
 
@@ -259,6 +389,12 @@ impl TraceCommandOutput {
                     doctor.route_source,
                     route,
                 );
+                if let Some(path) = &doctor.project_settings_path {
+                    rendered.push_str(&format!("\nProject settings: {}", path.display()));
+                    if !doctor.project_settings_fields.is_empty() {
+                        rendered.push_str(&format!("\nProject overrides: {}", doctor.project_settings_fields.join(", ")));
+                    }
+                }
                 push_auth_lines(&mut rendered, "", &doctor.auth);
                 let daemon = &doctor.daemon;
                 let status = match daemon.status {
@@ -301,15 +437,42 @@ impl TraceCommandOutput {
                 }
                 Ok(rendered)
             }
-            Self::Enable(setup) => Ok(format!(
-                "The Braintrust tracing plugin is installed for {} and configured in {}.\nRestart the coding agent to load the tracing plugin.",
+            Self::Enable(enable) if enable.scope == "project" => Ok(format!(
+                "Braintrust tracing is enabled for all coding agents in this repository. Project configuration {} at {}.",
+                enable.configuration.unwrap_or("reused"), enable.settings_path.display()
+            )),
+            Self::Disable(disable) if disable.scope == "project" => Ok(format!(
+                "Braintrust tracing is disabled for all coding agents in this repository at {}.", disable.settings_path.display()
+            )),
+            Self::Enable(setup) if setup.configuration.is_some_and(|value| value != "reused") => Ok(format!(
+                "Braintrust tracing configuration {} for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
+                setup.configuration.unwrap_or_default(), setup.display_name, setup.scope, setup.settings_path.display()
+            )),
+            Self::Install(setup) if setup.scope == "project" => Ok(format!(
+                "Project tracing settings for {} were written to {}.\nTracing is {}.\n{}", setup.display_name, setup.settings_path.display(), if setup.enabled == Some(false) { "disabled" } else { "enabled" }, setup.warnings.join("\n")
+            )),
+            Self::Install(setup) => Ok(format!(
+                "The Braintrust tracing plugin is installed for {} and configured in {}.{}\nRestart the coding agent to load the tracing plugin.",
                 setup.display_name,
-                setup.settings_path.display()
+                setup.settings_path.display(),
+                if setup.enabled == Some(false) { " Tracing is disabled by default." } else { "" },
+            )),
+            Self::Enable(enable) => Ok(format!(
+                "Braintrust tracing is enabled for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
+                enable.display_name, enable.scope, enable.settings_path.display()
             )),
             Self::Disable(disable) => Ok(format!(
-                "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
+                "Braintrust tracing is disabled for {} at {} scope in {}.\nRestart the coding agent to apply the change.",
                 disable.display_name,
+                disable.scope,
                 disable.settings_path.display()
+            )),
+            Self::Uninstall(uninstall) if uninstall.scope == "project" => Ok(format!(
+                "The shared repository tracing configuration was removed from {}. User-level settings now apply to all agents in this repository.", uninstall.settings_path.display()
+            )),
+            Self::Uninstall(uninstall) => Ok(format!(
+                "The Braintrust tracing plugin and configuration were removed for {} from {}.\nRestart the coding agent to apply the change.",
+                uninstall.display_name, uninstall.settings_path.display()
             )),
             Self::Update(update) => Ok(format!(
                 "The Braintrust tracing plugin was updated for {}.\nRestart the coding agent to load the update.",
@@ -411,18 +574,31 @@ mod tests {
     }
 
     #[test]
-    fn enable_json_contains_stable_selection_fields_without_prose() {
-        let output = TraceCommandOutput::setup(
+    fn install_json_contains_stable_selection_fields_without_prose() {
+        let output = TraceCommandOutput::install(
             "opencode",
             "OpenCode",
             PathBuf::from("/tmp/opencode/braintrust.json"),
         );
         let rendered = output.render(OutputFormat::Json).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["command"], "enable");
+        assert_eq!(value["command"], "install");
         assert_eq!(value["source"], "opencode");
         assert_eq!(value["restart_required"], true);
         assert!(!rendered.contains("installed for"));
+    }
+
+    #[test]
+    fn resume_output_reports_enable() {
+        let output = TraceCommandOutput::enable("pi", "Pi", PathBuf::from("braintrust.json"));
+        let json: serde_json::Value =
+            serde_json::from_str(&output.render(OutputFormat::Json).unwrap()).unwrap();
+        assert_eq!(json["command"], "enable");
+        assert_eq!(json["configuration"], "reused");
+        assert!(output
+            .render(OutputFormat::Human)
+            .unwrap()
+            .contains("tracing is enabled"));
     }
 
     #[test]
@@ -438,13 +614,13 @@ mod tests {
         assert!(output
             .render(OutputFormat::Human)
             .unwrap()
-            .contains("removed for Google Antigravity"));
+            .contains("disabled for Google Antigravity"));
     }
 
     #[test]
     fn codex_setup_and_updates_do_not_request_manual_trust() {
         for output in [
-            TraceCommandOutput::setup("codex", "Codex", PathBuf::from("braintrust.json")),
+            TraceCommandOutput::install("codex", "Codex", PathBuf::from("braintrust.json")),
             TraceCommandOutput::update("codex", "Codex"),
         ] {
             let human = output.render(OutputFormat::Human).unwrap();
@@ -541,6 +717,8 @@ mod tests {
             display_name: "Codex".into(),
             settings_path: PathBuf::from("/tmp/braintrust.json"),
             settings_present: true,
+            project_settings_path: None,
+            project_settings_fields: Vec::new(),
             enabled: true,
             route_source: "settings_file".into(),
             route: Some(SessionRoute::default()),

@@ -25,6 +25,44 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Locate a repository root from the invocation directory.
+pub(crate) fn repository_root(start: &Path) -> anyhow::Result<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project scope requires a Git repository (starting at {})",
+                start.display()
+            )
+        })
+}
+
+/// Whether a source can load shared repository tracing settings.
+pub(crate) fn supports_project_settings(source: &str) -> bool {
+    matches!(
+        source,
+        "claude"
+            | "claude-code"
+            | "cursor"
+            | "opencode"
+            | "pi"
+            | "codex"
+            | "muse"
+            | "muse-code"
+            | "grok"
+            | "antigravity"
+    )
+}
+
+pub(crate) fn project_settings_path(source: &str, start: &Path) -> anyhow::Result<PathBuf> {
+    if !supports_project_settings(source) {
+        anyhow::bail!("project scope is not supported for {source}");
+    }
+    Ok(repository_root(start)?.join(".braintrust.json"))
+}
+
 /// Resolve the socket path: explicit `override` → `$BRAINTRUST_DAEMON_SOCKET` →
 /// `$XDG_RUNTIME_DIR/braintrust/daemon.sock` → `~/.braintrust/run/daemon.sock`.
 pub fn socket_path(explicit: Option<&Path>) -> PathBuf {

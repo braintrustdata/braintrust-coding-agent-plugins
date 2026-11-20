@@ -33,7 +33,7 @@ Authenticate and install the published tracing plugin:
 
 ```bash
 bt login
-bt trace enable claude --project my-coding-agent
+bt trace install claude --project my-coding-agent
 ```
 
 Setup adds the marketplace and installs or enables `trace-claude-code`.
@@ -41,7 +41,7 @@ The plugin forwards lifecycle events locally; `bt` owns authentication,
 trace construction, and delivery.
 
 Use `--profile` or `--org` when needed. Setup stores only non-secret routing
-settings under `~/.claude/braintrust.json`. Restart Claude Code after setup.
+settings under `~/.claude/braintrust.json`. Restart Claude Code after installation.
 
 Every registered lifecycle event is forwarded synchronously to
 `bt trace hook --source claude-code`, preserving per-session ordering. Hook
@@ -66,7 +66,7 @@ Braintrust. Redaction cannot remove data that has already been delivered.
 
 ## Additional root metadata
 
-For a persistent route, pass a JSON object to `bt trace enable claude
+For a persistent route, pass a JSON object to `bt trace install claude
 --additional-metadata '<JSON>'` to tag the root span of every Claude Code
 session. Standard session metadata takes precedence if keys conflict.
 
@@ -82,7 +82,7 @@ route. Tags can be persisted with setup, supplied to one invocation, or added
 while importing a transcript:
 
 ```bash
-bt trace enable claude --tag ci --tag release-validation
+bt trace install claude --tag ci --tag release-validation
 bt trace run claude --tag ci -- "review this change"
 bt trace import claude session-id --tag historical-import
 ```
@@ -116,3 +116,5 @@ bt trace disable claude
 
 See the [tracing plugin guide](plugins/trace-claude-code/README.md) for the
 capture architecture and supported surfaces.
+
+For repository-scoped tracing, see the [daemon configuration guide](https://github.com/braintrustdata/braintrust-coding-agent-plugins/blob/main/bt-daemon/README.md#project-scoped-tracing).

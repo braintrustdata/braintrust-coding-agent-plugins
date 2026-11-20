@@ -8,8 +8,31 @@ import {
   claimManagedTracingInstance,
   DaemonClient,
   daemonSocketPath,
+  mergeProjectRoute,
+  mergeConfigObjects,
   resolveDaemonTraceSettings,
 } from "../src/index.ts"
+
+describe("project route overlay", () => {
+  test("preserves special JSON keys without changing object prototypes", () => {
+    const overlay = JSON.parse('{"__proto__":{"polluted":true},"nested":{"list":[3]}}')
+    const merged = mergeConfigObjects({ nested: { keep: 1, list: [1, 2] } }, overlay)
+    assert.equal(Object.getPrototypeOf(merged), Object.prototype)
+    assert.deepEqual(merged["__proto__"], { polluted: true })
+    assert.deepEqual(merged.nested, { keep: 1, list: [1, 2, 3] })
+  })
+  test("appends project plugins and can replace the inherited chain", () => {
+    const base = { destination: { type: "project_logs", project_name: "global" }, span_plugins: ["trusted"], tags: ["global"] }
+    const projectPath = join(tmpdir(), "example", ".braintrust.json")
+    const overlay = { destination: base.destination, span_plugins: ["project.mjs"], tags: ["project"] }
+    const appended = mergeProjectRoute(base, overlay, projectPath)!
+    assert.deepEqual(appended.span_plugins, ["trusted", join(tmpdir(), "example", "project.mjs")])
+    assert.deepEqual(appended.tags, ["global", "project"])
+    const replaced = mergeProjectRoute(base, overlay, projectPath, false)!
+    assert.deepEqual(replaced.span_plugins, [join(tmpdir(), "example", "project.mjs")])
+    assert.deepEqual(base.span_plugins, ["trusted"])
+  })
+})
 
 describe("managed adapter claims", () => {
   test("deduplicates only the same source and managed run", () => {
