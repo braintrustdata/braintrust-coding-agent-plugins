@@ -22,7 +22,7 @@ use crate::wire::Envelope;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -169,6 +169,8 @@ struct Subagent {
     span_id: String,
     parent_span_id: String,
     transcript_path: Option<String>,
+    #[serde(default)]
+    deferred_insert: Option<SpanRow>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -303,8 +305,12 @@ struct ClaudeTranslator {
     emitted_requests: RecentSet<String>,
     emitted_tools: RecentSet<String>,
     pending_tools: HashMap<String, PendingTool>,
+    #[serde(default)]
+    pending_nested_spawns: HashSet<String>,
     subagents: HashMap<String, Subagent>,
     subagent_handbacks: HashMap<String, Value>,
+    #[serde(default)]
+    observe_stopped_subagents: bool,
     /// Skills the user asked for on the current (or next) turn: `/skill`
     /// expansions and `SKILL.md` paths named in the prompt. Cleared when a
     /// turn stops, so a turn that ends without a Stop hands its skills to the
@@ -360,8 +366,10 @@ impl ClaudeTranslator {
             emitted_requests: RecentSet::default(),
             emitted_tools: RecentSet::default(),
             pending_tools: HashMap::new(),
+            pending_nested_spawns: HashSet::new(),
             subagents: HashMap::new(),
             subagent_handbacks: HashMap::new(),
+            observe_stopped_subagents: false,
             requested_skills: Vec::new(),
             pending_emission: None,
             claude_version: None,
@@ -752,7 +760,13 @@ impl ClaudeTranslator {
                     .map(|turn| turn.user_turn_id.clone())
                     .unwrap_or_else(|| self.last_user_turn_id.clone()),
             });
-        let parent_id = origin.parent_id.clone();
+        let parent_id = string_field(&event.payload, "_bt_import_parent_agent_id")
+            .and_then(|id| self.subagents.get(&id).map(|agent| agent.span_id.clone()))
+            .or_else(|| {
+                string_field(&event.payload, "_bt_import_parent_tool_id")
+                    .map(|id| ids::span_id(&self.session_id, &format!("tool:{id}")))
+            })
+            .unwrap_or_else(|| origin.parent_id.clone());
         let owner = origin
             .user_turn_id
             .clone()
@@ -760,7 +774,7 @@ impl ClaudeTranslator {
         self.agent_origins.insert(hook.agent_id.clone(), origin);
         let agent_type = hook.agent_type.clone().unwrap_or_else(|| "agent".into());
         let span_id = ids::span_id(&self.session_id, &format!("subagent:{}", hook.agent_id));
-        ops.push(SpanOp::Insert(SpanRow {
+        let row = SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
             parent_span_ids: vec![parent_id.clone()],
@@ -770,7 +784,11 @@ impl ClaudeTranslator {
             metadata: Some(json!({ "agent_id": hook.agent_id, "agent_type": agent_type })),
             turn_span_id: owner.clone(),
             ..Default::default()
-        }));
+        };
+        let defer = !self.pending_nested_spawns.is_empty();
+        if !defer {
+            ops.push(SpanOp::Insert(row.clone()));
+        }
         if let Some(owner) = owner {
             self.span_owners.insert(span_id.clone(), owner);
         }
@@ -780,6 +798,7 @@ impl ClaudeTranslator {
                 span_id: span_id.clone(),
                 parent_span_id: parent_id,
                 transcript_path: None,
+                deferred_insert: defer.then_some(row),
             },
         );
         span_id
@@ -795,6 +814,9 @@ impl ClaudeTranslator {
         let call_id = self.call_id(event);
         if self.pending_tools.contains_key(&call_id) || self.emitted_tools.contains(&call_id) {
             return;
+        }
+        if tool_name == "Agent" && string_field(&event.payload, "agent_id").is_some() {
+            self.pending_nested_spawns.insert(call_id.clone());
         }
         let input = tool_input(&event.payload);
         let span_id = ids::span_id(&self.session_id, &format!("tool:{call_id}"));
@@ -852,6 +874,7 @@ impl ClaudeTranslator {
             return;
         };
         let call_id = self.call_id(event);
+        self.pending_nested_spawns.remove(&call_id);
         let input = tool_input(&event.payload);
         let output = tool_output(&event.payload);
         let error = (approval != ToolApproval::Denied)
@@ -943,8 +966,26 @@ impl ClaudeTranslator {
     }
 
     fn stop_subagent(&mut self, event: &Envelope, hook: SubagentHook, ops: &mut Vec<SpanOp>) {
+        if event.payload.get("_bt_import_through_offset").is_none()
+            && hook.agent_transcript_path.is_some()
+        {
+            self.observe_stopped_subagents = true;
+        }
         let agent_id = hook.agent_id.clone();
         let parent = self.ensure_subagent(&hook, event, ops);
+        let native_parent = string_field(&event.payload, "_bt_claude_parent_agent_id")
+            .filter(|id| self.agent_origins.get(id).is_some());
+        if let Some(agent) = self.subagents.get_mut(&agent_id) {
+            if let Some(mut row) = agent.deferred_insert.take() {
+                if let Some(native_parent) = native_parent.as_ref() {
+                    let parent_span_id =
+                        ids::span_id(&self.session_id, &format!("subagent:{native_parent}"));
+                    agent.parent_span_id = parent_span_id.clone();
+                    row.parent_span_ids = vec![parent_span_id];
+                }
+                ops.push(SpanOp::Insert(row));
+            }
+        }
         let parent_span_ids = self
             .subagents
             .get(&agent_id)
@@ -1083,6 +1124,7 @@ impl ClaudeTranslator {
     }
 
     fn release_terminal_state(&mut self) {
+        self.observe_stopped_subagents = false;
         self.main_history = MessageHistory::default();
         self.transcripts.clear();
         self.subagents.clear();
@@ -1090,6 +1132,7 @@ impl ClaudeTranslator {
         self.user_turn_ends = RecentMap::default();
         self.last_user_turn_id = None;
         self.pending_tools.clear();
+        self.pending_nested_spawns.clear();
         self.requested_skills.clear();
         self.emitted_requests.clear();
         self.emitted_tools.clear();
@@ -1354,6 +1397,7 @@ impl ClaudeTranslator {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
+            self.pending_nested_spawns.remove(&id);
             if let Some(tool) = self.pending_tools.remove(&id) {
                 self.emitted_tools.insert(id);
                 let mut metadata = tool.metadata.as_object().cloned().unwrap_or_default();
@@ -1393,6 +1437,18 @@ impl ClaudeTranslator {
     }
 
     fn end_session(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+        for agent in self.subagents.values_mut() {
+            if let Some(row) = agent.deferred_insert.take() {
+                ops.push(SpanOp::Insert(row));
+                ops.push(SpanOp::Merge(SpanRow {
+                    span_id: agent.span_id.clone(),
+                    root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![agent.parent_span_id.clone()],
+                    end_ms: Some(event.ts_ms),
+                    ..Default::default()
+                }));
+            }
+        }
         if self.turn.is_some() {
             self.session_status = Some("interrupted".into());
         } else if self.session_status.is_none() {
@@ -1428,10 +1484,14 @@ impl ClaudeTranslator {
         }
         self.end_root(event.ts_ms, ops);
         self.root_open = false;
-        if let Some(pending) = &mut self.pending_emission {
-            pending.clear_after = true;
-        } else {
-            self.release_terminal_state();
+        // A stopped live subagent may append after session end. Keep its
+        // deduplication state until the observer is finalized.
+        if !self.observe_stopped_subagents {
+            if let Some(pending) = &mut self.pending_emission {
+                pending.clear_after = true;
+            } else {
+                self.release_terminal_state();
+            }
         }
     }
 }
@@ -1558,6 +1618,23 @@ impl AgentTranslator for ClaudeTranslator {
                     self.stop_subagent(event, hook, &mut ops);
                 }
             }
+            "TranscriptUpdate" if event.payload.get("agent_transcript_path").is_some() => {
+                if let (Some(agent_id), Some(path)) = (
+                    string_field(&event.payload, "agent_id"),
+                    string_field(&event.payload, "agent_transcript_path"),
+                ) {
+                    let mut offset = 0;
+                    let records = read_event_records(event, &path, &mut offset);
+                    self.queue_transcript(
+                        records,
+                        PendingHistory::Owned(MessageHistory::default()),
+                        format!("subagent:{agent_id}"),
+                        ids::span_id(&self.session_id, &format!("subagent:{agent_id}")),
+                        self.current_cwd.clone(),
+                        &mut ops,
+                    );
+                }
+            }
             "TranscriptUpdate" if self.turn.is_none() => {
                 if let Some(parent) = self.last_turn_id.clone() {
                     self.emit_main(&parent, &mut ops);
@@ -1629,6 +1706,9 @@ impl AgentTranslator for ClaudeTranslator {
             }));
         }
         for (agent_id, subagent) in std::mem::take(&mut self.subagents) {
+            if let Some(row) = subagent.deferred_insert.clone() {
+                ops.push(SpanOp::Insert(row));
+            }
             if let Some(owner) = self
                 .agent_origins
                 .get(&agent_id)

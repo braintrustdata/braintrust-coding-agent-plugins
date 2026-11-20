@@ -81,6 +81,9 @@ pub(crate) struct TranscriptPayload {
     #[serde(default, alias = "transcriptPath")]
     pub transcript_path: Option<String>,
     pub agent_transcript_path: Option<String>,
+    pub agent_id: Option<String>,
+    #[serde(rename = "_bt_claude_children")]
+    pub claude_children: Option<std::collections::BTreeMap<String, ClaudeChildReference>>,
     pub cwd: Option<String>,
     #[serde(rename = "_bt_transcript_mirror")]
     pub mirror: Option<Reference>,
@@ -98,6 +101,12 @@ pub(crate) struct TranscriptPayload {
     pub import_through_offset: Option<u64>,
     #[serde(rename = "_bt_import_through_ms")]
     pub import_through_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ClaudeChildReference {
+    pub path: String,
+    pub through: Option<u64>,
 }
 
 impl TranscriptPayload {

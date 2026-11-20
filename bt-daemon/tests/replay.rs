@@ -531,6 +531,112 @@ async fn importing_claude_desktop_fork_preserves_context_without_recounting_pare
 }
 
 #[tokio::test]
+async fn importing_claude_nested_and_workflow_agents_preserves_parentage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude-nested.jsonl");
+    let dir = tmp.path().join("claude-nested/subagents");
+    let workflow = dir.join("workflows/wf-1");
+    std::fs::create_dir_all(&workflow).unwrap();
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","sessionId":"claude-nested","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
+            json!({"type":"assistant","sessionId":"claude-nested","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","model":"claude-test","content":[{"type":"tool_use","id":"outer-call","name":"Agent","input":{}},{"type":"tool_use","id":"workflow-call","name":"Workflow","input":{}}]}}),
+            json!({"type":"user","sessionId":"claude-nested","timestamp":"2026-01-01T00:00:03Z","toolUseResult":{"agentId":"outer"},"message":{"content":[{"type":"tool_result","tool_use_id":"outer-call","content":"started"}]}}),
+            json!({"type":"user","sessionId":"claude-nested","timestamp":"2026-01-01T00:00:04Z","toolUseResult":{"runId":"wf-1"},"message":{"content":[{"type":"tool_result","tool_use_id":"workflow-call","content":"started"}]}}),
+            json!({"type":"assistant","sessionId":"claude-nested","timestamp":"2026-01-01T00:00:10Z","message":{"id":"m2","model":"claude-test","content":[{"type":"text","text":"done"}]}}),
+        ],
+    );
+    write_jsonl(
+        &dir.join("agent-outer.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:05Z","message":{"id":"outer-llm","model":"claude-test","content":[{"type":"tool_use","id":"inner-call","name":"Agent","input":{}}]}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:08Z","message":{"content":[{"type":"tool_result","tool_use_id":"inner-call","content":"done"}]}}),
+        ],
+    );
+    write_jsonl(
+        &dir.join("agent-inner.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"inner-llm","model":"claude-test","content":[{"type":"tool_use","id":"deep-call","name":"Agent","input":{}}]}}),
+        ],
+    );
+    std::fs::write(
+        dir.join("agent-inner.meta.json"),
+        json!({"parentAgentId":"outer","toolUseId":"inner-call","agentType":"general-purpose"})
+            .to_string(),
+    )
+    .unwrap();
+    write_jsonl(
+        &dir.join("agent-deep.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:07Z","message":{"id":"deep-llm","model":"claude-test","content":[{"type":"text","text":"deep"}]}}),
+        ],
+    );
+    std::fs::write(
+        dir.join("agent-deep.meta.json"),
+        json!({"parentAgentId":"inner","toolUseId":"deep-call","agentType":"general-purpose"})
+            .to_string(),
+    )
+    .unwrap();
+    write_jsonl(
+        &dir.join("agent-stale.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:07Z","message":{"id":"stale-llm","model":"claude-test","content":[{"type":"text","text":"stale"}]}}),
+        ],
+    );
+    std::fs::write(
+        dir.join("agent-stale.meta.json"),
+        json!({"parentAgentId":"missing","toolUseId":"deep-call"}).to_string(),
+    )
+    .unwrap();
+    write_jsonl(
+        &workflow.join("agent-worker.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"worker-llm","model":"claude-test","content":[{"type":"text","text":"worker"}]}}),
+        ],
+    );
+    std::fs::write(
+        workflow.join("agent-worker.meta.json"),
+        json!({"agentType":"workflow-subagent"}).to_string(),
+    )
+    .unwrap();
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Claude,
+        import_daemon::target(&output, None).await,
+        false,
+    )
+    .await
+    .unwrap();
+    let rows = rows(&output.join("claude-nested.ndjson"));
+    let inserts = rows
+        .iter()
+        .filter_map(|row| row.get("Insert"))
+        .collect::<Vec<_>>();
+    let agent = |id: &str| {
+        inserts
+            .iter()
+            .find(|row| row.pointer("/metadata/agent_id").and_then(Value::as_str) == Some(id))
+            .unwrap()
+    };
+    let outer = agent("outer");
+    let inner = agent("inner");
+    let worker = agent("worker");
+    assert_eq!(inner["parent_span_ids"][0], outer["span_id"]);
+    assert_eq!(agent("deep")["parent_span_ids"][0], inner["span_id"]);
+    assert!(!inserts
+        .iter()
+        .any(|row| row.pointer("/metadata/agent_id").and_then(Value::as_str) == Some("stale")));
+    let workflow_tool = inserts
+        .iter()
+        .find(|row| row.get("name").and_then(Value::as_str) == Some("Workflow"))
+        .unwrap();
+    assert_eq!(worker["parent_span_ids"][0], workflow_tool["span_id"]);
+    assert_eq!(inserted(&rows, "llm"), 6);
+}
+
+#[tokio::test]
 async fn importing_claude_parent_also_imports_its_subagent_into_the_same_trace() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("claude-parent.jsonl");

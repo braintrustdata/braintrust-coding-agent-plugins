@@ -444,6 +444,42 @@ async fn hydrate_claude_transcript_references(data_dir: &std::path::Path, env: &
     {
         return;
     }
+    // Claude writes the subagent's ancestry alongside its transcript by the
+    // time SubagentStop fires. Freeze only the parent ID with the hook.
+    if env.event == "SubagentStop" {
+        if let (Some(agent_id), Some(path)) = (
+            env.payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str),
+            env.payload
+                .get("agent_transcript_path")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            let path = std::path::Path::new(path);
+            if path.file_name().and_then(|name| name.to_str())
+                == Some(format!("agent-{agent_id}.jsonl").as_str())
+            {
+                let meta_path = path.with_extension("meta.json");
+                if tokio::fs::metadata(&meta_path)
+                    .await
+                    .is_ok_and(|meta| meta.len() <= 65536)
+                {
+                    if let Ok(bytes) = tokio::fs::read(&meta_path).await {
+                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(parent) = meta
+                                .get("parentAgentId")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|parent| !parent.is_empty() && *parent != agent_id)
+                            {
+                                env.payload["_bt_claude_parent_agent_id"] =
+                                    serde_json::json!(parent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mirror_session = crate::ids::session_namespace(&env.source, &env.session_id);
     let mut mirrors = std::collections::BTreeMap::new();
     for path in [
@@ -605,6 +641,34 @@ mod tests {
         env.payload["transcript_path"] = serde_json::json!(transcript);
         hydrate_transcript_reference(tmp.path(), &mut env).await;
         assert_eq!(env.payload["_bt_transcript_mirror"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn claude_stop_freezes_subagent_parent_from_matching_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent-child.jsonl");
+        tokio::fs::write(&path, b"").await.unwrap();
+        tokio::fs::write(
+            path.with_extension("meta.json"),
+            br#"{"parentAgentId":"outer"}"#,
+        )
+        .await
+        .unwrap();
+        let mut env: Envelope = serde_json::from_value(serde_json::json!({
+            "source":"claude-code", "session_id":"session", "event":"SubagentStop", "ts_ms":1,
+            "payload":{"agent_id":"child","agent_transcript_path":path}
+        }))
+        .unwrap();
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        assert_eq!(env.payload["_bt_claude_parent_agent_id"], "outer");
+        tokio::fs::write(
+            path.with_extension("meta.json"),
+            br#"{"parentAgentId":"other"}"#,
+        )
+        .await
+        .unwrap();
+        hydrate_transcript_reference(tmp.path(), &mut env).await;
+        assert_eq!(env.payload["_bt_claude_parent_agent_id"], "outer");
     }
 
     #[tokio::test]

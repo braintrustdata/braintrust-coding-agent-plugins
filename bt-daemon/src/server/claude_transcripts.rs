@@ -10,7 +10,15 @@ pub(super) struct ClaudeTranscriptObservation {
     /// Synthetic-event provenance only: never retain native prompts or responses.
     pub(super) template: Envelope,
     pub(super) through: Option<u64>,
-    path: String,
+    pub(super) path: String,
+    pub(super) children: HashMap<String, ClaudeChildObservation>,
+}
+
+#[derive(Clone)]
+pub(super) struct ClaudeChildObservation {
+    pub(super) template: Envelope,
+    pub(super) through: Option<u64>,
+    pub(super) path: String,
 }
 
 impl Daemon {
@@ -22,12 +30,6 @@ impl Daemon {
             return;
         };
         if fields.import_through_offset.is_some() {
-            return;
-        }
-        if env.event == "SessionEnd" {
-            self.claude_transcripts
-                .lock()
-                .retain(|key, _| key.source != env.source || key.session_id != env.session_id);
             return;
         }
         let Some(route) = env.route.as_ref() else {
@@ -74,16 +76,61 @@ impl Daemon {
             config: None,
         };
         let mut observations = self.claude_transcripts.lock();
-        let previous = observations
-            .get(&key)
+        let old = observations.remove(&key);
+        let previous = old
+            .as_ref()
             .filter(|observation| observation.path == path)
             .and_then(|observation| observation.through);
+        let mut children = old
+            .map(|observation| observation.children)
+            .unwrap_or_default();
+        if let Some(saved) = fields.claude_children.as_ref() {
+            for (agent_id, observation) in saved {
+                let child_path = &observation.path;
+                let mut child_template = template.clone();
+                child_template.payload["agent_id"] = serde_json::json!(agent_id);
+                child_template.payload["agent_transcript_path"] = serde_json::json!(child_path);
+                children.insert(
+                    agent_id.clone(),
+                    ClaudeChildObservation {
+                        template: child_template,
+                        through: observation.through,
+                        path: child_path.clone(),
+                    },
+                );
+            }
+        }
+        if matches!(env.event.as_str(), "SubagentStop" | "TranscriptUpdate") {
+            if let (Some(agent_id), Some(child_path)) = (
+                fields.agent_id.as_deref(),
+                fields.agent_transcript_path.as_deref(),
+            ) {
+                let child_through = fields
+                    .claude_mirrors
+                    .as_ref()
+                    .and_then(|mirrors| mirrors.get(child_path))
+                    .and_then(|mirror| mirror.through);
+                let mut child_template = template.clone();
+                child_template.payload["agent_id"] = serde_json::json!(agent_id);
+                child_template.payload["agent_transcript_path"] = serde_json::json!(child_path);
+                let previous = children.get(agent_id).and_then(|child| child.through);
+                children.insert(
+                    agent_id.to_string(),
+                    ClaudeChildObservation {
+                        template: child_template,
+                        through: child_through.or(previous),
+                        path: child_path.to_owned(),
+                    },
+                );
+            }
+        }
         observations.insert(
             key,
             ClaudeTranscriptObservation {
                 template,
                 path: path.to_owned(),
                 through: through.or(previous),
+                children,
             },
         );
     }
@@ -125,24 +172,31 @@ impl Daemon {
             let Some(observation) = observation else {
                 continue;
             };
-            let path = &observation.path;
-            let Ok(metadata) = tokio::fs::metadata(path).await else {
-                continue;
-            };
-            if observation.through == Some(metadata.len()) {
-                continue;
-            }
-            let mut env = observation.template;
-            env.ts_ms = now_ms();
-            hydrate_transcript_reference(&self.data_dir, &mut env).await;
-            let through = TranscriptPayload::decode(&env.payload)
-                .ok()
-                .and_then(|fields| fields.claude_mirrors?.get(path)?.through);
-            if through.is_none() || through == observation.through {
-                continue;
-            }
-            if let Err(error) = self.journal_and_enqueue(env).await {
-                tracing::warn!(session_id = %key.session_id, %error, "Claude transcript observation failed");
+            let mut targets = vec![(observation.template, observation.through, observation.path)];
+            targets.extend(
+                observation
+                    .children
+                    .into_values()
+                    .map(|child| (child.template, child.through, child.path)),
+            );
+            for (mut env, previous, path) in targets {
+                let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                    continue;
+                };
+                if previous == Some(metadata.len()) {
+                    continue;
+                }
+                env.ts_ms = now_ms();
+                hydrate_transcript_reference(&self.data_dir, &mut env).await;
+                let through = TranscriptPayload::decode(&env.payload)
+                    .ok()
+                    .and_then(|fields| fields.claude_mirrors?.get(&path)?.through);
+                if through.is_none() || through == previous {
+                    continue;
+                }
+                if let Err(error) = self.journal_and_enqueue(env).await {
+                    tracing::warn!(session_id = %key.session_id, %error, "Claude transcript observation failed");
+                }
             }
         }
     }
