@@ -453,7 +453,10 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
             .any(|row| row["span_id"] == *span && row["metrics"]["end"] == 1.0));
     }
 
-    let data_dir = tmp.path().join("data");
+    // Build the legacy fixture independently of the modern daemon's SQLite
+    // files, which can still be closing on Windows after shutdown returns.
+    let legacy = tempfile::tempdir().unwrap();
+    let data_dir = legacy.path().join("data");
     let journal = source_journal_path(&data_dir, "claude-code", session);
     // Model a released pre-SpanOp-journal daemon: accepted native history and
     // a legacy delivery checkpoint, with no newer durable partition.
@@ -466,11 +469,10 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     let through = history.len() as u64;
     history.push_str(&format!("{}\n",json!({"_bt_record_type":"delivery_checkpoint", "route":capture("UserPromptSubmit","v1","native1",1_000).route, "through":through})));
     std::fs::write(&journal, &history).unwrap();
-    std::fs::remove_dir_all(data_dir.join("pipeline")).unwrap();
     let acknowledged_history = history.into_bytes();
     assert_eq!(std::fs::read(&journal).unwrap(), acknowledged_history);
 
-    let second = Daemon::start(tmp.path(), &server, "bt2").await;
+    let second = Daemon::start(legacy.path(), &server, "bt2").await;
     let mut late_stop = capture("Stop", "v2", "native2", 2_000);
     late_stop.payload["last_assistant_message"] = json!("late legacy answer");
     second.send(&late_stop).await;
@@ -529,7 +531,7 @@ async fn legacy_acknowledged_spans_receive_late_updates_without_inventing_origin
     // Repeated recovery must not turn historical capture versions into a
     // fabricated birth snapshot, or restore SDK provenance on the next merge.
     let before_restart = rows.len();
-    let third = Daemon::start(tmp.path(), &server, "bt3").await;
+    let third = Daemon::start(legacy.path(), &server, "bt3").await;
     third
         .send(&capture("SessionEnd", "v5", "native5", 5_000))
         .await;
