@@ -20,9 +20,9 @@
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::{
-    add_tool_approval, compile_skill_regex, explicit_skill_metadata, insert_skill_metadata,
-    is_skill_name, prompt_skill_names, push_unique, skill_md_paths, tool_approval_metadata,
-    SkillLoad, ToolApproval,
+    add_tool_approval, compile_skill_regex, explicit_skill_metadata, is_skill_name,
+    prompt_skill_names, push_unique, skill_md_paths, tool_approval_metadata, SkillLoad,
+    ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -1203,7 +1203,7 @@ impl CodexTranslator {
             if let Some(skill_name) = &skill.name {
                 name = format!("skill: {skill_name}");
             }
-            insert_skill_metadata(&mut metadata, skill, &explicit_skills);
+            skill.insert_metadata(&mut metadata, &explicit_skills);
         }
         if let Some(permission) = permission {
             metadata.insert("permission".into(), permission);
@@ -1692,13 +1692,9 @@ fn is_injected_user_context(text: &str) -> bool {
 
 fn effective_transcript_path(event: &Envelope) -> Option<String> {
     let fields = TranscriptPayload::decode(&event.payload).ok()?;
-    fields.mirror.and_then(|mirror| mirror.mirror).or_else(|| {
-        if event.event == "SubagentStop" {
-            fields.agent_transcript_path
-        } else {
-            fields.transcript_path.or(fields.agent_transcript_path)
-        }
-    })
+    fields
+        .codex_read_path(event.event == "SubagentStop")
+        .map(str::to_owned)
 }
 
 impl Scope {

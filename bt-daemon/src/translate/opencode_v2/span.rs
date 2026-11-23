@@ -198,11 +198,11 @@ pub(super) struct Metrics {
 }
 impl Metrics {
     pub fn from_tokens(t: super::event::Tokens) -> Self {
-        let prompt = t.input + t.cache.read + t.cache.write;
+        let prompt = t.prompt_tokens();
         Self {
             prompt_tokens: prompt,
             completion_tokens: t.output,
-            tokens: prompt + t.output + t.reasoning,
+            tokens: t.total_tokens(),
             prompt_cached_tokens: t.cache.read,
             prompt_cache_creation_tokens: t.cache.write,
             reasoning_tokens: t.reasoning,

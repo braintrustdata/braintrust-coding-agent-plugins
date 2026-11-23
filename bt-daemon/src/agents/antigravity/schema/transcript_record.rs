@@ -1,4 +1,4 @@
-//! Antigravity native records shared by live translation and transcript import.
+use super::{optional_integer, ToolCalls};
 use crate::agents::usage::ProviderUsage;
 use crate::json::Extensions;
 use serde::{Deserialize, Serialize};
@@ -46,59 +46,29 @@ pub(crate) struct TranscriptRecord {
     pub extra: Extensions,
 }
 
-pub(crate) fn optional_integer<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<i64>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Integer {
-        Number(i64),
-        Text(String),
+impl TranscriptRecord {
+    pub fn normalized_kind(&self) -> &str {
+        self.kind
+            .strip_prefix("CORTEX_STEP_TYPE_")
+            .unwrap_or(&self.kind)
     }
-    Option::<Integer>::deserialize(deserializer)?
-        .map(|value| match value {
-            Integer::Number(value) => Ok(value),
-            Integer::Text(value) => value.parse().map_err(serde::de::Error::custom),
-        })
-        .transpose()
-}
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum ToolCalls {
-    Many(Vec<ToolCall>),
-    One(ToolCall),
-}
-impl ToolCalls {
-    pub fn iter(&self) -> std::slice::Iter<'_, ToolCall> {
-        match self {
-            Self::Many(calls) => calls.iter(),
-            Self::One(call) => std::slice::from_ref(call).iter(),
-        }
+    /// Native formats use three alternative content fields. Explicit null is
+    /// still content and must not accidentally expose a lower-priority field.
+    pub fn message_content(&self) -> Value {
+        self.content
+            .as_ref()
+            .or(self.message.as_ref())
+            .or(self.text.as_ref())
+            .cloned()
+            .unwrap_or(Value::Null)
     }
-}
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ToolCall {
-    #[serde(default, alias = "tool_name", alias = "toolName")]
-    pub name: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "arguments",
-        alias = "input",
-        deserialize_with = "crate::agents::schema::deserialize_present"
-    )]
-    pub args: Option<Value>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "result",
-        deserialize_with = "crate::agents::schema::deserialize_present"
-    )]
-    pub output: Option<Value>,
-    #[serde(flatten, deserialize_with = "crate::json::deserialize_extensions")]
-    pub extra: Extensions,
+    pub fn created_at_ms(&self) -> Option<i64> {
+        chrono::DateTime::parse_from_rfc3339(self.created_at.as_deref()?)
+            .ok()
+            .map(|timestamp| timestamp.timestamp_millis())
+    }
 }
 
 #[cfg(test)]

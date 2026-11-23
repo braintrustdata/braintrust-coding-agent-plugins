@@ -5,9 +5,11 @@
 //! behavior, setup, managed runs, imports, and output contracts stay here with
 //! the coding-agent integrations.
 
-use crate::route::{apply_additional_metadata, apply_tags, resolve_span_plugin_paths};
+use crate::route::resolve_span_plugin_paths;
 use crate::trace_command::{DoctorAgent, DoctorArgs, SettingsScope, SetupAgent, TraceCommand};
-use crate::wire::{AuthSelection, AuthSource, SessionConfig, SessionRoute, TraceDestination};
+#[cfg(test)]
+use crate::wire::AuthSource;
+use crate::wire::{AuthSelection, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
     run_traced_with_host, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider,
@@ -62,46 +64,6 @@ impl HostRouteSelection {
     }
 }
 
-fn auth_source_label(selection: &AuthSelection) -> &'static str {
-    match selection.effective_source() {
-        AuthSource::SavedProfile => "saved_profile",
-        AuthSource::Environment => "environment",
-        AuthSource::Auto => "command_context",
-    }
-}
-
-fn ready_auth_diagnostic(
-    selection: AuthSelection,
-    org_name: Option<String>,
-    expires_at_ms: Option<i64>,
-) -> AuthDiagnostic {
-    AuthDiagnostic {
-        status: "ready".into(),
-        source: auth_source_label(&selection).into(),
-        kind: None,
-        profile: selection.profile,
-        org_name,
-        expires_at_ms,
-        error: None,
-    }
-}
-
-fn unconfirmed_auth_diagnostic(
-    status: &str,
-    source: &str,
-    error: Option<String>,
-) -> AuthDiagnostic {
-    AuthDiagnostic {
-        status: status.into(),
-        source: source.into(),
-        kind: None,
-        profile: None,
-        org_name: None,
-        expires_at_ms: None,
-        error,
-    }
-}
-
 /// Host-owned services used by the integration runtime.
 ///
 /// Implementations resolve Braintrust profiles and destination choices but do
@@ -137,14 +99,14 @@ pub trait TraceHostServices: Send + Sync {
             .await
         {
             Ok(lease) => {
-                ready_auth_diagnostic(lease.selection, lease.auth.org_name, lease.expires_at_ms)
+                AuthDiagnostic::ready(lease.selection, lease.auth.org_name, lease.expires_at_ms)
             }
             Err(error) => AuthDiagnostic {
                 profile: selection.profile.clone(),
                 org_name: selection.org_name.clone(),
-                ..unconfirmed_auth_diagnostic(
+                ..AuthDiagnostic::unconfirmed(
                     "error",
-                    auth_source_label(selection),
+                    AuthDiagnostic::source_label(selection),
                     Some(error.to_string()),
                 )
             },
@@ -410,20 +372,20 @@ async fn diagnose_daemon_auth(socket: &Path, selection: &AuthSelection) -> AuthD
         });
     // The route already shows what was requested; report only what the
     // daemon actually resolved.
-    let source = auth_source_label(selection);
+    let source = AuthDiagnostic::source_label(selection);
     match result {
         Err(error)
             if error
                 .downcast_ref::<crate::client::RpcCallError>()
                 .is_some_and(|error| error.code == crate::wire::error_code::METHOD_NOT_FOUND) =>
         {
-            unconfirmed_auth_diagnostic("unsupported", source, None)
+            AuthDiagnostic::unconfirmed("unsupported", source, None)
         }
-        Err(error) => unconfirmed_auth_diagnostic("unknown", source, Some(error.to_string())),
+        Err(error) => AuthDiagnostic::unconfirmed("unknown", source, Some(error.to_string())),
         Ok(result) if result.error.is_some() => {
-            unconfirmed_auth_diagnostic("error", source, result.error)
+            AuthDiagnostic::unconfirmed("error", source, result.error)
         }
-        Ok(result) => ready_auth_diagnostic(
+        Ok(result) => AuthDiagnostic::ready(
             result.selection.unwrap_or_else(|| selection.clone()),
             result.org_name,
             result.expires_at_ms,
@@ -450,7 +412,7 @@ fn daemon_warnings(
     }
     let mut warnings = Vec::new();
     match &daemon.auth {
-        Some(daemon_auth) if daemon_auth.status == "error" => {
+        Some(daemon_auth) if daemon_auth.is_error() => {
             warnings.push(format!(
                 "the running tracing daemon cannot authenticate, so it rejects {display_name} events: {}",
                 daemon_auth.error.as_deref().unwrap_or("unknown error")
@@ -461,7 +423,7 @@ fn daemon_warnings(
                 );
             }
         }
-        Some(daemon_auth) if daemon_auth.status == "ready" && auth.status == "ready" => {
+        Some(daemon_auth) if daemon_auth.is_ready() && auth.is_ready() => {
             for (label, shell, daemon) in [
                 ("profile", &auth.profile, &daemon_auth.profile),
                 ("organization", &auth.org_name, &daemon_auth.org_name),
@@ -625,7 +587,7 @@ async fn doctor_output_at(
     let local_auth = async {
         match &route {
             Some(route) => host.services.diagnose_auth(&route.auth).await,
-            None => unconfirmed_auth_diagnostic(
+            None => AuthDiagnostic::unconfirmed(
                 "unresolved",
                 "unresolved",
                 Some("route is unresolved".into()),
@@ -643,7 +605,7 @@ async fn doctor_output_at(
     // what separates divergent credential views from failures both processes
     // share. Skip it when the local check already failed.
     let resolves_locally = match &route {
-        Some(route) if daemon.auth_failed() && auth.status == "ready" => {
+        Some(route) if daemon.auth_failed() && auth.is_ready() => {
             let local = HostAuthProvider {
                 services: host.services.clone(),
             };
@@ -729,8 +691,8 @@ async fn run_install_command(
         },
     )
     .await?;
-    apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
-    apply_tags(&mut route, &args.tags)?;
+    route.apply_additional_metadata(args.additional_metadata.as_deref())?;
+    route.apply_tags(&args.tags)?;
     if !args.plugin.is_empty() {
         route.span_plugins = resolve_span_plugin_paths(&args.plugin)?;
     }
@@ -946,8 +908,8 @@ pub async fn run_trace_with_matches(
                 },
             )
             .await?;
-            apply_additional_metadata(&mut route, import_args.additional_metadata.as_deref())?;
-            apply_tags(&mut route, &import_args.tags)?;
+            route.apply_additional_metadata(import_args.additional_metadata.as_deref())?;
+            route.apply_tags(&import_args.tags)?;
             // Resolve credentials up front, interactively if needed, so the
             // daemon can authenticate this route when it delivers.
             session_config(&host, &route).await?;
@@ -1032,7 +994,7 @@ pub async fn run_trace_with_matches(
             } else {
                 None
             };
-            apply_additional_metadata(&mut route, run_args.additional_metadata.as_deref())?;
+            route.apply_additional_metadata(run_args.additional_metadata.as_deref())?;
             if let Some(mut metadata) = inherited_metadata {
                 if let Some(overlay) = route.additional_metadata.take() {
                     crate::settings::merge_json(&mut metadata, overlay);
@@ -1040,7 +1002,7 @@ pub async fn run_trace_with_matches(
                 route.additional_metadata = Some(metadata);
             }
             let inherited_tags = run_args.inherit.then(|| route.tags.clone());
-            apply_tags(&mut route, &run_args.tags)?;
+            route.apply_tags(&run_args.tags)?;
             if let Some(tags) = inherited_tags {
                 route.tags.extend(tags);
             }

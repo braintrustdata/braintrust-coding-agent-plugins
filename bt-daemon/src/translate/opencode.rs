@@ -1,11 +1,14 @@
 //! OpenCode translator. The JavaScript package forwards native hook payloads;
 //! this module owns span construction, correlation, and recovery.
 
+mod permission;
+use permission::{PermissionProperties, PermissionRequest};
+
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet};
 use super::tool::{
-    error_text, insert_skill_metadata, prompt_skill_names, push_unique, skill_file_load,
-    skill_md_paths, with_tool_approval, SkillLoad, ToolApproval,
+    error_text, prompt_skill_names, push_unique, skill_file_load, skill_md_paths,
+    with_tool_approval, SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -218,100 +221,6 @@ impl From<ToolAfterPayload> for ToolAfter {
             },
         }
     }
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-struct PermissionToolRecord {
-    #[serde(default, rename = "sessionID")]
-    session_id: Option<String>,
-    #[serde(default, rename = "callID")]
-    call_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    tool: Option<String>,
-    #[serde(default)]
-    input: Option<Value>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(untagged)]
-#[derive(Serialize)]
-enum PermissionTool {
-    Name(String),
-    Record(PermissionToolRecord),
-}
-
-#[derive(Clone, Default, Deserialize, Serialize)]
-struct PermissionFields {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default, rename = "sessionID")]
-    session_id: Option<String>,
-    #[serde(default, rename = "callID")]
-    call_id: Option<String>,
-    #[serde(default)]
-    tool: Option<PermissionTool>,
-    #[serde(default, rename = "toolName")]
-    tool_name: Option<String>,
-    #[serde(default, rename = "permission")]
-    permission: Option<String>,
-    #[serde(default)]
-    input: Option<Value>,
-    #[serde(default)]
-    args: Option<Value>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default, rename = "type", alias = "permissionType")]
-    permission_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-#[derive(Serialize)]
-enum PermissionPayload {
-    Record(Box<PermissionFields>),
-    Kind(String),
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct PermissionProperties {
-    #[serde(default)]
-    permission: Option<PermissionPayload>,
-    #[serde(default)]
-    info: Option<PermissionFields>,
-    #[serde(default, rename = "permissionID")]
-    permission_id: Option<String>,
-    #[serde(default, rename = "requestID")]
-    request_id: Option<String>,
-    #[serde(default)]
-    reply: Option<String>,
-    #[serde(default)]
-    response: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(flatten)]
-    direct: PermissionFields,
-}
-
-impl PermissionTool {
-    fn record(&self) -> Option<&PermissionToolRecord> {
-        match self {
-            Self::Record(record) => Some(record),
-            Self::Name(_) => None,
-        }
-    }
-
-    fn name(&self) -> Option<&str> {
-        match self {
-            Self::Name(name) => Some(name),
-            Self::Record(_) => None,
-        }
-    }
-}
-
-fn permission_properties(payload: &Value) -> Option<PermissionProperties> {
-    decode(payload.get("properties").unwrap_or(payload))
 }
 
 #[derive(Deserialize)]
@@ -570,16 +479,6 @@ impl MessageHistory {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-struct PermissionRequest {
-    id: Option<String>,
-    session_id: Option<String>,
-    call_id: Option<String>,
-    tool: Option<String>,
-    input: Option<Value>,
-    title: Option<String>,
-    permission_type: Option<String>,
-}
 #[derive(Serialize, Deserialize)]
 struct OpenCodeTranslator {
     daemon_session_id: String,
@@ -611,10 +510,10 @@ impl AgentTranslator for OpenCodeTranslator {
                 .map(ToolAfter::from)
                 .map(|tool| self.tool_after(tool, event.ts_ms))
                 .unwrap_or_default(),
-            "permission.asked" => permission_properties(&event.payload)
+            "permission.asked" => PermissionProperties::decode(&event.payload)
                 .map(|permission| self.permission_asked(permission))
                 .unwrap_or_default(),
-            "permission.replied" => permission_properties(&event.payload)
+            "permission.replied" => PermissionProperties::decode(&event.payload)
                 .map(|permission| self.permission_replied(permission, event.ts_ms))
                 .unwrap_or_default(),
             "session.idle" => self.finish_session_event(event, false, None),
@@ -1038,7 +937,7 @@ impl OpenCodeTranslator {
         let tokens = info.tokens.as_ref().cloned().unwrap_or_default();
         let cache_read = tokens.cache.read;
         let cache_write = tokens.cache.write;
-        let prompt = tokens.input + cache_read + cache_write;
+        let prompt = tokens.prompt_tokens();
         let completion = tokens.output;
         let reasoning = tokens.reasoning;
         let content = state.output_parts.remove(mid).unwrap_or_default();
@@ -1121,7 +1020,7 @@ impl OpenCodeTranslator {
             output: Some(Value::Array(vec![assistant])),
             metadata: Some(metadata),
             metrics: Some(
-                json!({"prompt_tokens":prompt,"completion_tokens":completion,"tokens":prompt+completion+reasoning,"prompt_cached_tokens":cache_read,"prompt_cache_creation_tokens":cache_write,"reasoning_tokens":reasoning}),
+                json!({"prompt_tokens":prompt,"completion_tokens":completion,"tokens":tokens.total_tokens(),"prompt_cached_tokens":cache_read,"prompt_cache_creation_tokens":cache_write,"reasoning_tokens":reasoning}),
             ),
             error: info.error.as_ref().map(|error| format_error(Some(error))),
             tags: (info.summary || info.compaction).then(|| vec!["compaction".into()]),
@@ -1152,7 +1051,7 @@ impl OpenCodeTranslator {
                 .tool_args
                 .get(&call)
                 .and_then(|args| skill_load(&tool, args))
-                .map_or_else(|| tool.clone(), |skill| skill_span_name(&skill));
+                .map_or_else(|| tool.clone(), |skill| skill.display_name());
             return vec![SpanOp::Insert(SpanRow {
                 span_id: ids::span_id(&self.daemon_session_id, &format!("tool:{sid}:{call}")),
                 root_span_id: s.effective_root_span_id.clone(),
@@ -1203,7 +1102,7 @@ impl OpenCodeTranslator {
         let args = s.tool_args.remove(&call);
         let skill = args.as_ref().and_then(|args| skill_load(&tool, args));
         let name = if let Some(skill) = &skill {
-            skill_span_name(skill)
+            skill.display_name()
         } else {
             event
                 .result
@@ -1217,7 +1116,7 @@ impl OpenCodeTranslator {
             Some(ToolApproval::Approved),
         );
         if let (Some(skill), Some(fields)) = (&skill, metadata.as_object_mut()) {
-            insert_skill_metadata(fields, skill, &s.requested_skills);
+            skill.insert_metadata(fields, &s.requested_skills);
         }
         let had_start = s.tool_starts.contains_key(&call);
         let parent_span_id = s.tool_parent_span_ids.remove(&call).unwrap_or(turn);
@@ -1256,56 +1155,8 @@ impl OpenCodeTranslator {
         }]
     }
 
-    fn permission_record(properties: &PermissionProperties) -> PermissionRequest {
-        let permission_kind = match &properties.permission {
-            Some(PermissionPayload::Kind(kind)) => Some(kind.clone()),
-            _ => None,
-        };
-        let source = match &properties.permission {
-            Some(PermissionPayload::Record(record)) => record,
-            _ => properties.info.as_ref().unwrap_or(&properties.direct),
-        };
-        let tool_record = source.tool.as_ref().and_then(PermissionTool::record);
-        PermissionRequest {
-            id: source
-                .id
-                .clone()
-                .or_else(|| properties.direct.id.clone())
-                .or_else(|| properties.permission_id.clone())
-                .or_else(|| properties.request_id.clone()),
-            session_id: source
-                .session_id
-                .clone()
-                .or_else(|| properties.direct.session_id.clone())
-                .or_else(|| tool_record.and_then(|tool| tool.session_id.clone())),
-            call_id: source
-                .call_id
-                .clone()
-                .or_else(|| tool_record.and_then(|tool| tool.call_id.clone())),
-            tool: source
-                .tool
-                .as_ref()
-                .and_then(PermissionTool::name)
-                .map(str::to_owned)
-                .or_else(|| source.tool_name.clone())
-                .or_else(|| tool_record.and_then(|tool| tool.name.clone()))
-                .or_else(|| tool_record.and_then(|tool| tool.tool.clone()))
-                // OpenCode's native permission events put the requested tool
-                // kind in `permission`, separate from `tool.callID`.
-                .or_else(|| source.permission.clone())
-                .or(permission_kind),
-            input: source
-                .input
-                .clone()
-                .or_else(|| source.args.clone())
-                .or_else(|| tool_record.and_then(|tool| tool.input.clone())),
-            title: source.title.clone(),
-            permission_type: source.permission_type.clone(),
-        }
-    }
-
     fn permission_asked(&mut self, properties: PermissionProperties) -> Vec<SpanOp> {
-        let request = Self::permission_record(&properties);
+        let request = properties.request();
         if let Some(id) = &request.id {
             self.permission_requests.insert(id.clone(), request);
         }
@@ -1313,13 +1164,8 @@ impl OpenCodeTranslator {
     }
 
     fn permission_replied(&mut self, properties: PermissionProperties, ts_ms: i64) -> Vec<SpanOp> {
-        let reply = properties
-            .reply
-            .as_deref()
-            .or(properties.response.as_deref())
-            .or(properties.status.as_deref())
-            .unwrap_or("");
-        let direct = Self::permission_record(&properties);
+        let reply = properties.reply();
+        let direct = properties.request();
         let request = direct
             .id
             .as_ref()
@@ -1568,13 +1414,6 @@ pub(super) fn requested_skills(input: &str) -> Vec<String> {
         push_unique(&mut names, name);
     }
     names
-}
-
-fn skill_span_name(skill: &SkillLoad) -> String {
-    skill
-        .name
-        .as_ref()
-        .map_or_else(|| "skill".into(), |name| format!("skill: {name}"))
 }
 
 /// OpenCode loads a skill through its `skill` tool, or by reading the skill's

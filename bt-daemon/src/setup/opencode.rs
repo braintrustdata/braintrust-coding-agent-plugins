@@ -30,26 +30,17 @@ fn config_path() -> PathBuf {
 }
 
 fn is_ours(plugin: &OpenCodePlugin) -> bool {
-    plugin.package().is_some_and(|plugin| {
-        plugin == PACKAGE
-            || plugin
-                .strip_prefix(PACKAGE)
-                .is_some_and(|version| version.starts_with('@'))
-    })
-}
-
-/// Replace any entry for the plugin with the bundled major version.
-fn pin_plugin(plugins: &mut Vec<OpenCodePlugin>) -> anyhow::Result<()> {
-    plugins.retain(|plugin| !is_ours(plugin));
-    plugins.push(OpenCodePlugin::Package(plugin_spec()?));
-    Ok(())
+    plugin.matches_package(PACKAGE)
 }
 
 fn enable_at(path: &Path) -> anyhow::Result<()> {
     edit_json(
         path,
         FileAccess::Inherited,
-        |config: &mut OpenCodeConfig, _| pin_plugin(config.plugin.get_or_insert_with(Vec::new)),
+        |config: &mut OpenCodeConfig, _| {
+            config.replace_plugin(is_ours, OpenCodePlugin::Package(plugin_spec()?));
+            Ok(())
+        },
     )
 }
 
@@ -61,12 +52,11 @@ fn update_at(path: &Path) -> anyhow::Result<()> {
             if !existed {
                 bail!(NOT_INSTALLED);
             }
-            let plugins = config
-                .plugin
-                .as_mut()
-                .filter(|plugins| plugins.iter().any(is_ours))
-                .ok_or_else(|| anyhow::anyhow!(NOT_INSTALLED))?;
-            pin_plugin(plugins)
+            if config.find_plugin(is_ours).is_none() {
+                bail!(NOT_INSTALLED);
+            }
+            config.replace_plugin(is_ours, OpenCodePlugin::Package(plugin_spec()?));
+            Ok(())
         },
     )
 }
@@ -76,9 +66,7 @@ fn disable_at(path: &Path) -> anyhow::Result<()> {
         path,
         FileAccess::Inherited,
         |config: &mut OpenCodeConfig, _| {
-            if let Some(plugins) = &mut config.plugin {
-                plugins.retain(|plugin| !is_ours(plugin));
-            }
+            config.retain_plugins(|plugin| !is_ours(plugin));
             Ok(())
         },
     )
@@ -107,9 +95,7 @@ impl Setup for OpenCode {
         };
         let expected = plugin_spec().ok();
         config
-            .plugin
-            .as_ref()
-            .and_then(|plugins| plugins.iter().find(|plugin| is_ours(plugin)))
+            .find_plugin(is_ours)
             .and_then(OpenCodePlugin::package)
             .is_some_and(|plugin| Some(plugin) != expected.as_deref())
     }

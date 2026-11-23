@@ -1,7 +1,7 @@
 //! OpenCode managed runs add the tracing plugin to inline config.
 
 use super::{Injection, ManagedRun};
-use crate::agents::schema::{OpenCodeConfig, OpenCodePlugin};
+use crate::agents::schema::OpenCodeConfig;
 use crate::agents::OpenCode;
 use crate::args::RunHookCommand;
 use std::ffi::OsString;
@@ -74,7 +74,6 @@ fn opencode_managed_config(existing: Option<&str>, v2: bool) -> anyhow::Result<S
             .map_err(|error| anyhow::anyhow!("invalid OPENCODE_CONFIG_CONTENT: {error}"))?,
         None => OpenCodeConfig::default(),
     };
-    let plugins = config.plugin.get_or_insert_with(Vec::new);
     let plugin = crate::env::var("BRAINTRUST_TRACE_OPENCODE_PLUGIN_SPEC").unwrap_or_else(|| {
         if v2 {
             "@braintrust/trace-opencode"
@@ -83,9 +82,7 @@ fn opencode_managed_config(existing: Option<&str>, v2: bool) -> anyhow::Result<S
         }
         .to_string()
     });
-    if !plugins.iter().any(|value| value.package() == Some(&plugin)) {
-        plugins.push(OpenCodePlugin::Package(plugin));
-    }
+    config.ensure_plugin(plugin);
     Ok(serde_json::to_string(&config)?)
 }
 

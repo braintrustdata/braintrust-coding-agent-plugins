@@ -122,7 +122,7 @@ async fn next_evicted_event(
             .ok_or_else(|| anyhow::anyhow!("replay range ends inside a record"))?;
         anyhow::ensure!(entry.id <= through, "invalid replay end boundary");
         if let EventRecord::Event(redacted) = entry.record {
-            let mut env = journal::envelope_from_redacted(redacted);
+            let mut env = redacted.into_envelope();
             let Some(source) = daemon.translators.canonical_source(&env.source) else {
                 continue;
             };

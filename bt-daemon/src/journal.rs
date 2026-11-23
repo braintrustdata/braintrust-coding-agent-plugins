@@ -5,7 +5,7 @@
 //! Managed-run acceptance records remain separate so flush can discover
 //! pipelines after the daemon that accepted them has restarted or idle-exited.
 
-use crate::wire::{BackendAuth, Envelope, RedactedEnvelope, SessionRoute};
+use crate::wire::SessionRoute;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -187,39 +187,10 @@ pub async fn gc_old_managed_runs(data_dir: &Path, max_age: std::time::Duration) 
     }
 }
 
-/// Reconstruct a translator-usable [`Envelope`] from a redacted journal entry.
-/// The live token is gone (redacted), so `auth.token` is empty — fine for
-/// rebuilding translator state; the sink must be re-supplied live credentials
-/// if replay needs to actually deliver.
-pub fn envelope_from_redacted(r: RedactedEnvelope) -> Envelope {
-    let route = r.route;
-    let config = route.as_ref().map(|route| {
-        route.with_auth(BackendAuth {
-            token: String::new(),
-            api_url: None,
-            app_url: None,
-            org_name: route.auth.org_name.clone(),
-            org_id: None,
-        })
-    });
-    Envelope {
-        source: r.source,
-        source_version: r.source_version,
-        plugin_version: r.plugin_version,
-        session_id: r.session_id,
-        event: r.event,
-        ts_ms: r.ts_ms,
-        managed_run_id: r.managed_run_id,
-        capture: r.capture,
-        payload: r.payload,
-        route,
-        config,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::Envelope;
 
     #[test]
     fn pi_journaled_request_configuration_replays_unchanged() {

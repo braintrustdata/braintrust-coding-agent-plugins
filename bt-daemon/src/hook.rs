@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::args::HookArgs;
 use crate::client::{forward_envelope, HostInfo};
-use crate::route::apply_additional_metadata;
 use crate::wire::{self, Envelope, SessionRoute};
 use crate::{paths, settings};
 
@@ -287,7 +286,7 @@ async fn capture_hook(
     if route.destination.is_none() {
         anyhow::bail!("trace destination is not configured for {}", args.source);
     }
-    apply_additional_metadata(&mut route, args.additional_metadata.as_deref())?;
+    route.apply_additional_metadata(args.additional_metadata.as_deref())?;
     let mut env = build_hook_envelope(&args, route, payload, session_id, event);
     if let Some(context) = &managed_context {
         env.managed_run_id = Some(context.managed_run_id.clone());
