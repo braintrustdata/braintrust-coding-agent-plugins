@@ -1187,18 +1187,37 @@ async fn auth_resolution_failure_is_reported_without_exposing_credentials() {
     )
     .await
     .unwrap();
-    let status = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: Some("login-needed".into()),
+    // Status observes asynchronous processing without forcing a drain.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: Some("login-needed".into()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if status.sessions.iter().any(|s| {
+                s.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("select a profile explicitly"))
+            }) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("expected session state did not become visible");
     let status_error = status.sessions[0].last_error.as_deref().unwrap();
     assert!(status_error.contains("select a profile explicitly"));
     assert!(!status_error.contains("secret-"));
     assert!(
-        !journal_store::pending(&data_dir, "debug", "login-needed").is_empty(),
+        !journal_store::pending(&data_dir, "debug", "login-needed").is_empty()
+            || Inspector::session(&data_dir, "debug", "login-needed")
+                .unwrap()
+                .count(Table::Ops)
+                > 0,
         "capture must remain durable even when background auth fails"
     );
     {
@@ -1744,13 +1763,24 @@ async fn status_reports_sessions_and_filters_by_session_id() {
         .await
         .unwrap();
 
-    let all = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: None,
+    // Status observes asynchronous processing without forcing a drain.
+    let all = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let all = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if all.sessions.len() == 2 {
+                break all;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("expected session state did not become visible");
     assert_eq!(all.daemon_version, "test");
     assert_eq!(all.sessions.len(), 2);
 
@@ -1846,7 +1876,7 @@ async fn daemon_version_handover_only_moves_forward() {
 }
 
 #[tokio::test]
-async fn shutdown_drains_then_retries_late_capture_on_replacement() {
+async fn shutdown_acknowledges_then_drains_and_retries_late_capture_on_replacement() {
     let gate = Arc::new(tokio::sync::Notify::new());
     let emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (data_dir, socket, handle, _tmp) = start_gated_daemon(gate.clone(), emitted.clone()).await;
@@ -1876,13 +1906,18 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
     })
     .await
     .expect("daemon did not begin shutdown");
+    tokio::time::timeout(Duration::from_secs(1), shutdown_task)
+        .await
+        .expect("shutdown acknowledgement waited for the sink")
+        .unwrap()
+        .unwrap();
     assert!(
-        !shutdown_task.is_finished(),
-        "shutdown returned before the sink drained"
+        !handle.is_finished(),
+        "daemon exited before its sink drained"
     );
 
     let late_socket = socket.clone();
-    let late_event = tokio::spawn(async move {
+    let mut late_event = tokio::spawn(async move {
         forward_envelope(
             &envelope("drained-shutdown", "PostToolUse", 2),
             &late_socket,
@@ -1892,13 +1927,21 @@ async fn shutdown_drains_then_retries_late_capture_on_replacement() {
         .await
     });
 
-    shutdown_task.abort();
-    let _ = shutdown_task.await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut late_event)
+            .await
+            .is_err(),
+        "late capture must remain pending while the sink blocks handover"
+    );
     gate.notify_one();
     tokio::time::timeout(Duration::from_secs(5), handle)
         .await
-        .expect("daemon stayed alive after the shutdown client disconnected")
+        .expect("daemon stayed alive after its sink was released")
         .unwrap();
+    assert!(
+        emitted.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "shutdown must deliver captured output before the daemon exits"
+    );
     let replacement = start_daemon_at(data_dir.clone(), socket.clone()).await;
     late_event.await.unwrap().unwrap();
     shutdown(&socket).await;
@@ -4686,15 +4729,26 @@ async fn managed_run_flush_shares_one_budget_and_returns_pending_counts() {
             .await
             .unwrap();
     }
-    // Journal acknowledgement precedes actor creation. Observe the ingress
-    // barrier before measuring finalize's budget, so initialization is excluded.
-    let status = run_status(StatusArgs {
-        socket: Some(socket.clone()),
-        session_id: None,
+    // Journal acknowledgement precedes actor creation. Wait until all actors
+    // are visible before measuring finalize's budget, excluding initialization.
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = run_status(StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            if status.sessions.len() == 3 {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("managed sessions did not become visible");
     assert_eq!(status.sessions.len(), 3);
     // All three sinks remain blocked. The server must answer with diagnostics
     // within its shared budget, before the client's outer deadline expires.
