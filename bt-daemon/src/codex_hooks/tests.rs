@@ -53,3 +53,22 @@ async fn rpc_ignores_notifications_and_reports_unsupported_methods() {
         "hooks/list"
     );
 }
+
+#[test]
+fn config_read_tolerates_null_feature_flags() {
+    let read = |features: Value| {
+        serde_json::from_value::<ConfigRead>(json!({"config": {"features": features}}))
+            .unwrap()
+            .config
+            .hooks_enabled()
+    };
+    assert!(read(json!({"hooks": true, "network_proxy": null})));
+    assert!(read(json!({"hooks": null, "codex_hooks": null})));
+    assert!(read(json!({"network_proxy": {"enabled": true}})));
+    assert!(!read(json!({"hooks": false, "network_proxy": null})));
+    assert!(!read(json!({"hooks": true, "codex_hooks": false})));
+    assert!(serde_json::from_value::<ConfigRead>(json!({"config": {}}))
+        .unwrap()
+        .config
+        .hooks_enabled());
+}
