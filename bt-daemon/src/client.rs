@@ -540,6 +540,29 @@ pub(crate) async fn status_over(
         .await
 }
 
+/// Request shutdown directly, without waiting for a status snapshot.
+/// Missing and stale endpoints mean there is no daemon to stop.
+pub(crate) async fn stop_daemon(socket: &Path) -> anyhow::Result<bool> {
+    let stream = match connect(socket).await {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut conn = Conn::new(stream);
+    let response: wire::ShutdownResult = conn
+        .call(method::DAEMON_SHUTDOWN, serde_json::json!({}))
+        .await?;
+    anyhow::ensure!(response.ok, "tracing daemon refused shutdown");
+    Ok(true)
+}
+
 /// Request a graceful daemon shutdown. Primarily useful for lifecycle
 /// management and transport integration tests.
 pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
@@ -548,4 +571,41 @@ pub async fn shutdown_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
     conn.request(method::DAEMON_SHUTDOWN, serde_json::json!({}))
         .await?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod stop_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_preserves_shutdown_failures() {
+        for refused in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let line = BufReader::new(read)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request: Request = serde_json::from_str(&line).unwrap();
+                if refused {
+                    let response =
+                        Response::serialized(request.id, wire::ShutdownResult { ok: false });
+                    write
+                        .write_all(
+                            format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            assert!(stop_daemon(&socket).await.is_err());
+            peer.await.unwrap();
+        }
+    }
 }

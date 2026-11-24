@@ -12,10 +12,10 @@ use crate::wire::AuthSource;
 use crate::wire::{AuthSelection, SessionConfig, SessionRoute, TraceDestination};
 use crate::{
     braintrust_serve_options, paths, run_disable, run_enable, run_import, run_serve, run_status,
-    run_traced_with_host, shutdown_daemon, AuthDiagnostic, AuthLease, AuthProvider,
-    AuthResolveReason, BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput,
-    HostInfo, ImportTarget, OutputFormat, Registry, RunHookCommand, ServeOptions, StatusArgs,
-    TraceArgs, TraceCommandOutput,
+    run_traced_with_host, AuthDiagnostic, AuthLease, AuthProvider, AuthResolveReason,
+    BraintrustSinkConfig, DaemonDiagnostic, DaemonStatus, DoctorCommandOutput, HostInfo,
+    ImportTarget, OutputFormat, Registry, RunHookCommand, ServeOptions, TraceArgs,
+    TraceCommandOutput,
 };
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -888,15 +888,11 @@ pub async fn run_trace_with_matches(
         ),
         TraceCommand::Stop(stop_args) => {
             let socket = paths::socket_path(stop_args.socket.as_deref());
-            let status_args = StatusArgs {
-                socket: Some(socket.clone()),
-                session_id: None,
-            };
-            if run_status(status_args).await?.is_none() {
-                return print_output(TraceCommandOutput::stop(false, false), host.output_format);
-            }
-            shutdown_daemon(&socket).await?;
-            print_output(TraceCommandOutput::stop(true, true), host.output_format)
+            let stopped = crate::client::stop_daemon(&socket).await?;
+            print_output(
+                TraceCommandOutput::stop(stopped, stopped),
+                host.output_format,
+            )
         }
         TraceCommand::Import(import_args) => {
             let mut route = resolve_host_route(
@@ -2194,5 +2190,66 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_requests_shutdown_without_status() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let line = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: crate::wire::Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, crate::wire::method::DAEMON_SHUTDOWN);
+            let response = crate::wire::Response::serialized(
+                request.id,
+                crate::wire::ShutdownResult { ok: true },
+            );
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_trace(
+                TraceArgs {
+                    command: TraceCommand::Stop(StopArgs {
+                        socket: Some(socket),
+                    }),
+                },
+                test_host(Arc::new(PanicHost)),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        peer.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_accepts_stale_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("stale.sock");
+        drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        run_trace(
+            TraceArgs {
+                command: TraceCommand::Stop(StopArgs {
+                    socket: Some(socket),
+                }),
+            },
+            test_host(Arc::new(PanicHost)),
+        )
+        .await
+        .unwrap();
     }
 }
