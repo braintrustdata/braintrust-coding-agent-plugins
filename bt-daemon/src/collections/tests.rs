@@ -434,3 +434,30 @@ async fn compaction_returns_deleted_space_to_the_file_system() {
     assert_eq!(pragma("freelist_count"), 0);
     assert!(size() < bloated / 4, "{} of {bloated} bytes remain", size());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_legacy_open_preserves_capture() {
+    for qualified in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = if qualified {
+            source_journal_path(temp.path(), "debug", "session")
+        } else {
+            journal_path(temp.path(), "session")
+        };
+        let record = line(
+            &json!({"source":"debug","session_id":"session","event":"e","ts_ms":1,"payload":{}}),
+        );
+        write_legacy(&path, &record).await;
+        let outcomes = futures::future::join_all(
+            (0..16).map(|_| SessionStorage::open(temp.path(), "debug", "session")),
+        )
+        .await;
+        for storage in outcomes {
+            assert_eq!(
+                storage.unwrap().status().await.unwrap().event_tail,
+                record.len() as u64
+            );
+        }
+        assert!(!path.exists());
+    }
+}
