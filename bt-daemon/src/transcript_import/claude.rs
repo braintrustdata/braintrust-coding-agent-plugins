@@ -31,6 +31,7 @@ pub(super) struct Tail {
     completed_turns: usize,
     active_turn: Option<usize>,
     last_len: u64,
+    pending_background_stops: HashSet<String>,
 }
 
 impl TailSession for Tail {
@@ -59,6 +60,9 @@ impl TailSession for Tail {
         if events.len() < 2 {
             bail!("Claude import did not produce session boundary events");
         }
+        // A cold historical import already has the complete child transcript.
+        // During attach, async launch results are links, not completion events.
+        let attaching = !finalize || self.started;
         let mut out = Vec::new();
         if !self.started {
             out.push(events[0].clone());
@@ -81,9 +85,41 @@ impl TailSession for Tail {
             let start = turn_starts[turn];
             let end = turn_starts.get(turn + 1).copied().unwrap_or(middle.len());
             let skip = usize::from(self.active_turn == Some(turn));
-            out.extend(middle[start + skip..end].iter().cloned());
+            for event in &middle[start + skip..end] {
+                if attaching
+                    && event.event == "SubagentStop"
+                    && event
+                        .payload
+                        .get("_bt_import_background")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    if let Some(id) = string_at(&event.payload, "/agent_id") {
+                        self.pending_background_stops.insert(id);
+                        continue;
+                    }
+                }
+                out.push(event.clone());
+            }
             self.completed_turns += 1;
             self.active_turn = None;
+        }
+        let notifications = turn_starts
+            .iter()
+            .filter_map(|&index| {
+                crate::translate::claude_task_notification_id(
+                    middle[index].payload.get("prompt")?.as_str()?,
+                )
+            })
+            .collect::<HashSet<_>>();
+        for event in middle.iter().filter(|event| event.event == "SubagentStop") {
+            let Some(id) = event.payload.get("agent_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if (finalize || notifications.contains(id)) && self.pending_background_stops.remove(id)
+            {
+                out.push(event.clone());
+            }
         }
         if !finalize && turn_count > 0 {
             let active = turn_count - 1;
@@ -303,7 +339,8 @@ pub(super) fn envelopes(
                 "agent_type": subagent.agent_type,
                 "agent_transcript_path": subagent.path,
                 "_bt_import_parent_agent_id": subagent.parent_agent_id,
-                "_bt_import_parent_tool_id": subagent.parent_tool_id
+                "_bt_import_parent_tool_id": subagent.parent_tool_id,
+                "_bt_import_background": subagent.background
             });
             if !is_start {
                 payload["last_assistant_message"] = json!(subagent
@@ -372,6 +409,7 @@ struct Subagent {
     parent_agent_id: Option<String>,
     parent_tool_id: Option<String>,
     depth: usize,
+    background: bool,
 }
 
 fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
@@ -540,6 +578,10 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: None,
                 parent_tool_id: None,
                 depth: 0,
+                background: records[record_index]
+                    .pointer("/toolUseResult/status")
+                    .and_then(Value::as_str)
+                    == Some("async_launched"),
             })
         })
         .collect::<Vec<_>>();
@@ -656,6 +698,10 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: parent_id,
                 parent_tool_id,
                 depth,
+                background: records[record_index]
+                    .pointer("/toolUseResult/status")
+                    .and_then(Value::as_str)
+                    == Some("async_launched"),
             });
             linked.insert(agent_id.clone());
             added = true;

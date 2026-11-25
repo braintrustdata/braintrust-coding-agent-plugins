@@ -1771,4 +1771,52 @@ mod tests {
             vec!["Stop", "SessionEnd"]
         );
     }
+    #[test]
+    fn claude_attach_keeps_background_agent_open_until_its_final_records_arrive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-a.jsonl");
+        let child = temp.path().join("session-a/subagents/agent-child-a.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        let write = |path: &Path, records: &[Value]| {
+            std::fs::write(
+                path,
+                records
+                    .iter()
+                    .map(|record| format!("{record}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        write(
+            &path,
+            &[
+                json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
+                json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer"}}]}}),
+                json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","toolUseResult":{"agentId":"child-a","status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":"launched"}]}}),
+                json!({"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"content":"next prompt"}}),
+            ],
+        );
+        let started = json!({"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":"review"}});
+        write(&child, std::slice::from_ref(&started));
+
+        let mut tail = TranscriptTail::new(path, ImportSource::Claude);
+        let initial = tail.poll(false).unwrap();
+        assert!(initial.iter().any(|event| event.event == "SubagentStart"));
+        assert!(!initial.iter().any(|event| event.event == "SubagentStop"));
+        write(
+            &child,
+            &[
+                started,
+                json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"late","content":[{"type":"text","text":"reviewed"}]}}),
+            ],
+        );
+        let terminal = tail.poll(true).unwrap();
+        let stop = terminal
+            .iter()
+            .find(|event| event.event == "SubagentStop")
+            .unwrap();
+        assert_eq!(stop.payload["last_assistant_message"], "reviewed");
+        assert_eq!(stop.ts_ms, 1_767_225_606_000);
+    }
+
 }

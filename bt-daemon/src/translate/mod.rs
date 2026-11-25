@@ -22,7 +22,7 @@ mod muse;
 mod opencode;
 mod opencode_v2;
 mod pi;
-pub(crate) use claude::{cli_fork_history, successful_subagent_handback_message, CliForkHistory};
+pub(crate) use claude::{cli_fork_history, successful_subagent_handback_message, task_notification_id as claude_task_notification_id, CliForkHistory};
 pub(crate) use pi::request_config as pi_request_config;
 mod origins;
 pub(crate) mod recent;

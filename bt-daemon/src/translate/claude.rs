@@ -1729,7 +1729,7 @@ fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
     Some(("agent_message", id))
 }
 
-fn task_notification_id(prompt: &str) -> Option<&str> {
+pub(crate) fn task_notification_id(prompt: &str) -> Option<&str> {
     let body = prompt
         .trim()
         .strip_prefix("<task-notification>")?
