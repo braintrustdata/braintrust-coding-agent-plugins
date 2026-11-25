@@ -28,6 +28,7 @@ use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use transcript_envelope::TranscriptEnvelope;
 use transcript_tool::TranscriptTool;
+use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
@@ -721,7 +722,11 @@ impl ClaudeTranslator {
         let call_id = self.call_id(event);
         self.pending_nested_spawns.remove(&call_id);
         let input = tool_input(&event.payload);
-        let output = tool_output(&event.payload);
+        let output = tool_output(&event.payload).or_else(|| {
+            (approval == ToolApproval::Denied && event.event == "PostToolUseFailure")
+                .then(|| event.payload.get("error").cloned())
+                .flatten()
+        });
         let error = (approval != ToolApproval::Denied)
             .then(|| forced_error.or_else(|| tool_error(&event.payload)))
             .flatten();
@@ -1194,6 +1199,7 @@ impl ClaudeTranslator {
         };
         self.session_status = Some(outcome.to_string());
         let error = (!interrupted).then_some(error).flatten();
+        self.recover_pending_denials(&turn_id, event.ts_ms, ops);
         self.emit_main(&turn_id, ops);
         self.close_pending_tools(
             &turn_id,
@@ -1226,6 +1232,64 @@ impl ClaudeTranslator {
         self.last_user_turn_id = turn.user_turn_id;
         self.last_turn_id = Some(turn_id);
         self.requested_skills.clear();
+    }
+
+    fn recover_pending_denials(&mut self, turn_id: &str, end_ms: i64, ops: &mut Vec<SpanOp>) {
+        #[derive(Deserialize)]
+        struct ResultBlock<'a> {
+            #[serde(rename = "type")]
+            kind: &'a str,
+            tool_use_id: &'a str,
+        }
+
+        if self.pending_tools.is_empty() {
+            return;
+        }
+        let Some(cursor) = self
+            .main_transcript
+            .as_ref()
+            .and_then(|path| self.transcripts.get(path))
+        else {
+            return;
+        };
+        for record in &cursor.buffered {
+            let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
+                continue;
+            };
+            for block in blocks {
+                let Ok(result) = ResultBlock::deserialize(block) else {
+                    continue;
+                };
+                if result.kind != "tool_result"
+                    || !self
+                        .pending_tools
+                        .get(result.tool_use_id)
+                        .is_some_and(|tool| tool.parent_id == turn_id)
+                    || !matches!(
+                        TranscriptToolOutcome::from_result(block, record),
+                        TranscriptToolOutcome::Denied
+                    )
+                {
+                    continue;
+                }
+                let Some(tool) = self.pending_tools.remove(result.tool_use_id) else {
+                    continue;
+                };
+                self.pending_nested_spawns.remove(result.tool_use_id);
+                self.emitted_tools.insert(result.tool_use_id.to_owned());
+                let mut metadata = tool.metadata.as_object().cloned().unwrap_or_default();
+                add_tool_approval(&mut metadata, Some(ToolApproval::Denied));
+                ops.push(SpanOp::Merge(SpanRow {
+                    span_id: tool.span_id,
+                    root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![tool.parent_id],
+                    end_ms: Some(parse_timestamp_ms(record).unwrap_or(end_ms)),
+                    output: block.get("content").cloned(),
+                    metadata: Some(Value::Object(metadata)),
+                    ..Default::default()
+                }));
+            }
+        }
     }
 
     fn close_pending_tools(
@@ -1418,12 +1482,16 @@ impl AgentTranslator for ClaudeTranslator {
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
             "PreToolUse" => self.pre_tool(event, &mut ops),
             "PostToolUse" => self.finish_tool(event, ToolApproval::Approved, None, &mut ops),
-            "PostToolUseFailure" => self.finish_tool(
-                event,
-                ToolApproval::Approved,
-                tool_failure_text(&event.payload).or_else(|| Some("Tool execution failed".into())),
-                &mut ops,
-            ),
+            "PostToolUseFailure" => {
+                let error = tool_failure_text(&event.payload)
+                    .or_else(|| Some("Tool execution failed".into()));
+                let approval = if event.payload.get("error").is_some_and(is_permission_denial) {
+                    ToolApproval::Denied
+                } else {
+                    ToolApproval::Approved
+                };
+                self.finish_tool(event, approval, error, &mut ops);
+            }
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
             "PostCompact" => {
                 let turn_span_id = self

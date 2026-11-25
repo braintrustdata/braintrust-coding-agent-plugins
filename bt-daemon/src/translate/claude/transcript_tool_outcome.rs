@@ -25,23 +25,7 @@ impl TranscriptToolOutcome {
         let structured_denial = values
             .iter()
             .any(|value| has_structured_outcome(value, &["denied", "deny", "rejected", "reject"]));
-        let denial_text = values.iter().any(|value| {
-            (has_outcome_phrase(value, &["permission to use"])
-                && has_outcome_phrase(value, &["has been denied"]))
-                || has_outcome_phrase(
-                    value,
-                    &[
-                        "tool use was rejected",
-                        "tool use was denied",
-                        "user rejected",
-                        "user denied",
-                        "user doesn't want to proceed",
-                        "user does not want to proceed",
-                        "permission request was rejected",
-                        "permission request was denied",
-                    ],
-                )
-        });
+        let denial_text = values.iter().any(|value| is_permission_denial(value));
         if structured_denial || (error_signalled && denial_text) {
             return TranscriptToolOutcome::Denied;
         }
@@ -124,4 +108,25 @@ fn has_outcome_phrase(value: &Value, phrases: &[&str]) -> bool {
             .any(|value| has_outcome_phrase(value, phrases)),
         _ => false,
     }
+}
+
+pub(super) fn is_permission_denial(value: &Value) -> bool {
+    (has_outcome_phrase(value, &["permission to use"])
+        && has_outcome_phrase(value, &["has been denied"]))
+        || has_outcome_phrase(
+            value,
+            &[
+                "tool use was rejected",
+                "tool use was denied",
+                "user rejected",
+                "user denied",
+                "user doesn't want to proceed",
+                "user does not want to proceed",
+                "permission request was rejected",
+                "permission request was denied",
+                "but you haven't granted it yet",
+                "denied by the claude code auto mode classifier",
+                "denied by a built-in claude code safety check",
+            ],
+        )
 }
