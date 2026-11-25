@@ -27,7 +27,14 @@ fn shell_tool_call(request: &OpenAiRequest, call_id: &str, command: &str) -> Ope
         .into_iter()
         .find(|name| names.contains(name))
         .unwrap_or_else(|| {
-            panic!("agent offered no supported shell tool; offered tools: {names:?}")
+            // Include the raw request shape: an empty list can mean the agent
+            // sent no tools or that it changed how tools are encoded.
+            let keys: Vec<_> = request.body.as_object().into_iter().flatten().map(|(key, _)| key).collect();
+            let tools = request.body.get("tools").map(Value::to_string).unwrap_or_default();
+            panic!(
+                "agent offered no supported shell tool; offered tools: {names:?}; request keys: {keys:?}; tools: {}",
+                &tools[..tools.len().min(2000)]
+            )
         });
     let arguments = match name {
         "exec_command" => json!({"cmd": command, "login": false}),
@@ -386,6 +393,9 @@ async fn pi_session_emits_traces() {
                 .mock_inference(inference_server.uri()),
         )
         .await;
+    // Trace-delivery failures panic without the agent's own output; print it
+    // so CI shows what Pi reported (shown with --nocapture).
+    eprintln!("Pi output:\n{}", output.text());
     output.assert_success();
     if world.uses_mock_inference() {
         output.assert_contains("PI_MOCK_OK");

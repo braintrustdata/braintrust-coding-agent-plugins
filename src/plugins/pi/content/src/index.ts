@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import * as piTui from "@earendil-works/pi-tui";
 import { loadConfig } from "./config.ts";
 import { legacyContinuationFor, type LegacyContinuation } from "./legacy-session.ts";
 import { runningPiPackage } from "./pi-package.ts";
@@ -18,15 +17,37 @@ const TRACE_LINK_POLL_TIMEOUT_MS = 40_000;
 const PI_VERSION = runningPiPackage().version;
 const PI_HOST_NAME = runningPiPackage().name;
 
-/**
- * Oh My Pi resolves this package to its own pi-tui, which exports neither
- * helper. A named import would fail to link and OMP would silently drop the
- * extension, so read them from the namespace and fall back to plain text.
- */
-function terminalHyperlink(text: string, url: string): string | undefined {
-  const { getCapabilities, hyperlink } = piTui as Partial<typeof piTui>;
-  if (typeof getCapabilities !== "function" || typeof hyperlink !== "function") return undefined;
-  return getCapabilities().hyperlinks ? hyperlink(text, url) : undefined;
+// Oh My Pi 19.2+ refuses to load an extension whose source names upstream
+// pi-tui, even in a literal dynamic import, and its own pi-tui has no link
+// helpers. Other hosts load it through a computed specifier; keep it computed
+// (src/plugins/pi/validate.sh rejects a literal in the build).
+const PI_TUI_PACKAGE = ["@earendil-works", "pi-tui"].join("/");
+const OH_MY_PI_PACKAGE = "@oh-my-pi/pi-coding-agent";
+
+interface HyperlinkHelpers {
+  getCapabilities(): { hyperlinks?: boolean };
+  hyperlink(text: string, url: string): string;
+}
+
+async function loadHyperlinkHelpers(): Promise<HyperlinkHelpers | undefined> {
+  if (runningPiPackage().name === OH_MY_PI_PACKAGE) return undefined;
+  try {
+    const { getCapabilities, hyperlink } = (await import(
+      PI_TUI_PACKAGE
+    )) as Partial<HyperlinkHelpers>;
+    if (typeof getCapabilities !== "function" || typeof hyperlink !== "function") return undefined;
+    return { getCapabilities, hyperlink };
+  } catch {
+    return undefined;
+  }
+}
+
+function terminalHyperlink(
+  helpers: HyperlinkHelpers | undefined,
+  text: string,
+  url: string,
+): string | undefined {
+  return helpers?.getCapabilities().hyperlinks ? helpers.hyperlink(text, url) : undefined;
 }
 
 function sessionKeyFor(
@@ -95,6 +116,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
   let traceLinkShown = false;
   let traceLinkPollGeneration: number | undefined;
   let traceLinkPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let hyperlinkHelpers: Promise<HyperlinkHelpers | undefined> | undefined;
   const client = new DaemonClient({
     source: "pi",
     pluginVersion: EXTENSION_VERSION,
@@ -139,7 +161,10 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     if (!ctx.hasUI || !config.showUi || !sessionId) return;
     const refreshGeneration = uiGeneration;
     const refreshSessionId = sessionId;
-    const status = await statusClient.status(refreshSessionId);
+    const [status, links] = await Promise.all([
+      statusClient.status(refreshSessionId),
+      config.showTraceLink ? (hyperlinkHelpers ??= loadHyperlinkHelpers()) : undefined,
+    ]);
     if (uiGeneration !== refreshGeneration || sessionId !== refreshSessionId) return;
     const daemonSession = status?.sessions.find(
       (session) => session.session_id === refreshSessionId,
@@ -151,7 +176,7 @@ export default function braintrustPiExtension(pi: ExtensionAPI): void {
     } else {
       ctx.ui.setStatus(
         STATUS_KEY,
-        (permalink && terminalHyperlink(traceLabel, permalink)) || "Braintrust: connected",
+        (permalink && terminalHyperlink(links, traceLabel, permalink)) || "Braintrust: connected",
       );
     }
     traceLinkShown = Boolean(permalink);
