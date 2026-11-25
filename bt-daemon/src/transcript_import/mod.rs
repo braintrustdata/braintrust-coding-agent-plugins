@@ -1818,5 +1818,4 @@ mod tests {
         assert_eq!(stop.payload["last_assistant_message"], "reviewed");
         assert_eq!(stop.ts_ms, 1_767_225_606_000);
     }
-
 }

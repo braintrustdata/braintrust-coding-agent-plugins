@@ -18,12 +18,13 @@ mod tool_completion_hook;
 mod transcript_envelope;
 mod transcript_tool;
 mod transcript_tool_outcome;
+mod user_prompt_hook;
 
 use hook_context::HookContext;
 use llm_call::LlmCall;
 use message_history::MessageHistory;
 use parsed_transcript::ParsedTranscript;
-use subagent_hook::SubagentHook;
+pub(crate) use subagent_hook::SubagentHook;
 #[cfg(test)]
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
@@ -32,6 +33,7 @@ use transcript_envelope::TranscriptEnvelope;
 pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
 use transcript_tool::TranscriptTool;
 use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
+pub(crate) use user_prompt_hook::UserPromptHook;
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
@@ -1717,7 +1719,7 @@ fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
             return (!id.is_empty()).then_some(("agent_message", id));
         }
     }
-    let prompt = payload.get("prompt")?.as_str()?.trim();
+    let prompt = UserPromptHook::deserialize(payload).ok()?.text()?.trim();
     if let Some(id) = task_notification_id(prompt) {
         return Some(("task_notification", id));
     }

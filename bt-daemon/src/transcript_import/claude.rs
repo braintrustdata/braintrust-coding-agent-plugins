@@ -3,9 +3,11 @@ use super::{
     string_at, timestamp_bounds, timestamp_ms, validate_session_id, IncrementalRecords,
     TailSession, TranscriptImport, TranscriptLayout,
 };
+use crate::translate::{claude_task_notification_id, ClaudeSubagentHook, ClaudeUserPromptHook};
 use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
 use anyhow::bail;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -86,17 +88,12 @@ impl TailSession for Tail {
             let end = turn_starts.get(turn + 1).copied().unwrap_or(middle.len());
             let skip = usize::from(self.active_turn == Some(turn));
             for event in &middle[start + skip..end] {
-                if attaching
-                    && event.event == "SubagentStop"
-                    && event
-                        .payload
-                        .get("_bt_import_background")
-                        .and_then(Value::as_bool)
-                        == Some(true)
-                {
-                    if let Some(id) = string_at(&event.payload, "/agent_id") {
-                        self.pending_background_stops.insert(id);
-                        continue;
+                if attaching && event.event == "SubagentStop" {
+                    if let Ok(hook) = ClaudeSubagentHook::deserialize(&event.payload) {
+                        if hook.import_background {
+                            self.pending_background_stops.insert(hook.agent_id);
+                            continue;
+                        }
                     }
                 }
                 out.push(event.clone());
@@ -107,15 +104,15 @@ impl TailSession for Tail {
         let notifications = turn_starts
             .iter()
             .filter_map(|&index| {
-                crate::translate::claude_task_notification_id(
-                    middle[index].payload.get("prompt")?.as_str()?,
-                )
+                let hook = ClaudeUserPromptHook::deserialize(&middle[index].payload).ok()?;
+                claude_task_notification_id(hook.text()?)
             })
             .collect::<HashSet<_>>();
         for event in middle.iter().filter(|event| event.event == "SubagentStop") {
-            let Some(id) = event.payload.get("agent_id").and_then(Value::as_str) else {
+            let Ok(hook) = ClaudeSubagentHook::deserialize(&event.payload) else {
                 continue;
             };
+            let id = hook.agent_id.as_str();
             if (finalize || notifications.contains(id)) && self.pending_background_stops.remove(id)
             {
                 out.push(event.clone());
