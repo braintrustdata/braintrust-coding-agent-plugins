@@ -5,7 +5,7 @@ use super::{
 };
 use crate::translate::{
     claude_task_notification_id, is_background_agent_launch, ClaudeSubagentHook,
-    ClaudeUserPromptHook,
+    ClaudeTranscriptEnvelope, ClaudeUserPromptHook,
 };
 use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
@@ -360,8 +360,9 @@ pub(super) fn envelopes(
         let error = if segment
             .iter()
             .rev()
-            .take_while(|record| record.get("type").and_then(Value::as_str) != Some("assistant"))
-            .any(is_interrupt_record)
+            .filter_map(|record| ClaudeTranscriptEnvelope::deserialize(record).ok())
+            .take_while(|record| !record.is_assistant())
+            .any(|record| record.is_interrupt())
         {
             Some("Request interrupted by user".to_owned())
         } else {
@@ -737,69 +738,8 @@ fn import_envelope(
     )
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UserRecord {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    #[serde(default)]
-    is_compact_summary: bool,
-    #[serde(default)]
-    is_meta: bool,
-    #[serde(default)]
-    queue_transcript_only: bool,
-}
-
-fn user_text(record: &Value) -> Option<&str> {
-    let content = record.pointer("/message/content")?;
-    content.as_str().or_else(|| {
-        let [block] = content.as_array()?.as_slice() else {
-            return None;
-        };
-        (block.get("type")?.as_str()? == "text")
-            .then(|| block.get("text")?.as_str())
-            .flatten()
-    })
-}
-
-fn is_interrupt_record(record: &Value) -> bool {
-    record.get("type").and_then(Value::as_str) == Some("user")
-        && matches!(
-            user_text(record).map(str::trim),
-            Some("[Request interrupted by user]" | "[Request interrupted by user for tool use]")
-        )
-}
-
 fn is_real_user(record: &Value) -> bool {
-    let Ok(user) = UserRecord::deserialize(record) else {
-        return false;
-    };
-    if user.kind.as_deref() != Some("user")
-        || user.is_compact_summary
-        || user.is_meta
-        || user.queue_transcript_only
-        || is_interrupt_record(record)
-        || user_text(record).is_some_and(|text| {
-            [
-                "<local-command-caveat>",
-                "<command-name>",
-                "<local-command-stdout>",
-                "<local-command-stderr>",
-            ]
-            .iter()
-            .any(|tag| text.trim_start().starts_with(tag))
-        })
-    {
-        return false;
-    }
-    !record
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
+    ClaudeTranscriptEnvelope::deserialize(record).is_ok_and(|row| row.is_import_turn_start())
 }
 
 fn last_assistant_text(records: &[Value]) -> Option<Value> {

@@ -33,7 +33,7 @@ use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use tool_completion_hook::ToolCompletionHook;
 use transcript_content::TranscriptContent;
-use transcript_envelope::TranscriptEnvelope;
+pub(crate) use transcript_envelope::TranscriptEnvelope;
 pub(crate) use transcript_envelope::{
     cli_fork_history, is_background_agent_launch, CliForkHistory,
 };

@@ -25,7 +25,8 @@ mod pi;
 pub(crate) use claude::{
     cli_fork_history, is_background_agent_launch, successful_subagent_handback_message,
     task_notification_id as claude_task_notification_id, CliForkHistory,
-    SubagentHook as ClaudeSubagentHook, UserPromptHook as ClaudeUserPromptHook,
+    SubagentHook as ClaudeSubagentHook, TranscriptEnvelope as ClaudeTranscriptEnvelope,
+    UserPromptHook as ClaudeUserPromptHook,
 };
 pub(crate) use pi::request_config as pi_request_config;
 mod origins;
