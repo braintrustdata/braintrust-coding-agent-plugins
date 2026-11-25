@@ -1,17 +1,23 @@
 use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Deserialize)]
 pub(super) struct Config {
-    // Codex feature values are not all booleans (e.g. `network_proxy: null`),
-    // so only the hook toggles are interpreted and everything else is ignored.
-    #[serde(default)]
-    features: Value,
+    features: Option<Features>,
+}
+
+/// Only the hook toggles are modeled. Serde skips every other feature entry,
+/// whose values are not all booleans (Codex 0.172.0 reports
+/// `network_proxy: null`).
+#[derive(Deserialize)]
+struct Features {
+    hooks: Option<bool>,
+    codex_hooks: Option<bool>,
 }
 
 impl Config {
     pub(super) fn hooks_enabled(&self) -> bool {
-        let disabled = |key| self.features.get(key) == Some(&Value::Bool(false));
-        !disabled("hooks") && !disabled("codex_hooks")
+        self.features.as_ref().is_none_or(|features| {
+            features.hooks != Some(false) && features.codex_hooks != Some(false)
+        })
     }
 }

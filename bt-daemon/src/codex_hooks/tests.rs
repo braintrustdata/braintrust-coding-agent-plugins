@@ -55,29 +55,26 @@ async fn rpc_ignores_notifications_and_reports_unsupported_methods() {
 }
 
 #[test]
-fn config_read_accepts_non_boolean_feature_values() {
-    let read: ConfigRead = serde_json::from_value(json!({
-        "config": {"features": {"network_proxy": null, "other": {"nested": 1}, "hooks": true}}
-    }))
-    .unwrap();
-    assert!(read.config.hooks_enabled());
-    for features in [json!(null), json!({})] {
-        let read: ConfigRead =
-            serde_json::from_value(json!({"config": {"features": features}})).unwrap();
-        assert!(read.config.hooks_enabled());
-    }
-    let read: ConfigRead = serde_json::from_value(json!({"config": {}})).unwrap();
-    assert!(read.config.hooks_enabled());
-}
-
-#[test]
-fn config_read_respects_disabled_hook_features() {
-    for key in ["hooks", "codex_hooks"] {
-        let read: ConfigRead = serde_json::from_value(json!({
-            "config": {"features": {"network_proxy": null, key: false}}
-        }))
-        .unwrap();
-        assert!(!read.config.hooks_enabled(), "{key}");
+fn config_read_ignores_unrelated_features_and_honors_hook_toggles() {
+    // Codex 0.172.0 reports `network_proxy: null` even for a default config.
+    for (config, enabled) in [
+        (
+            json!({"features": {"network_proxy": null, "other": {"nested": 1}}}),
+            true,
+        ),
+        (json!({"features": null}), true),
+        (json!({}), true),
+        (
+            json!({"features": {"network_proxy": null, "hooks": false}}),
+            false,
+        ),
+        (
+            json!({"features": {"network_proxy": null, "codex_hooks": false}}),
+            false,
+        ),
+    ] {
+        let read: ConfigRead = serde_json::from_value(json!({"config": config})).unwrap();
+        assert_eq!(read.config.hooks_enabled(), enabled, "{config}");
     }
 }
 

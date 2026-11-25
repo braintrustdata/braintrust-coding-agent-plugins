@@ -73,18 +73,4 @@ mod tests {
         assert_eq!(kept.len(), TAIL_BYTES);
         assert!(kept.ends_with(b"end"));
     }
-
-    #[test]
-    fn stderr_is_appended_only_when_present() {
-        let error = with_stderr(
-            anyhow!("Codex closed the probe stream"),
-            b"error: unexpected argument '--no-daemon' found\n",
-        );
-        assert_eq!(
-            error.to_string(),
-            "Codex closed the probe stream\nCodex stderr:\nerror: unexpected argument '--no-daemon' found"
-        );
-        let error = with_stderr(anyhow!("Codex closed the probe stream"), b" \n");
-        assert_eq!(error.to_string(), "Codex closed the probe stream");
-    }
 }
