@@ -440,6 +440,12 @@ jobs:
         run: cargo build --manifest-path bt-daemon/Cargo.toml --all-features --locked
       - name: Test daemon
         run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked
+      # `bt trace install/update codex` activation against the latest Codex,
+      # in an isolated CODEX_HOME. Needs no credentials.
+      - name: Check Codex hook activation contract
+        env:
+          CODEX_BIN: ${{ runner.temp }}/coding-agents/node_modules/.bin/codex${{ matrix.agent_suffix }}
+        run: cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --lib -- --ignored --exact codex_hooks::tests::activation_succeeds_against_real_codex
       - name: Test coding-agent integrations with deterministic inference
         env:
           BT_AGENT_INFERENCE_MODE: mock

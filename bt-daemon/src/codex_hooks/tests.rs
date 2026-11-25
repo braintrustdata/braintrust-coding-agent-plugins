@@ -101,3 +101,36 @@ async fn probe_failures_include_codex_stderr() {
         "{error}"
     );
 }
+
+/// Contract test against a real Codex binary: setup must fully activate the
+/// packaged hooks in an isolated home. This exercises every app-server call
+/// setup makes, so protocol drift (e.g. Codex 0.172.0 reporting
+/// `features.network_proxy = null`) fails CI instead of user setups.
+#[tokio::test]
+#[ignore = "requires the Codex CLI (CODEX_BIN or codex on PATH)"]
+async fn activation_succeeds_against_real_codex() {
+    let program = std::env::var_os("CODEX_BIN").unwrap_or_else(|| "codex".into());
+    let home = tempfile::tempdir().unwrap();
+    let codex = || {
+        let mut command = crate::subprocess::background_command(&program);
+        command.env("CODEX_HOME", home.path());
+        command
+    };
+    let marketplace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("src/plugins/codex/content");
+    let marketplace = marketplace.to_str().unwrap();
+    for args in [
+        ["plugin", "marketplace", "add", marketplace].as_slice(),
+        &["plugin", "add", PLUGIN],
+    ] {
+        let output = codex().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "codex {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    activate_with(codex()).await.unwrap();
+}

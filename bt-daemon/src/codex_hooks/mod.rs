@@ -50,9 +50,14 @@ use transport::request;
 use trust_state::TrustState;
 
 pub(crate) async fn activate() -> anyhow::Result<()> {
+    activate_with(crate::subprocess::background_command("codex")).await
+}
+
+/// Takes the Codex command so the real-Codex contract test can isolate
+/// `CODEX_HOME` and select `CODEX_BIN`.
+async fn activate_with(command: std::process::Command) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut command: tokio::process::Command =
-        crate::subprocess::background_command("codex").into();
+    let mut command: tokio::process::Command = command.into();
     command
         .args(["--no-daemon", "app-server", "--stdio"])
         .current_dir(&cwd)
