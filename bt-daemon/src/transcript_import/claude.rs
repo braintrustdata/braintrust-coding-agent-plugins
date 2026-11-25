@@ -357,7 +357,16 @@ pub(super) fn envelopes(
                 record_end_offsets[record_index],
             ));
         }
-        let error = last_assistant_error(segment);
+        let error = if segment
+            .iter()
+            .rev()
+            .take_while(|record| record.get("type").and_then(Value::as_str) != Some("assistant"))
+            .any(is_interrupt_record)
+        {
+            Some("Request interrupted by user".to_owned())
+        } else {
+            last_assistant_error(segment)
+        };
         let stop_event = if error.is_some() {
             "StopFailure"
         } else {
@@ -728,11 +737,59 @@ fn import_envelope(
     )
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserRecord {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    is_compact_summary: bool,
+    #[serde(default)]
+    is_meta: bool,
+    #[serde(default)]
+    queue_transcript_only: bool,
+}
+
+fn user_text(record: &Value) -> Option<&str> {
+    let content = record.pointer("/message/content")?;
+    content.as_str().or_else(|| {
+        let [block] = content.as_array()?.as_slice() else {
+            return None;
+        };
+        (block.get("type")?.as_str()? == "text")
+            .then(|| block.get("text")?.as_str())
+            .flatten()
+    })
+}
+
+fn is_interrupt_record(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("user")
+        && matches!(
+            user_text(record).map(str::trim),
+            Some("[Request interrupted by user]" | "[Request interrupted by user for tool use]")
+        )
+}
+
 fn is_real_user(record: &Value) -> bool {
-    if record.get("type").and_then(Value::as_str) != Some("user") {
+    let Ok(user) = UserRecord::deserialize(record) else {
         return false;
-    }
-    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    };
+    if user.kind.as_deref() != Some("user")
+        || user.is_compact_summary
+        || user.is_meta
+        || user.queue_transcript_only
+        || is_interrupt_record(record)
+        || user_text(record).is_some_and(|text| {
+            [
+                "<local-command-caveat>",
+                "<command-name>",
+                "<local-command-stdout>",
+                "<local-command-stderr>",
+            ]
+            .iter()
+            .any(|tag| text.trim_start().starts_with(tag))
+        })
+    {
         return false;
     }
     !record
