@@ -5,6 +5,7 @@
 //! Record IDs grow by each record's encoded size, so IDs imported from a legacy
 //! NDJSON journal keep their original byte boundaries and input budgets still
 //! measure bytes. Removal never renumbers later records.
+use super::event_history;
 use super::store::{read_batch, Json, One, SessionStorage, NOW_MS};
 use crate::pipeline::input::{PipelineControl, SourcePosition};
 use crate::wire::RedactedEnvelope;
@@ -123,7 +124,7 @@ impl SessionStorage {
                 return Ok(None);
             }
             let Some((digest, mut identity)) = capture else {
-                return insert(tx, stored).map(Some);
+                return insert(tx, tail, stored, None).map(Some);
             };
             if tx.execute(
                 &format!("INSERT OR IGNORE INTO captured(digest,at_ms) VALUES(?,{NOW_MS})"),
@@ -137,7 +138,13 @@ impl SessionStorage {
             if let Some(Json(previous)) = previous {
                 retain_references(&mut identity, &previous);
             }
-            let appended = insert(tx, stored)?;
+            let delta = match &mut record {
+                EventRecord::Event(event) => {
+                    event_history::encode(tx, tail, event, stored.value.len())?
+                }
+                EventRecord::Control(_) => None,
+            };
+            let appended = insert(tx, tail, stored, delta)?;
             tx.execute(
                 "UPDATE session SET identity=? WHERE id=1",
                 [Json(&identity)],
@@ -255,22 +262,30 @@ pub(super) fn identity(event: &RedactedEnvelope) -> RedactedEnvelope {
     identity
 }
 
-fn insert(tx: &rusqlite::Transaction<'_>, stored: Stored) -> anyhow::Result<SourcePosition> {
-    let before: u64 = tx.one("SELECT event_tail FROM session WHERE id=1", [])?;
+fn insert(
+    tx: &rusqlite::Transaction<'_>,
+    before: u64,
+    stored: Stored,
+    delta: Option<Vec<u8>>,
+) -> anyhow::Result<SourcePosition> {
     let through = before
         .checked_add(stored.value.len() as u64 + 1)
         .filter(|id| *id <= i64::MAX as u64)
         .ok_or_else(|| anyhow::anyhow!("event ID overflow"))?;
+    let (value, base) = match delta {
+        Some(value) => (value, Some(before)),
+        None => (stored.value, None),
+    };
     tx.execute(
-        "INSERT INTO events(id,control,value) VALUES(?,?,?)",
-        params![through, stored.control, stored.value],
+        "INSERT INTO events(id,control,value,base) VALUES(?,?,?,?)",
+        params![through, stored.control, value, base],
     )?;
     tx.execute("UPDATE session SET event_tail=? WHERE id=1", [through])?;
     super::store::touch(tx)?;
     Ok(SourcePosition { before, through })
 }
 
-type Batch = VecDeque<(u64, serde_json::Result<EventRecord>)>;
+type Batch = VecDeque<(u64, anyhow::Result<EventRecord>)>;
 
 /// An ordered stream of the event records in a range, fetched in batches.
 /// It ends at the end of the range; [`extend`](Self::extend) lets it
@@ -311,7 +326,7 @@ impl EventReader {
                 .run(move |db| {
                     read_batch(
                         db,
-                        "SELECT id,control,value FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
+                        "SELECT id,control,value,base FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?",
                         params![after, through, READ_RECORDS],
                         READ_BYTES,
                         std::time::Duration::MAX,
@@ -320,8 +335,17 @@ impl EventReader {
                                 control: row.get(1)?,
                                 value: row.get(2)?,
                             };
-                            let size = stored.value.len();
-                            Ok((size, (row.get(0)?, EventRecord::try_from(&stored))))
+                            let id = row.get(0)?;
+                            let base = row.get(3)?;
+                            let (size, record) = if let Some(base) = base {
+                                match event_history::decode(db, id, base, &stored.value) {
+                                    Ok((event, size)) => (size, Ok(EventRecord::Event(event))),
+                                    Err(error) => (stored.value.len(), Err(error)),
+                                }
+                            } else {
+                                (stored.value.len(), EventRecord::try_from(&stored).map_err(Into::into))
+                            };
+                            Ok((size, (id, record)))
                         },
                     )
                 })
@@ -361,7 +385,7 @@ impl Stream for EventReader {
                 // Leave the position at the last good record, so a retry
                 // reads the undecodable record again.
                 this.buffer.clear();
-                Err(anyhow::Error::new(error).context(format!("event record {id}")))
+                Err(error.context(format!("event record {id}")))
             }
         }))
     }

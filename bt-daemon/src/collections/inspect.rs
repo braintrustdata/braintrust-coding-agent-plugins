@@ -94,14 +94,33 @@ impl Inspector {
 
     /// Event records awaiting translation, decoded as JSON.
     pub fn events(&self) -> Vec<Value> {
-        let Ok(mut query) = self.0.prepare("SELECT value FROM events ORDER BY id") else {
+        let Ok(mut query) = self
+            .0
+            .prepare("SELECT id,value,base FROM events ORDER BY id")
+        else {
             return Vec::new();
         };
-        let Ok(rows) = query.query_map([], |r| r.get::<_, Vec<u8>>(0)) else {
+        let Ok(rows) = query.query_map([], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Option<u64>>(2)?,
+            ))
+        }) else {
             return Vec::new();
         };
-        rows.filter_map(|row| serde_json::from_slice(&row.ok()?).ok())
-            .collect()
+        rows.filter_map(|row| {
+            let (id, value, base) = row.ok()?;
+            match base {
+                Some(base) => {
+                    let (event, _) =
+                        super::event_history::decode(&self.0, id, base, &value).ok()?;
+                    serde_json::to_value(event).ok()
+                }
+                None => serde_json::from_slice(&value).ok(),
+            }
+        })
+        .collect()
     }
 
     /// Encoded SpanOp records in publication order.

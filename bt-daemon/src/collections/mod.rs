@@ -6,6 +6,7 @@
 //! Translation transfers events to SpanOps in one transaction; each route
 //! removes SpanOps from its view once the backend accepts them. Storage of a
 //! session that has met every obligation is deleted.
+mod event_history;
 mod events;
 #[cfg(any(test, feature = "test-support"))]
 pub mod inspect;

@@ -23,6 +23,7 @@ mod correlation;
 mod daemon_log;
 mod dispatch;
 mod env;
+mod history;
 mod hook;
 mod hook_executable;
 mod ids;
