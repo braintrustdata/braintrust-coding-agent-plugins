@@ -344,7 +344,7 @@ pub(super) fn envelopes(
             });
             if !is_start {
                 payload["last_assistant_message"] = json!(subagent
-                    .handback_message
+                    .reported_output
                     .clone()
                     .or_else(|| subagent.last_assistant_message.clone()));
             }
@@ -415,7 +415,7 @@ struct Subagent {
     start_ms: i64,
     end_ms: i64,
     last_assistant_message: Option<Value>,
-    handback_message: Option<Value>,
+    reported_output: Option<Value>,
     parent_agent_id: Option<String>,
     parent_tool_id: Option<String>,
     depth: usize,
@@ -582,7 +582,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 start_ms,
                 end_ms,
                 last_assistant_message: last_assistant_text(&subagent_records),
-                handback_message: crate::translate::successful_subagent_handback_message(
+                reported_output: crate::translate::successful_subagent_handback_message(
                     &subagent_records,
                 ),
                 parent_agent_id: None,
@@ -699,9 +699,12 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 start_ms: *child_start,
                 end_ms: child_end,
                 last_assistant_message: last_assistant_text(child_records),
-                handback_message: crate::translate::successful_subagent_handback_message(
-                    child_records,
-                ),
+                reported_output: parent_tool_id
+                    .as_ref()
+                    .and_then(|_| crate::translate::successful_workflow_output(child_records))
+                    .or_else(|| {
+                        crate::translate::successful_subagent_handback_message(child_records)
+                    }),
                 parent_agent_id: parent_id,
                 parent_tool_id,
                 depth,
