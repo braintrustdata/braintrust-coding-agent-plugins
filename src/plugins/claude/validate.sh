@@ -76,7 +76,7 @@ assert cursor['hooks'] == {'version': 1, 'hooks': {}}
 
 expected_events = {
     "PermissionDenied", "PostCompact", "PostToolUse", "PostToolUseFailure",
-    "PreToolUse", "SessionEnd", "SessionStart", "Stop", "StopFailure",
+    "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "StopFailure",
     "SubagentStart", "SubagentStop", "UserPromptExpansion", "UserPromptSubmit",
 }
 assert set(hooks) == expected_events
