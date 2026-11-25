@@ -633,6 +633,19 @@ async fn importing_claude_nested_and_workflow_agents_preserves_parentage() {
         .find(|row| row.get("name").and_then(Value::as_str) == Some("Workflow"))
         .unwrap();
     assert_eq!(worker["parent_span_ids"][0], workflow_tool["span_id"]);
+    let latest_end = |id: &Value| {
+        rows.iter()
+            .filter_map(|op| op.get("Insert").or_else(|| op.get("Merge")))
+            .filter(|row| &row["span_id"] == id)
+            .filter_map(|row| row["end_ms"].as_i64())
+            .next_back()
+            .unwrap()
+    };
+    assert_eq!(
+        latest_end(&workflow_tool["span_id"]),
+        latest_end(&worker["span_id"])
+    );
+
     assert_eq!(inserted(&rows, "llm"), 6);
 }
 
