@@ -11,12 +11,14 @@
 use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
 use crate::wire::{SessionConfig, TraceDestination};
-use braintrust_api_client::backend::{extensions::AttachmentRequest, HttpError};
+use braintrust_api_client::backend::{
+    extensions::{AttachmentRequest, AttachmentUploadStatus},
+    BackendClient, HttpError,
+};
 use braintrust_sdk_rust::{
     BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
     SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
-use reqwest13 as reqwest;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
@@ -191,24 +193,8 @@ impl Creds {
 /// Only completed keys are retained, never attachment bytes. This bounded
 /// optimization may miss after eviction or restart; check conflicts with the API.
 struct AttachmentUploads {
-    backend: braintrust_api_client::backend::BackendClient,
+    backend: BackendClient,
     completed: crate::translate::recent::RecentSet<String>,
-    lookup: Option<reqwest::Client>,
-}
-
-#[derive(Deserialize)]
-struct AttachmentMetadata {
-    status: AttachmentUploadStatus,
-    #[serde(rename = "contentLength")]
-    content_length: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "upload_status", rename_all = "snake_case")]
-enum AttachmentUploadStatus {
-    Done,
-    #[serde(other)]
-    Incomplete,
 }
 
 #[derive(Deserialize)]
@@ -218,16 +204,10 @@ struct AttachmentConflict {
 }
 
 impl AttachmentUploads {
-    async fn upload(
-        &mut self,
-        request: &AttachmentRequest,
-        data: &[u8],
-        api: &str,
-        token: &str,
-    ) -> anyhow::Result<()> {
+    async fn upload(&mut self, request: &AttachmentRequest, data: &[u8]) -> anyhow::Result<()> {
         if let Err(error) = self.backend.upload_attachment(request, data.to_vec()).await {
             let duplicate = error.downcast_ref::<HttpError>().is_some_and(|http| {
-                http.status == reqwest::StatusCode::CONFLICT
+                http.status.as_u16() == 409
                     && serde_json::from_str::<AttachmentConflict>(&http.body)
                         .is_ok_and(|body| body.message.starts_with("Attachment key already exists"))
             });
@@ -237,31 +217,9 @@ impl AttachmentUploads {
 
             // A key is reserved before the object is uploaded. Require both
             // a completed status and an object of the expected size.
-            if self.lookup.is_none() {
-                let mut builder = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .redirect(reqwest::redirect::Policy::none());
-                if let Some(pem) = crate::env::var("BRAINTRUST_CUSTOM_CA_BUNDLE") {
-                    for certificate in reqwest::Certificate::from_pem_bundle(pem.as_bytes())? {
-                        builder = builder.add_root_certificate(certificate);
-                    }
-                }
-                self.lookup = Some(builder.build()?);
-            }
-            let Some(client) = &self.lookup else {
-                return Err(error);
-            };
-            let metadata: AttachmentMetadata = client
-                .get(format!("{}/attachment", api.trim_end_matches('/')))
-                .bearer_auth(token)
-                .query(request)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let metadata = self.backend.get_attachment(request).await?;
             if !matches!(metadata.status, AttachmentUploadStatus::Done)
-                || metadata.content_length != Some(data.len())
+                || metadata.content_length != Some(data.len() as u64)
             {
                 return Err(error);
             }
@@ -456,7 +414,7 @@ impl BraintrustSink {
                 .ok_or_else(|| anyhow::anyhow!("missing attachment backend"))?;
             if self.attachment_uploads.is_none() {
                 self.attachment_uploads = Some(AttachmentUploads {
-                    backend: braintrust_api_client::backend::BackendClient::new(
+                    backend: BackendClient::new(
                         api,
                         app,
                         &creds.token,
@@ -465,7 +423,6 @@ impl BraintrustSink {
                         concat!("bt-daemon/", env!("CARGO_PKG_VERSION")),
                     )?,
                     completed: Default::default(),
-                    lookup: None,
                 });
             }
             let uploads = self
@@ -491,8 +448,6 @@ impl BraintrustSink {
                                 creds.org_id.clone(),
                             ),
                             &attachment.data,
-                            api,
-                            &creds.token,
                         )
                         .await?;
                 }

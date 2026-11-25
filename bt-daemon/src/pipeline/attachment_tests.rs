@@ -11,7 +11,7 @@ use crate::{
     wire::{Envelope, SessionConfig},
 };
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn event(source: &str, name: &str, ts: i64, payload: Value) -> Envelope {
@@ -66,8 +66,14 @@ async fn upload_sessions(
             .await;
         Mock::given(method("GET"))
             .and(path("/attachment"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(query_param("content_type", "image/png"))
+            .and(query_param("org_id", "org"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "status":{"upload_status":status},"contentLength":11
+                "status":{"upload_status":status},
+                "contentLength":11,
+                "downloadUrl":format!("{storage_url}/download"),
+                "embedUrl":format!("{storage_url}/embed")
             })))
             .expect(1)
             .mount(&server)

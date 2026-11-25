@@ -274,7 +274,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cb231d5785987a3143361cc846227f3ac758ba74#cb231d5785987a3143361cc846227f3ac758ba74"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=1c03a8b0739d4de0a985ca350b24e4e52a3a2f8a#1c03a8b0739d4de0a985ca350b24e4e52a3a2f8a"
 dependencies = [
  "anyhow",
  "backoff",
@@ -349,7 +349,6 @@ dependencies = [
  "parking_lot",
  "regex",
  "reqwest 0.12.28",
- "reqwest 0.13.5",
  "rquickjs",
  "rquickjs-serde",
  "rusqlite",
