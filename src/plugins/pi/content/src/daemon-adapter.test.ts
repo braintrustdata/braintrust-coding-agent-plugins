@@ -17,18 +17,12 @@ const mockState = vi.hoisted(() => ({
   permalink: "https://www.braintrust.dev/trace/1" as string | undefined,
 }));
 
-vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
-  const original = await importOriginal<typeof import("@earendil-works/pi-tui")>();
-  return {
-    ...original,
-    get getCapabilities() {
-      return mockState.ompTui ? undefined : () => ({ hyperlinks: mockState.hyperlinks });
-    },
-    get hyperlink() {
-      return mockState.ompTui ? undefined : original.hyperlink;
-    },
-  };
-});
+vi.mock("./pi-tui.ts", () => ({
+  loadPiHyperlinkHelpers: async () =>
+    mockState.ompTui
+      ? {}
+      : { getCapabilities: () => ({ hyperlinks: mockState.hyperlinks }), hyperlink },
+}));
 
 vi.mock("./runtime/daemon-client.ts", () => ({
   claimManagedTracingInstance: () => mockState.claim,

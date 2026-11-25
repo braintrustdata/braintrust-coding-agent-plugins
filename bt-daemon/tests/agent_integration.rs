@@ -368,6 +368,13 @@ async fn pi_session_emits_traces() {
         if request.has_function_output("call_pi_1") {
             return MockReply::response(OpenAiTurn::text("PI_MOCK_OK"));
         }
+        // Oh My Pi sends auxiliary requests without tools to the same
+        // provider before the actual prompt. Only drive the shell turn when
+        // tools are offered. The assertions below still require the tool
+        // call, its result, and their delivered trace.
+        if request.tool_names().is_empty() {
+            return MockReply::response(OpenAiTurn::text("Integration test"));
+        }
         MockReply::response(shell_tool_call(
             &request,
             "call_pi_1",
