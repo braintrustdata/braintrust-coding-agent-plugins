@@ -22,9 +22,18 @@ considering setup complete.
 - Keep generated hook definitions stable when the agent uses definition-based
   trust, and preserve the agent's normal review boundary.
 - Provide a reversible disable or uninstall path.
+- When setup talks to the agent's own API or protocol (for example Codex's
+  app-server), report the underlying error and the agent's stderr, not only a
+  generic setup failure.
 
 ## Verify completion
 
 Test setup in an isolated home and configuration tree, including first install,
 repeat setup, route changes, existing unrelated configuration, disablement,
 missing dependencies, and a real agent launch using the installed adapter.
+
+If setup calls the agent's API or protocol, add a credential-free contract test
+that runs that setup path against the real agent in an isolated home, and run it
+in CI against the latest agent release. Agent releases can break setup without
+any change on our side. See
+`codex_hooks::tests::activation_succeeds_against_real_codex`.
