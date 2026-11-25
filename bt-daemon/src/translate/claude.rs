@@ -16,6 +16,7 @@ mod parsed_transcript;
 mod subagent_hook;
 mod timestamp_envelope;
 mod tool_completion_hook;
+mod transcript_content;
 mod transcript_envelope;
 mod transcript_tool;
 mod transcript_tool_outcome;
@@ -31,6 +32,7 @@ pub(crate) use subagent_hook::SubagentHook;
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use tool_completion_hook::ToolCompletionHook;
+use transcript_content::TranscriptContent;
 use transcript_envelope::TranscriptEnvelope;
 pub(crate) use transcript_envelope::{
     cli_fork_history, is_background_agent_launch, CliForkHistory,
@@ -82,7 +84,7 @@ struct Turn {
 #[derive(Serialize, Deserialize)]
 struct PendingPrompt {
     turn_id: Arc<String>,
-    content: Value,
+    content: TranscriptContent,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -376,7 +378,7 @@ impl ClaudeTranslator {
         )
     }
 
-    fn open_turn(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+    fn open_turn(&mut self, event: &Envelope, prompt: UserPromptHook, ops: &mut Vec<SpanOp>) {
         self.session_status = Some("running".into());
         if let Some(old) = self.turn.take() {
             self.close_pending_tools(
@@ -395,7 +397,8 @@ impl ClaudeTranslator {
                 ..Default::default()
             }));
         }
-        let continuation = continuation_origin(&event.payload);
+        let text = prompt.prompt.as_ref().and_then(TranscriptContent::as_text);
+        let continuation = continuation_origin(&event.payload, prompt.text());
         let (id, parent_id, user_turn_id, name) = if let Some((_, task_id)) = continuation {
             self.continuation_count += 1;
             let owner = self
@@ -431,7 +434,7 @@ impl ClaudeTranslator {
         // as directly as a `/x` slash command. Continuations are runtime
         // notifications, not user requests.
         if continuation.is_none() {
-            if let Some(prompt) = event.payload.get("prompt").and_then(Value::as_str) {
+            if let Some(prompt) = text {
                 for name in prompt_skill_names(prompt) {
                     push_unique(&mut self.requested_skills, name);
                 }
@@ -462,7 +465,7 @@ impl ClaudeTranslator {
             span_type: SpanType::Task,
             is_turn: true,
             start_ms: Some(event.ts_ms),
-            input: event.payload.get("prompt").cloned(),
+            input: (!prompt.prompt.is_missing()).then(|| json!(prompt.prompt)),
             metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
             turn_span_id: Some(owner.clone()),
             ..Default::default()
@@ -475,14 +478,12 @@ impl ClaudeTranslator {
             self.prompt_turns
                 .insert(prompt_id.to_owned(), turn_id.clone());
         }
-        if let Some(content) = event.payload.get("prompt").filter(|value| !value.is_null()) {
+        if let crate::json::Field::Value(content) = prompt.prompt {
             if self.pending_prompts.len() == RECENT_ID_CAPACITY {
                 self.pending_prompts.pop_front();
             }
-            self.pending_prompts.push_back(PendingPrompt {
-                turn_id,
-                content: content.clone(),
-            });
+            self.pending_prompts
+                .push_back(PendingPrompt { turn_id, content });
         }
         self.turn = Some(Turn {
             id,
@@ -1032,7 +1033,11 @@ impl ClaudeTranslator {
     // Hooks carry prompt_id only after the first user input, and older Claude
     // versions omit it. Without it, match prompts in submission order, then
     // retain transcript identities so repeats cannot consume another turn.
-    fn user_record_turn(&mut self, record: &Value) -> Option<Arc<String>> {
+    fn user_record_turn(
+        &mut self,
+        record: &Value,
+        row: &TranscriptEnvelope,
+    ) -> Option<Arc<String>> {
         let prompt_id = record.get("promptId").and_then(Value::as_str);
         let mut owner = prompt_id
             .and_then(|id| self.prompt_turns.get(id))
@@ -1047,9 +1052,8 @@ impl ClaudeTranslator {
             if let Some(owner) = &owner {
                 &pending.turn_id == owner
             } else {
-                record
-                    .pointer("/message/content")
-                    .is_some_and(|content| prompt_matches(&pending.content, content))
+                row.content()
+                    .is_some_and(|content| content.matches_prompt(&pending.content))
             }
         }) {
             owner = self
@@ -1068,12 +1072,13 @@ impl ClaudeTranslator {
     // each user record before propagating its owner through record ancestry.
     fn observe_record_turns(&mut self, records: &[Value], ops: &mut Vec<SpanOp>) {
         for record in records {
-            let user_prompt = is_real_user_record(record)
-                && record.get("queueTranscriptOnly").and_then(Value::as_bool) != Some(true);
-            if user_prompt {
-                self.main_record_turn = self.user_record_turn(record);
+            let user_prompt = TranscriptEnvelope::deserialize(record)
+                .ok()
+                .filter(|row| row.is_user_prompt() && !row.queue_transcript_only);
+            if let Some(row) = &user_prompt {
+                self.main_record_turn = self.user_record_turn(record, row);
             }
-            let owner = if user_prompt {
+            let owner = if user_prompt.is_some() {
                 self.main_record_turn.clone()
             } else {
                 record
@@ -1084,10 +1089,11 @@ impl ClaudeTranslator {
                     .or_else(|| self.main_record_turn.clone())
             };
             let Some(owner) = owner else { continue };
-            if user_prompt {
-                if let Some(content) = record
-                    .pointer("/message/content")
-                    .filter(|content| crate::attachments::contains(content))
+            if let Some(row) = user_prompt {
+                if let Some(content) = row
+                    .content()
+                    .map(|content| json!(content))
+                    .filter(crate::attachments::contains)
                 {
                     let identity =
                         self.turn_identities
@@ -1104,7 +1110,7 @@ impl ClaudeTranslator {
                             span_id: owner.to_string(),
                             root_span_id,
                             parent_span_ids: vec![parent_id],
-                            input: Some(content.clone()),
+                            input: Some(content),
                             turn_span_id: self.owner_of(owner.as_str()),
                             ..Default::default()
                         }));
@@ -1195,7 +1201,7 @@ impl ClaudeTranslator {
         }
     }
 
-    fn flush_previous_turn_rows(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+    fn flush_previous_turn_rows(&mut self, prompt: &UserPromptHook, ops: &mut Vec<SpanOp>) {
         let previous = self.turn.as_ref().map_or_else(
             || {
                 self.last_turn_id
@@ -1213,13 +1219,15 @@ impl ClaudeTranslator {
         let split = if self.turn.is_some() {
             // The replacement hook can run before its prompt is written. In
             // that case all bytes observed by this hook belong to the old turn.
-            event.payload.get("prompt").and_then(|prompt| {
+            prompt.prompt.as_ref().and_then(|prompt| {
                 cursor.buffered.iter().rposition(|record| {
-                    is_real_user_record(record)
-                        && record.get("queueTranscriptOnly").and_then(Value::as_bool) != Some(true)
-                        && record
-                            .pointer("/message/content")
-                            .is_some_and(|content| prompt_matches(prompt, content))
+                    TranscriptEnvelope::deserialize(record).is_ok_and(|row| {
+                        row.is_user_prompt()
+                            && !row.queue_transcript_only
+                            && row
+                                .content()
+                                .is_some_and(|content| content.matches_prompt(prompt))
+                    })
                 })
             })
         } else {
@@ -1520,9 +1528,10 @@ impl AgentTranslator for ClaudeTranslator {
                 }
             }
             "UserPromptSubmit" => {
-                self.flush_previous_turn_rows(event, &mut ops);
+                let prompt = UserPromptHook::deserialize(&event.payload).unwrap_or_default();
+                self.flush_previous_turn_rows(&prompt, &mut ops);
                 event_op_start = ops.len();
-                self.open_turn(event, &mut ops);
+                self.open_turn(event, prompt, &mut ops);
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
             "PreToolUse" => self.pre_tool(event, &mut ops),
@@ -1742,7 +1751,10 @@ pub(crate) fn successful_subagent_handback_message(records: &[Value]) -> Option<
         .and_then(|tool| tool.handback_message())
 }
 
-fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
+fn continuation_origin<'a>(
+    payload: &'a Value,
+    prompt: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
     if let Some(origin) = payload.get("origin") {
         if origin.get("kind").and_then(Value::as_str) == Some("peer")
             && origin.get("handback").and_then(Value::as_bool) == Some(true)
@@ -1754,7 +1766,7 @@ fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
             return (!id.is_empty()).then_some(("agent_message", id));
         }
     }
-    let prompt = UserPromptHook::deserialize(payload).ok()?.text()?.trim();
+    let prompt = prompt?.trim();
     if let Some(id) = task_notification_id(prompt) {
         return Some(("task_notification", id));
     }
@@ -1777,49 +1789,10 @@ pub(crate) fn task_notification_id(prompt: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-fn prompt_matches(prompt: &Value, content: &Value) -> bool {
-    if prompt == content {
-        return true;
-    }
-    let (Some(mut remaining), Some(blocks)) = (prompt.as_str(), content.as_array()) else {
-        return false;
-    };
-    // Native hooks use a string, while transcripts may wrap the same prompt
-    // in text blocks alongside images. Compare without allocating a joined copy.
-    let mut has_text = false;
-    for text in blocks.iter().filter_map(|block| {
-        (block.get("type").and_then(Value::as_str) == Some("text"))
-            .then(|| block.get("text").and_then(Value::as_str))
-            .flatten()
-    }) {
-        has_text = true;
-        let Some(rest) = remaining.strip_prefix(text) else {
-            return false;
-        };
-        remaining = rest;
-    }
-    remaining.is_empty() && (has_text || crate::attachments::contains(content))
+fn is_real_user_record(record: &Value) -> bool {
+    TranscriptEnvelope::deserialize(record).is_ok_and(|row| row.is_user_prompt())
 }
 
-fn is_real_user_record(record: &Value) -> bool {
-    let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
-        return false;
-    };
-    if envelope.kind.as_deref() != Some("user") {
-        return false;
-    }
-    if envelope.is_compact_summary {
-        return false;
-    }
-    !record
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
-}
 /// Read newline-delimited records forward from `offset`, advancing it past
 /// everything consumed.
 ///

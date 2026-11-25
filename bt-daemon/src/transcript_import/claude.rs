@@ -108,7 +108,7 @@ impl TailSession for Tail {
             .iter()
             .filter_map(|&index| {
                 let hook = ClaudeUserPromptHook::deserialize(&middle[index].payload).ok()?;
-                claude_task_notification_id(hook.text()?)
+                claude_task_notification_id(hook.text()?).map(str::to_owned)
             })
             .collect::<HashSet<_>>();
         for event in middle.iter().filter(|event| event.event == "SubagentStop") {
