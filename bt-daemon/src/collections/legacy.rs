@@ -22,6 +22,10 @@ const IMPORT_RECORDS: usize = 1024;
 const IMPORT_BYTES: usize = 8 * 1024 * 1024;
 const PI_MESSAGES_DELTA: &str = "_bt_messages_delta";
 
+// Recovery and live capture can both discover a legacy journal. Serialize
+// reading, committing and removing those files. Modern sessions bypass this.
+static IMPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Import any legacy journals that hold records for this source session.
 pub(super) async fn import_session(
     data_dir: &Path,
@@ -30,14 +34,19 @@ pub(super) async fn import_session(
     events: &SessionStorage,
 ) -> anyhow::Result<()> {
     let unqualified = journal_path(data_dir, session_id);
-    if unqualified
+    let unqualified_supported = unqualified
         .file_name()
-        .is_some_and(|name| name.len() <= crate::journal::MAX_FILE_NAME_BYTES)
-        && tokio::fs::try_exists(&unqualified).await?
+        .is_some_and(|name| name.len() <= crate::journal::MAX_FILE_NAME_BYTES);
+    let qualified = source_journal_path(data_dir, source, session_id);
+    if !(unqualified_supported && tokio::fs::try_exists(&unqualified).await?)
+        && !tokio::fs::try_exists(&qualified).await?
     {
+        return Ok(());
+    }
+    let _guard = IMPORT_LOCK.lock().await;
+    if unqualified_supported && tokio::fs::try_exists(&unqualified).await? {
         import_unqualified(data_dir, &unqualified).await?;
     }
-    let qualified = source_journal_path(data_dir, source, session_id);
     if tokio::fs::try_exists(&qualified).await? {
         import_file(&qualified, source, events, None).await?;
         tokio::fs::remove_file(&qualified).await?;
@@ -57,11 +66,18 @@ pub(crate) async fn import_all(data_dir: &Path) {
             continue;
         }
         let result = async {
-            let owners = sessions(&path).await?;
-            if owners.is_empty() {
-                // Nothing was ever acknowledged from a file without events.
-                tokio::fs::remove_file(&path).await?;
-            }
+            let owners = {
+                let _guard = IMPORT_LOCK.lock().await;
+                if !tokio::fs::try_exists(&path).await? {
+                    return Ok(());
+                }
+                let owners = sessions(&path).await?;
+                if owners.is_empty() {
+                    // Nothing was ever acknowledged from a file without events.
+                    tokio::fs::remove_file(&path).await?;
+                }
+                owners
+            };
             for (source, session_id) in owners {
                 SessionStorage::open(data_dir, &source, &session_id).await?;
             }
