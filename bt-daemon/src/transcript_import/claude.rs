@@ -766,18 +766,18 @@ fn last_assistant_text(records: &[Value]) -> Option<Value> {
 }
 
 fn last_assistant_error(records: &[Value]) -> Option<String> {
-    records.iter().rev().find_map(|record| {
-        if record.get("type").and_then(Value::as_str) != Some("assistant")
-            || record.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true)
-        {
-            return None;
-        }
-        string_at(record, "/error")
-            .or_else(|| {
-                last_assistant_text(std::slice::from_ref(record))?
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .or_else(|| Some("Claude API error".into()))
-    })
+    let record = records
+        .iter()
+        .rev()
+        .find(|record| record.get("type").and_then(Value::as_str) == Some("assistant"))?;
+    if record.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    string_at(record, "/error")
+        .or_else(|| {
+            last_assistant_text(std::slice::from_ref(record))?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .or_else(|| Some("Claude API error".into()))
 }
