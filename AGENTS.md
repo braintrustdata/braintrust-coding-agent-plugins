@@ -56,8 +56,8 @@ explicitly when introducing shared types.
 For responses and configuration owned by an external agent, model only the
 fields we read, as optional typed fields, and let Serde skip the rest. Never
 decode an agent-owned open-ended collection into a closed type such as
-`BTreeMap<String, bool>`: one new value shape in an agent release then fails the
-whole response (Codex 0.172.0 added `features.network_proxy = null`).
+`BTreeMap<String, bool>`: a single new key or value type in an agent release,
+such as a `null`, then fails the whole response.
 
 Put shared schema interpretation, validated lookup, lossless edits, and common
 projections on the type that owns those rules. Keep filesystem, credential,
