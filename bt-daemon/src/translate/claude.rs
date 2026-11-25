@@ -1235,13 +1235,6 @@ impl ClaudeTranslator {
     }
 
     fn recover_pending_denials(&mut self, turn_id: &str, end_ms: i64, ops: &mut Vec<SpanOp>) {
-        #[derive(Deserialize)]
-        struct ResultBlock<'a> {
-            #[serde(rename = "type")]
-            kind: &'a str,
-            tool_use_id: &'a str,
-        }
-
         if self.pending_tools.is_empty() {
             return;
         }
@@ -1253,30 +1246,29 @@ impl ClaudeTranslator {
             return;
         };
         for record in &cursor.buffered {
-            let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
+            let Ok(row) = TranscriptEnvelope::deserialize(record) else {
                 continue;
             };
-            for block in blocks {
-                let Ok(result) = ResultBlock::deserialize(block) else {
+            for result in row.tool_results() {
+                let Some(call_id) = result.tool_use_id.as_deref() else {
                     continue;
                 };
-                if result.kind != "tool_result"
-                    || !self
-                        .pending_tools
-                        .get(result.tool_use_id)
-                        .is_some_and(|tool| tool.parent_id == turn_id)
+                if !self
+                    .pending_tools
+                    .get(call_id)
+                    .is_some_and(|tool| tool.parent_id == turn_id)
                     || !matches!(
-                        TranscriptToolOutcome::from_result(block, record),
+                        TranscriptToolOutcome::from_result(result, row.tool_use_result.as_ref()),
                         TranscriptToolOutcome::Denied
                     )
                 {
                     continue;
                 }
-                let Some(tool) = self.pending_tools.remove(result.tool_use_id) else {
+                let Some(tool) = self.pending_tools.remove(call_id) else {
                     continue;
                 };
-                self.pending_nested_spawns.remove(result.tool_use_id);
-                self.emitted_tools.insert(result.tool_use_id.to_owned());
+                self.pending_nested_spawns.remove(call_id);
+                self.emitted_tools.insert(call_id.to_owned());
                 let mut metadata = tool.metadata.as_object().cloned().unwrap_or_default();
                 add_tool_approval(&mut metadata, Some(ToolApproval::Denied));
                 ops.push(SpanOp::Merge(SpanRow {
@@ -1284,7 +1276,7 @@ impl ClaudeTranslator {
                     root_span_id: self.root_span_id.clone(),
                     parent_span_ids: vec![tool.parent_id],
                     end_ms: Some(parse_timestamp_ms(record).unwrap_or(end_ms)),
-                    output: block.get("content").cloned(),
+                    output: result.content().cloned(),
                     metadata: Some(Value::Object(metadata)),
                     ..Default::default()
                 }));
