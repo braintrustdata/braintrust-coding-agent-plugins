@@ -1593,6 +1593,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_fork_attach_waits_for_the_forks_own_prompt() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fork.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"queue-operation\",\"sessionId\":\"fork\",\"operation\":\"enqueue\",\"timestamp\":\"2026-01-01T00:00:10Z\"}\n",
+                "{\"type\":\"user\",\"sessionId\":\"fork\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"content\":\"old one\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"fork\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"content\":\"old answer one\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"fork\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"content\":\"old two\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"fork\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"content\":\"old answer two\"}}\n",
+            ),
+        )
+        .unwrap();
+        let append_line = |record: Value| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
+        };
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Claude);
+        let copied = tail.poll(false).unwrap();
+        append_line(
+            json!({"type":"user","sessionId":"fork","timestamp":"2026-01-01T00:00:11Z","message":{"content":"new question"}}),
+        );
+        let active = tail.poll(false).unwrap();
+        append_line(
+            json!({"type":"assistant","sessionId":"fork","timestamp":"2026-01-01T00:00:12Z","message":{"content":"new answer"}}),
+        );
+        let finalized = tail.poll(true).unwrap();
+        assert_eq!(
+            finalized
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["Stop", "SessionEnd"],
+        );
+        assert!(copied.is_empty());
+        assert_eq!(
+            active
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["SessionStart", "UserPromptSubmit", "ImportCheckpoint"],
+        );
+    }
+
+    #[test]
     fn claude_cli_fork_keeps_copied_work_as_context_in_import_and_live_translation() {
         use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
 

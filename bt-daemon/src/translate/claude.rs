@@ -26,8 +26,8 @@ use subagent_hook::SubagentHook;
 #[cfg(test)]
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
-pub(crate) use transcript_envelope::cli_fork_history_end;
 use transcript_envelope::TranscriptEnvelope;
+pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
 use transcript_tool::TranscriptTool;
 
 use super::git::GitMetadataCache;
@@ -309,13 +309,16 @@ impl ClaudeTranslator {
             return;
         };
         let cursor = self.transcripts.entry(path.clone()).or_default();
-        let rows = read_event_records(event, &path, &mut cursor.offset);
+        let Ok(fields) = TranscriptPayload::decode(&event.payload) else {
+            return;
+        };
+        let rows = read_records_for_payload(event.ts_ms, &fields, &path, &mut cursor.offset);
         if self.claude_version.is_none() {
             self.claude_version = rows.iter().find_map(|row| string_field(row, "version"));
         }
         cursor.buffered.extend(rows);
-        if event.payload.get("_bt_import_through_offset").is_none() && self.last_turn_id.is_none() {
-            if let Some(end) = cli_fork_history_end(&cursor.buffered) {
+        if fields.import_through_offset.is_none() && self.last_turn_id.is_none() {
+            if let CliForkHistory::EndsAt(end) = cli_fork_history(&cursor.buffered) {
                 let remainder = cursor.buffered.split_off(end);
                 let history = std::mem::replace(&mut cursor.buffered, remainder);
                 self.main_history = std::mem::take(&mut self.main_history)
@@ -1822,6 +1825,15 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
     let Ok(fields) = TranscriptPayload::decode(&event.payload) else {
         return Vec::new();
     };
+    read_records_for_payload(event.ts_ms, &fields, path, offset)
+}
+
+fn read_records_for_payload(
+    event_ts_ms: i64,
+    fields: &TranscriptPayload,
+    path: &str,
+    offset: &mut u64,
+) -> Vec<Value> {
     let import_through_offset = fields.import_through_offset;
     if let Some(mirrors) = &fields.claude_mirrors {
         // This marker records even an absent/unreadable file. Never replace a
@@ -1847,7 +1859,7 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
             // are interchangeable between them. An import offset is the
             // tighter bound when present.
             let through = import_through_offset.unwrap_or(through);
-            let cutoff = import_through_offset.is_none().then_some(event.ts_ms);
+            let cutoff = import_through_offset.is_none().then_some(event_ts_ms);
             if std::fs::metadata(mirror_path).is_ok() {
                 return read_file_bounded(mirror_path, offset, cutoff, Some(through));
             }
@@ -1860,10 +1872,10 @@ fn read_event_records(event: &Envelope, path: &str, offset: &mut u64) -> Vec<Val
         (Some(contents), through @ Some(_)) => {
             read_snapshot_bounded(contents, offset, None, through)
         }
-        (Some(contents), None) => read_snapshot_bounded(contents, offset, Some(event.ts_ms), None),
+        (Some(contents), None) => read_snapshot_bounded(contents, offset, Some(event_ts_ms), None),
         (None, through @ Some(_)) => read_file_bounded(path, offset, None, through),
         (None, None) if fields.replay == Some(true) => Vec::new(),
-        (None, None) => read_file_bounded(path, offset, Some(event.ts_ms), None),
+        (None, None) => read_file_bounded(path, offset, Some(event_ts_ms), None),
     }
 }
 

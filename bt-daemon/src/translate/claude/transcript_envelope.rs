@@ -23,9 +23,15 @@ pub(super) enum QueueOperation {
     Other,
 }
 
+pub(crate) enum CliForkHistory {
+    Absent,
+    AwaitingPrompt,
+    EndsAt(usize),
+}
+
 /// CLI forks stamp copied records with their own session ID. Claude queues the
 /// new prompt before writing that copied history, retaining its old timestamps.
-pub(crate) fn cli_fork_history_end(records: &[Value]) -> Option<usize> {
+pub(crate) fn cli_fork_history(records: &[Value]) -> CliForkHistory {
     let mut queued_at = None;
     let mut copied_assistant = false;
     for (index, record) in records.iter().enumerate() {
@@ -40,20 +46,30 @@ pub(crate) fn cli_fork_history_end(records: &[Value]) -> Option<usize> {
             }
             Some("user") if matches!((queued_at, parse_timestamp_ms(record)), (Some(queue), Some(user)) if user >= queue) =>
             {
-                return copied_assistant.then_some(index);
+                return if copied_assistant {
+                    CliForkHistory::EndsAt(index)
+                } else {
+                    CliForkHistory::Absent
+                };
             }
-            Some("user") if queued_at.is_none() => return None,
+            Some("user") if queued_at.is_none() || parse_timestamp_ms(record).is_none() => {
+                return CliForkHistory::Absent;
+            }
             Some("assistant") => {
                 let (Some(queue), Some(assistant)) = (queued_at, parse_timestamp_ms(record)) else {
-                    return None;
+                    return CliForkHistory::Absent;
                 };
                 if assistant >= queue {
-                    return None;
+                    return CliForkHistory::Absent;
                 }
                 copied_assistant = true;
             }
             _ => {}
         }
     }
-    None
+    if queued_at.is_some() {
+        CliForkHistory::AwaitingPrompt
+    } else {
+        CliForkHistory::Absent
+    }
 }

@@ -3,6 +3,7 @@ use super::{
     string_at, timestamp_bounds, timestamp_ms, validate_session_id, IncrementalRecords,
     TailSession, TranscriptImport, TranscriptLayout,
 };
+use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -52,6 +53,9 @@ impl TailSession for Tail {
         len: u64,
         finalize: bool,
     ) -> anyhow::Result<Vec<Envelope>> {
+        if events.is_empty() {
+            return Ok(events);
+        }
         if events.len() < 2 {
             bail!("Claude import did not produce session boundary events");
         }
@@ -175,10 +179,16 @@ pub(super) fn envelopes(
             .find_map(|record| string_at(record, "/sessionId"))
             .unwrap_or_else(|| file_session_id(path))
     });
-    let inherited_prefix = own_start
-        .filter(|&index| index > 0)
-        .or_else(|| crate::translate::cli_fork_history_end(records))
-        .unwrap_or(0);
+    let inherited_prefix = match own_start.filter(|&index| index > 0) {
+        Some(index) => index,
+        None => match cli_fork_history(records) {
+            CliForkHistory::Absent => 0,
+            // Wait to emit SessionStart until its offset includes the whole
+            // inherited prefix. Copied prompts must never advance turn indices.
+            CliForkHistory::AwaitingPrompt => return Ok(Vec::new()),
+            CliForkHistory::EndsAt(index) => index,
+        },
+    };
     let own_records = &records[inherited_prefix..];
     let source_version = own_records
         .iter()
