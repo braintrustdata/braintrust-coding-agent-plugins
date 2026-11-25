@@ -28,7 +28,7 @@ use subagent_hook::SubagentHook;
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use tool_completion_hook::ToolCompletionHook;
-use transcript_envelope::TranscriptEnvelope;
+pub(crate) use transcript_envelope::TranscriptEnvelope;
 pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
 use transcript_tool::TranscriptTool;
 use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
@@ -1765,23 +1765,7 @@ fn prompt_matches(prompt: &Value, content: &Value) -> bool {
 }
 
 fn is_real_user_record(record: &Value) -> bool {
-    let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
-        return false;
-    };
-    if envelope.kind.as_deref() != Some("user") {
-        return false;
-    }
-    if envelope.is_compact_summary {
-        return false;
-    }
-    !record
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
+    decode::<TranscriptEnvelope>(record).is_some_and(|row| row.is_user_prompt())
 }
 /// Read newline-delimited records forward from `offset`, advancing it past
 /// everything consumed.

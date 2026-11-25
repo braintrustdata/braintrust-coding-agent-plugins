@@ -1808,5 +1808,4 @@ mod tests {
             .unwrap();
         assert_eq!(failure.payload["error"], "Request interrupted by user");
     }
-
 }
