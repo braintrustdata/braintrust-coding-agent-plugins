@@ -119,10 +119,8 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
         assert!(!request.headers.contains_key("authorization"));
     }
 
-    server
-        .received_requests()
-        .await
-        .unwrap()
+    let mut rows = std::collections::BTreeMap::<String, serde_json::Map<String, Value>>::new();
+    for row in requests
         .into_iter()
         .filter(|r| r.url.path() == "/logs3")
         .flat_map(|r| {
@@ -131,7 +129,12 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
                 .unwrap()
                 .clone()
         })
-        .collect()
+    {
+        rows.entry(row["id"].as_str().unwrap().to_owned())
+            .or_default()
+            .extend(row.as_object().unwrap().clone());
+    }
+    rows.into_values().map(Value::Object).collect()
 }
 
 #[tokio::test]
