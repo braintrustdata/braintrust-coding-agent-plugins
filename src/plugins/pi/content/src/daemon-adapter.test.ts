@@ -7,8 +7,10 @@ const mockState = vi.hoisted(() => ({
   closed: 0,
   claim: true,
   hyperlinks: true,
-  // Oh My Pi's pi-tui exports neither getCapabilities() nor hyperlink().
+  // A pi-tui without getCapabilities() or hyperlink(), like older hosts.
   ompTui: false,
+  hostName: "@earendil-works/pi-coding-agent",
+  tuiLoads: 0,
   legacyContinuation: undefined as Record<string, unknown> | undefined,
   legacyContinuationFor: vi.fn(),
   logGate: undefined as Promise<void> | undefined,
@@ -22,6 +24,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
   return {
     ...original,
     get getCapabilities() {
+      mockState.tuiLoads += 1;
       return mockState.ompTui ? undefined : () => ({ hyperlinks: mockState.hyperlinks });
     },
     get hyperlink() {
@@ -92,7 +95,7 @@ vi.mock("./legacy-session.ts", () => ({
 
 vi.mock("./pi-package.ts", () => ({
   runningPiPackage: () => ({
-    name: "@oh-my-pi/pi-coding-agent",
+    name: mockState.hostName,
     version: "18.12.6",
     configDir: ".pi",
   }),
@@ -132,6 +135,8 @@ describe("Pi daemon adapter", () => {
     mockState.claim = true;
     mockState.hyperlinks = true;
     mockState.ompTui = false;
+    mockState.hostName = "@earendil-works/pi-coding-agent";
+    mockState.tuiLoads = 0;
     mockState.legacyContinuation = undefined;
     mockState.legacyContinuationFor.mockClear();
     mockState.logGate = undefined;
@@ -157,7 +162,7 @@ describe("Pi daemon adapter", () => {
       source: "pi",
       source_version: "18.12.6",
       ts_ms: 1_234,
-      payload: { host_name: "@oh-my-pi/pi-coding-agent" },
+      payload: { host_name: "@earendil-works/pi-coding-agent" },
     });
   });
 
@@ -351,6 +356,20 @@ describe("Pi daemon adapter", () => {
       expect(setStatus).toHaveBeenCalledWith("braintrust-tracing", "Braintrust: connected"),
     );
     expect(setStatus.mock.calls.flat().join(" ")).not.toContain("https://");
+    await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+  });
+
+  it("never loads upstream pi-tui under Oh My Pi", async () => {
+    // Oh My Pi 19.2+ refuses to load extensions that import upstream pi-tui.
+    mockState.hostName = "@oh-my-pi/pi-coding-agent";
+    const setStatus = vi.fn();
+    const ctx = fakeContext({ setStatus, setWidget: vi.fn() });
+    const handlers = await loadExtension();
+    await handlers.get("session_start")?.({ reason: "new" }, ctx);
+    await vi.waitFor(() =>
+      expect(setStatus).toHaveBeenCalledWith("braintrust-tracing", "Braintrust: connected"),
+    );
+    expect(mockState.tuiLoads).toBe(0);
     await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
   });
 
