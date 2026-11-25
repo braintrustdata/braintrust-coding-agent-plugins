@@ -38,12 +38,14 @@ mod plugin;
 mod plugin_list;
 mod plugin_marketplace;
 mod response;
+mod stderr;
 mod transport;
 mod trust_state;
 
 use config_read::ConfigRead;
 use hooks_list::HooksList;
 use plugin_list::PluginList;
+use stderr::StderrTail;
 use transport::request;
 use trust_state::TrustState;
 
@@ -57,10 +59,11 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .context("start Codex to activate tracing hooks")?;
+    let stderr = StderrTail::capture(&mut child);
     let result =
         tokio::time::timeout(TIMEOUT, async {
             let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
@@ -136,8 +139,17 @@ pub(crate) async fn activate() -> anyhow::Result<()> {
         .await;
     let _ = child.kill().await;
     match result {
-        Ok(result) => result.context("Codex plugin installed, but hook activation failed"),
-        Err(_) => Err(anyhow!("Codex hook activation timed out after 5 seconds")),
+        // Inline the cause chain: callers may print only the top-level message.
+        Ok(result) => stderr.attach(result).await.map_err(|error| {
+            anyhow!("Codex plugin installed, but hook activation failed: {error:#}")
+        }),
+        Err(_) => {
+            stderr
+                .attach(Err(anyhow!(
+                    "Codex hook activation timed out after 5 seconds"
+                )))
+                .await
+        }
     }
 }
 
@@ -159,10 +171,11 @@ pub(crate) async fn run_trust_override(
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .context("start Codex to prepare managed hook trust")?;
+    let stderr = StderrTail::capture(&mut child);
     let result =
         tokio::time::timeout(TIMEOUT, async {
             let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
@@ -185,12 +198,13 @@ pub(crate) async fn run_trust_override(
         })
         .await;
     let _ = child.kill().await;
-    match result {
+    let result = match result {
         Ok(result) => result,
         Err(_) => Err(anyhow!(
             "Codex managed hook trust inspection timed out after 5 seconds"
         )),
-    }
+    };
+    stderr.attach(result).await
 }
 
 /// Validate the complete installed file, including the other platform's command,

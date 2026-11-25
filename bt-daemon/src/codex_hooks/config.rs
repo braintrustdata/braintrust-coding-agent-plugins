@@ -1,15 +1,17 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde_json::Value;
 
 #[derive(Deserialize)]
 pub(super) struct Config {
+    // Codex feature values are not all booleans (e.g. `network_proxy: null`),
+    // so only the hook toggles are interpreted and everything else is ignored.
     #[serde(default)]
-    pub(super) features: BTreeMap<String, bool>,
+    features: Value,
 }
 
 impl Config {
     pub(super) fn hooks_enabled(&self) -> bool {
-        self.features.get("hooks") != Some(&false)
-            && self.features.get("codex_hooks") != Some(&false)
+        let disabled = |key| self.features.get(key) == Some(&Value::Bool(false));
+        !disabled("hooks") && !disabled("codex_hooks")
     }
 }

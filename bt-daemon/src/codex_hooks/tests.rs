@@ -53,3 +53,54 @@ async fn rpc_ignores_notifications_and_reports_unsupported_methods() {
         "hooks/list"
     );
 }
+
+#[test]
+fn config_read_accepts_non_boolean_feature_values() {
+    let read: ConfigRead = serde_json::from_value(json!({
+        "config": {"features": {"network_proxy": null, "other": {"nested": 1}, "hooks": true}}
+    }))
+    .unwrap();
+    assert!(read.config.hooks_enabled());
+    for features in [json!(null), json!({})] {
+        let read: ConfigRead =
+            serde_json::from_value(json!({"config": {"features": features}})).unwrap();
+        assert!(read.config.hooks_enabled());
+    }
+    let read: ConfigRead = serde_json::from_value(json!({"config": {}})).unwrap();
+    assert!(read.config.hooks_enabled());
+}
+
+#[test]
+fn config_read_respects_disabled_hook_features() {
+    for key in ["hooks", "codex_hooks"] {
+        let read: ConfigRead = serde_json::from_value(json!({
+            "config": {"features": {"network_proxy": null, key: false}}
+        }))
+        .unwrap();
+        assert!(!read.config.hooks_enabled(), "{key}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_failures_include_codex_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\necho \"error: unexpected argument '--no-daemon' found\" >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = run_trust_override(codex.as_os_str(), dir.path(), &[], "unused")
+        .await
+        .unwrap_err()
+        .to_string();
+    // The transport error races Codex's exit (closed stream vs broken pipe);
+    // either way the stderr explanation must be present.
+    assert!(
+        error.contains("unexpected argument '--no-daemon' found"),
+        "{error}"
+    );
+}
