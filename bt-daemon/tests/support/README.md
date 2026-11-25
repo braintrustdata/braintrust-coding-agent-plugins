@@ -24,6 +24,15 @@ executables. To run one agent, add a test-name filter before `--` (for example,
 `codex`). The ordinary Rust suite covers translators and daemon behavior
 without installing agents.
 
+`bt trace install/update codex` hook activation has a separate real-Codex
+contract test in the library tests. It installs the plugin into an isolated
+`CODEX_HOME` and needs no credentials:
+
+```bash
+cargo test --manifest-path bt-daemon/Cargo.toml --all-features --locked --lib \
+  -- --ignored --exact codex_hooks::tests::activation_succeeds_against_real_codex
+```
+
 ## Test layers
 
 - `server` binds an Axum router to an ephemeral address and manages its lifetime.

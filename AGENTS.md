@@ -53,6 +53,12 @@ that flexibility; do not use an opaque JSON fallback for a known schema merely
 to avoid modeling it. Preserve native format variants and unknown extensions
 explicitly when introducing shared types.
 
+For responses and configuration owned by an external agent, model only the
+fields we read, as optional typed fields, and let Serde skip the rest. Never
+decode an agent-owned open-ended collection into a closed type such as
+`BTreeMap<String, bool>`: a single new key or value type in an agent release,
+such as a `null`, then fails the whole response.
+
 Put shared schema interpretation, validated lookup, lossless edits, and common
 projections on the type that owns those rules. Keep filesystem, credential,
 process, and event-ordering policy in the services that coordinate them. Organize
