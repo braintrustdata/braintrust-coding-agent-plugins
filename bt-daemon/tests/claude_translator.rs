@@ -3300,3 +3300,50 @@ fn claude_mid_turn_notification_keeps_buffered_calls_under_their_turn() {
         );
     }
 }
+
+#[test]
+fn claude_preserves_reported_thinking_without_double_counting_tokens() {
+    let records = [
+        json!({"type":"assistant","message":{"id":"first","content":[{"type":"thinking","thinking":"Check the file."},{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":10,"output_tokens_details":{"thinking_tokens":4}}}}),
+        json!({"type":"assistant","message":{"id":"second","content":[{"type":"thinking","signature":"opaque"},{"type":"text","text":"answer"}],"usage":{"output_tokens":3,"output_tokens_details":{"thinking_tokens":0}}}}),
+    ];
+    let transcript = records
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect::<String>();
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"answer"})),
+            (
+                "Stop",
+                30,
+                json!({"transcript_path":"main.jsonl","_bt_transcript_snapshot":{"path":"main.jsonl","contents":transcript}}),
+            ),
+        ],
+        false,
+    );
+    let call = |id| {
+        rows.values()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("request_id"))
+                    == Some(&json!(id))
+            })
+            .unwrap()
+    };
+    let first = call("first");
+    let thinking = json!([{"id":"reasoning","content":"Check the file."}]);
+    assert_eq!(first.output.as_ref().unwrap()["reasoning"], thinking);
+    let metrics = first.metrics.as_ref().unwrap();
+    assert_eq!(metrics["completion_reasoning_tokens"], 4);
+    assert_eq!(metrics["completion_tokens"], 10);
+    assert_eq!(metrics["tokens"], 12);
+    let second = call("second");
+    assert_eq!(second.input.as_ref().unwrap()[0]["reasoning"], thinking);
+    assert!(second.output.as_ref().unwrap().get("reasoning").is_none());
+    assert_eq!(
+        second.metrics.as_ref().unwrap()["completion_reasoning_tokens"],
+        0
+    );
+}

@@ -14,6 +14,10 @@ pub(super) struct LlmCall {
     end_ms: i64,
     input: Vec<Value>,
     text: Vec<String>,
+    #[serde(default)]
+    thinking: Vec<String>,
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
     tool_calls: Vec<Value>,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -40,6 +44,8 @@ impl LlmCall {
             end_ms: start_ms,
             input,
             text: Vec::new(),
+            thinking: Vec::new(),
+            reasoning_tokens: None,
             tool_calls: Vec::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -92,6 +98,19 @@ impl LlmCall {
                             }
                         }
                     }
+                    Some("thinking") => {
+                        #[derive(Deserialize)]
+                        struct ThinkingBlock<'a> {
+                            thinking: &'a str,
+                        }
+                        if let Ok(block) = ThinkingBlock::deserialize(block) {
+                            if !block.thinking.is_empty()
+                                && !self.thinking.iter().any(|seen| seen == block.thinking)
+                            {
+                                self.thinking.push(block.thinking.to_owned());
+                            }
+                        }
+                    }
                     Some("tool_use") => {
                         let arguments =
                             serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
@@ -126,6 +145,15 @@ impl LlmCall {
         {
             self.prompt_tokens = self.prompt_tokens.max(usage.input_tokens.unwrap_or(0));
             self.completion_tokens = self.completion_tokens.max(usage.output_tokens.unwrap_or(0));
+            if let Some(tokens) = usage
+                .output_tokens_details
+                .and_then(|details| details.thinking_tokens)
+            {
+                self.reasoning_tokens = Some(
+                    self.reasoning_tokens
+                        .map_or(tokens, |prev| prev.max(tokens)),
+                );
+            }
             self.cache_creation_tokens = self
                 .cache_creation_tokens
                 .max(usage.cache_creation_input_tokens.unwrap_or(0));
@@ -144,12 +172,14 @@ impl LlmCall {
     }
 
     pub(super) fn output_message(&self) -> Value {
-        let content = self.text.join("\n");
-        if self.tool_calls.is_empty() {
-            json!({ "role": "assistant", "content": content })
-        } else {
-            json!({ "role": "assistant", "content": content, "tool_calls": self.tool_calls })
+        let mut output = json!({ "role": "assistant", "content": self.text.join("\n") });
+        if !self.tool_calls.is_empty() {
+            output["tool_calls"] = json!(self.tool_calls);
         }
+        if !self.thinking.is_empty() {
+            output["reasoning"] = json!([{"id":"reasoning","content":self.thinking.join("\n")}]);
+        }
+        output
     }
 
     pub(super) fn into_row(self, span_id: String, root_span_id: String, parent: String) -> SpanRow {
@@ -164,6 +194,9 @@ impl LlmCall {
         metrics.insert("prompt_tokens".into(), json!(prompt));
         metrics.insert("completion_tokens".into(), json!(self.completion_tokens));
         metrics.insert("tokens".into(), json!(prompt + self.completion_tokens));
+        if let Some(tokens) = self.reasoning_tokens {
+            metrics.insert("completion_reasoning_tokens".into(), json!(tokens));
+        }
         metrics.insert("prompt_cached_tokens".into(), json!(self.cache_read_tokens));
         if has_split {
             metrics.insert(
