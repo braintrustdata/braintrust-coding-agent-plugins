@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 vi.mock("./runtime/daemon-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./runtime/daemon-client")>()),
@@ -25,34 +25,37 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-it("applies the project opt-out to OpenCode 2 and permits a managed run", async () => {
-  const global = join(directory, "config", "opencode");
-  const project = directory;
-  mkdirSync(global, { recursive: true });
-  mkdirSync(project, { recursive: true });
-  writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
-  writeFileSync(join(project, ".braintrust.json"), JSON.stringify({ trace_to_braintrust: false }));
-  const hook = vi.fn(async () => {});
-  const subscribe = vi.fn(async function* () {});
-  const ctx = {
-    app: { version: "2.2.5" },
-    location: { directory },
-    session: { hook, get: async () => ({}) },
-    event: { subscribe },
-    tool: { transform: async () => {} },
-  };
-  expect(await plugin.setup(ctx)).toBeUndefined();
-  expect(hook).not.toHaveBeenCalled();
-  expect(subscribe).not.toHaveBeenCalled();
-  vi.stubEnv(
-    "BT_TRACE_INVOCATION_SETTINGS",
-    JSON.stringify({
-      trace_to_braintrust: true,
-      route: { destination: { type: "project_logs", project_name: "managed" } },
-    }),
-  );
-  const cleanup = await plugin.setup(ctx);
-  expect(hook).toHaveBeenCalled();
-  expect(subscribe).toHaveBeenCalled();
-  await cleanup?.();
-});
+it.each([".braintrust.json", join(".opencode", "braintrust.json")])(
+  "applies the %s opt-out to OpenCode 2 and permits a managed run",
+  async (configPath) => {
+    const global = join(directory, "config", "opencode");
+    const projectConfig = join(directory, configPath);
+    mkdirSync(global, { recursive: true });
+    mkdirSync(dirname(projectConfig), { recursive: true });
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(projectConfig, JSON.stringify({ trace_to_braintrust: false }));
+    const hook = vi.fn(async () => {});
+    const subscribe = vi.fn(async function* () {});
+    const ctx = {
+      app: { version: "2.2.5" },
+      location: { directory },
+      session: { hook, get: async () => ({}) },
+      event: { subscribe },
+      tool: { transform: async () => {} },
+    };
+    expect(await plugin.setup(ctx)).toBeUndefined();
+    expect(hook).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    vi.stubEnv(
+      "BT_TRACE_INVOCATION_SETTINGS",
+      JSON.stringify({
+        trace_to_braintrust: true,
+        route: { destination: { type: "project_logs", project_name: "managed" } },
+      }),
+    );
+    const cleanup = await plugin.setup(ctx);
+    expect(hook).toHaveBeenCalled();
+    expect(subscribe).toHaveBeenCalled();
+    await cleanup?.();
+  },
+);

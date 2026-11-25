@@ -84,8 +84,15 @@ Settings load in this order, with later values taking precedence:
 
 1. Defaults
 2. `~/.pi/agent/braintrust.json`
-3. `.pi/braintrust.json` in the project (or Pi's configured project config directory)
-4. `bt trace run` settings for that invocation
+3. `.braintrust.json` at the Git root, or in the working directory outside Git
+
+An explicit tracing opt-out in the legacy `.pi/braintrust.json` (or the host's
+configured project config directory) still disables tracing, even if
+`.braintrust.json` enables it. The extension checks the working directory and
+the Git root for legacy opt-outs and uses only the tracing flag from those
+files. To migrate an opt-out, set `"trace_to_braintrust": false` in
+`.braintrust.json`. `bt trace run` can override these settings for one
+invocation.
 
 Example:
 

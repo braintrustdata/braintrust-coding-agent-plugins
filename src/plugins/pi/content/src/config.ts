@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   type DaemonSessionRoute,
   projectSettingsPath,
@@ -8,6 +8,7 @@ import {
   mergeProjectRoute,
   resolveDaemonTraceSettings,
 } from "./runtime/daemon-client.ts";
+import { runningPiPackage } from "./pi-package.ts";
 
 export interface PiConfig {
   enabled: boolean;
@@ -154,6 +155,18 @@ export function loadConfig(cwd = process.cwd()): PiConfig {
     }
   } else if (existsSync(projectPath)) {
     config.enabled = false;
+  }
+
+  if (config.enabled) {
+    const { configDir } = runningPiPackage();
+    const legacyDirectories = new Set([cwd, dirname(projectPath)]);
+    for (const directory of legacyDirectories) {
+      const legacy = readConfig(join(directory, configDir, "braintrust.json"));
+      if (boolean(legacy?.trace_to_braintrust) === false) {
+        config.enabled = false;
+        break;
+      }
+    }
   }
 
   config.showUi = boolean(process.env.BRAINTRUST_SHOW_UI) ?? config.showUi;
