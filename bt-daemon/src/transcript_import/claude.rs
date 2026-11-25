@@ -175,7 +175,10 @@ pub(super) fn envelopes(
             .find_map(|record| string_at(record, "/sessionId"))
             .unwrap_or_else(|| file_session_id(path))
     });
-    let inherited_prefix = own_start.unwrap_or(0);
+    let inherited_prefix = own_start
+        .filter(|&index| index > 0)
+        .or_else(|| crate::translate::cli_fork_history_end(records))
+        .unwrap_or(0);
     let own_records = &records[inherited_prefix..];
     let source_version = own_records
         .iter()

@@ -26,6 +26,7 @@ use subagent_hook::SubagentHook;
 #[cfg(test)]
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
+pub(crate) use transcript_envelope::cli_fork_history_end;
 use transcript_envelope::TranscriptEnvelope;
 use transcript_tool::TranscriptTool;
 
@@ -313,6 +314,15 @@ impl ClaudeTranslator {
             self.claude_version = rows.iter().find_map(|row| string_field(row, "version"));
         }
         cursor.buffered.extend(rows);
+        if event.payload.get("_bt_import_through_offset").is_none() && self.last_turn_id.is_none() {
+            if let Some(end) = cli_fork_history_end(&cursor.buffered) {
+                let remainder = cursor.buffered.split_off(end);
+                let history = std::mem::replace(&mut cursor.buffered, remainder);
+                self.main_history = std::mem::take(&mut self.main_history)
+                    .parse_records(&history)
+                    .history;
+            }
+        }
     }
 
     fn observe_session_details(&mut self, hook: &HookContext) {

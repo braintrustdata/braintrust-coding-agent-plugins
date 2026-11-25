@@ -1593,6 +1593,82 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_fork_keeps_copied_work_as_context_in_import_and_live_translation() {
+        use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fork.jsonl");
+        let records = [
+            json!({"type":"queue-operation","sessionId":"fork","operation":"enqueue","timestamp":"2026-01-01T00:00:10Z"}),
+            json!({"type":"user","sessionId":"fork","timestamp":"2026-01-01T00:00:01Z","message":{"content":"old question"}}),
+            json!({"type":"assistant","sessionId":"fork","timestamp":"2026-01-01T00:00:02Z","message":{"id":"old","content":[{"type":"text","text":"old answer"}]}}),
+            json!({"type":"user","sessionId":"fork","timestamp":"2026-01-01T00:00:11Z","message":{"content":"new question"}}),
+            json!({"type":"assistant","sessionId":"fork","timestamp":"2026-01-01T00:00:12Z","message":{"id":"new","content":[{"type":"text","text":"new answer"}]}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let imported = transcript_envelopes(&path, ImportSource::Claude).unwrap();
+        let live = vec![
+            envelope(
+                "claude-code",
+                None,
+                "fork",
+                "UserPromptSubmit",
+                1_767_225_611_000,
+                json!({"transcript_path":path,"prompt":"new question"}),
+            ),
+            envelope(
+                "claude-code",
+                None,
+                "fork",
+                "Stop",
+                1_767_225_613_000,
+                json!({"transcript_path":path,"last_assistant_message":"new answer"}),
+            ),
+        ];
+        let ctx = SessionCtx {
+            session_id: "fork".into(),
+            config: None,
+        };
+        for events in [imported, live] {
+            let mut translator = Registry::default_agents().create("claude-code", "fork");
+            let mut ops = Vec::new();
+            for event in events {
+                ops.extend(translator.handle(&event, &ctx).unwrap());
+                while let Some(more) = translator.drain_pending(&ctx).unwrap() {
+                    ops.extend(more);
+                }
+            }
+            let calls = ops
+                .iter()
+                .filter_map(|op| match op {
+                    SpanOp::Insert(row) if row.span_type == SpanType::Llm => Some(row),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0]
+                .input
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("old answer"));
+            assert!(calls[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("new answer"));
+        }
+    }
+
+    #[test]
     fn claude_tail_closes_only_completed_turns() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session-123.jsonl");
