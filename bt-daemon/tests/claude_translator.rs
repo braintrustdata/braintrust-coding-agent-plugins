@@ -3114,6 +3114,7 @@ fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook()
     let request =
         "Claude requested permissions to write to out.txt, but you haven't granted it yet.";
     let refusal = "denied by the Claude Code auto mode classifier";
+    let structured = json!({"content":[{"type":"text","text":refusal}]});
     let records = [
         json!({"type":"assistant","message":{"id":"tool-request","content":[{"type":"tool_use","id":"silent","name":"Write","input":{}}]}}),
         json!({"type":"user","timestamp":"1970-01-01T00:00:00.025Z","message":{"content":[{"type":"tool_result","tool_use_id":"silent","is_error":true,"content":refusal}]}}),
@@ -3137,6 +3138,16 @@ fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook()
             ),
             (
                 "PreToolUse",
+                14,
+                json!({"tool_name":"Write","tool_use_id":"structured"}),
+            ),
+            (
+                "PostToolUseFailure",
+                15,
+                json!({"tool_name":"Write","tool_use_id":"structured","error":structured}),
+            ),
+            (
+                "PreToolUse",
                 20,
                 json!({"tool_name":"Write","tool_use_id":"silent"}),
             ),
@@ -3148,7 +3159,11 @@ fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook()
         ],
         false,
     );
-    for (id, end, reason) in [("explicit", 13, request), ("silent", 25, refusal)] {
+    for (id, end, reason) in [
+        ("explicit", 13, json!(request)),
+        ("structured", 15, structured),
+        ("silent", 25, json!(refusal)),
+    ] {
         let tool = rows
             .values()
             .find(|row| {
@@ -3162,6 +3177,6 @@ fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook()
         assert_eq!(metadata["tool_approval"], "denied");
         assert_ne!(metadata["cancelled"], true);
         assert_eq!(tool.end_ms, Some(end));
-        assert_eq!(tool.output, Some(json!(reason)));
+        assert_eq!(tool.output, Some(reason));
     }
 }
