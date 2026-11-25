@@ -11,6 +11,11 @@ TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 [[ -f "$TARGET_DIR/package.json" ]] || fail "missing package.json"
 [[ -f "$TARGET_DIR/dist/index.mjs" ]] || fail "missing production entrypoint"
 [[ -f "$TARGET_DIR/dist/index.d.mts" ]] || fail "missing production declarations"
+# Oh My Pi 19.2+ refuses to load an extension that names upstream pi-tui, even
+# in a literal dynamic import; src/index.ts loads it via a computed specifier.
+if grep -nE "[\"'\`]@(earendil-works|mariozechner)/pi-tui" "$TARGET_DIR/dist/index.mjs"; then
+  fail "production entrypoint names upstream pi-tui; Oh My Pi 19.2+ will not load it"
+fi
 
 (cd "$SOURCE_DIR" && pnpm install --frozen-lockfile)
 (cd "$SOURCE_DIR" && pnpm run check && pnpm test && pnpm run build && pnpm run smoke)
