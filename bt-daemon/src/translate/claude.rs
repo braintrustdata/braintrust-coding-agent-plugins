@@ -1195,19 +1195,37 @@ impl ClaudeTranslator {
         }
     }
 
-    fn flush_previous_turn_rows(&mut self, ops: &mut Vec<SpanOp>) {
-        let (Some(path), Some(parent)) = (self.main_transcript.clone(), self.last_turn_id.clone())
-        else {
+    fn flush_previous_turn_rows(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+        let previous = self.turn.as_ref().map_or_else(
+            || {
+                self.last_turn_id
+                    .clone()
+                    .map(|id| (id, self.last_turn_cwd.clone()))
+            },
+            |turn| Some((turn.id.clone(), turn.cwd.clone())),
+        );
+        let (Some(path), Some((parent, cwd))) = (self.main_transcript.clone(), previous) else {
             return;
         };
         let Some(cursor) = self.transcripts.get_mut(&path) else {
             return;
         };
-        let split = cursor
-            .buffered
-            .iter()
-            .rposition(is_real_user_record)
-            .unwrap_or(cursor.buffered.len());
+        let split = if self.turn.is_some() {
+            // The replacement hook can run before its prompt is written. In
+            // that case all bytes observed by this hook belong to the old turn.
+            event.payload.get("prompt").and_then(|prompt| {
+                cursor.buffered.iter().rposition(|record| {
+                    is_real_user_record(record)
+                        && record.get("queueTranscriptOnly").and_then(Value::as_bool) != Some(true)
+                        && record
+                            .pointer("/message/content")
+                            .is_some_and(|content| prompt_matches(prompt, content))
+                })
+            })
+        } else {
+            cursor.buffered.iter().rposition(is_real_user_record)
+        }
+        .unwrap_or(cursor.buffered.len());
         let current_turn_rows = cursor.buffered.split_off(split);
         let previous_rows = std::mem::replace(&mut cursor.buffered, current_turn_rows);
         self.queue_transcript(
@@ -1215,7 +1233,7 @@ impl ClaudeTranslator {
             PendingHistory::Main,
             "main".into(),
             parent,
-            self.last_turn_cwd.clone(),
+            cwd,
             ops,
         );
     }
@@ -1502,7 +1520,7 @@ impl AgentTranslator for ClaudeTranslator {
                 }
             }
             "UserPromptSubmit" => {
-                self.flush_previous_turn_rows(&mut ops);
+                self.flush_previous_turn_rows(event, &mut ops);
                 event_op_start = ops.len();
                 self.open_turn(event, &mut ops);
             }
