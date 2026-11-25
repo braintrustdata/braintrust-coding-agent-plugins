@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rquickjs = "0.12.2"
 rquickjs-serde = "0.6.1"
 serde = { version = "1", features = ["derive", "rc"] }

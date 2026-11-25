@@ -28,6 +28,15 @@ fn reference(value: &Value, mime: &str) -> bool {
     }
 }
 async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
+    upload_sessions(source, events, None).await
+}
+
+async fn upload_sessions(
+    source: &str,
+    events: Vec<Envelope>,
+    existing_status: Option<&str>,
+) -> Vec<Value> {
+    let repeat = existing_status.is_some();
     let server = MockServer::start().await;
     let storage = MockServer::start().await;
     Mock::given(method("GET"))
@@ -46,12 +55,32 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
         .mount(&server)
         .await;
     let storage_url = storage.uri();
+    if let Some(status) = existing_status {
+        Mock::given(method("POST"))
+            .and(path("/attachment"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "Code":"HTTPError","Message":"Attachment key already exists"
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status":{"upload_status":status},"contentLength":11
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("POST"))
         .and(path("/attachment"))
         .respond_with(move |request: &wiremock::Request| {
             let metadata: Value = serde_json::from_slice(&request.body).unwrap();
             ResponseTemplate::new(200).set_body_json(json!({"signedUrl":format!("{storage_url}/bytes/{}",metadata["key"].as_str().unwrap()),"headers":{}}))
         })
+        .with_priority(1)
+        .up_to_n_times(if repeat { 1 } else { u64::MAX })
         .mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/attachment/status"))
@@ -96,6 +125,27 @@ async fn upload(source: &str, events: Vec<Envelope>) -> Vec<Value> {
         sink.emit(&[op]).await.unwrap();
     }
     sink.flush().await.unwrap();
+    if repeat {
+        let mut other = BraintrustSinkFactory::new(BraintrustSinkConfig::default())
+            .create("another-session", source)
+            .unwrap();
+        other.configure(&config);
+        for mut op in session.stored().await {
+            let row = op.row_mut();
+            row.span_id = format!("second-{}", row.span_id);
+            row.root_span_id = format!("second-{}", row.root_span_id);
+            for parent in &mut row.parent_span_ids {
+                *parent = format!("second-{parent}");
+            }
+            if let Err(error) = other.emit(&[op]).await {
+                assert_eq!(existing_status, Some("uploading"), "{error:#}");
+                assert!(error.to_string().contains("409 Conflict"), "{error:#}");
+                return Vec::new();
+            }
+        }
+        other.flush().await.unwrap();
+        assert_eq!(existing_status, Some("done"));
+    }
     let uploaded = storage.received_requests().await.unwrap();
     assert!(!uploaded.is_empty(), "{source} uploaded no attachments");
     let requests = server.received_requests().await.unwrap();
@@ -301,4 +351,39 @@ async fn claude_uploads_prompt_documents_and_tool_images() {
                 && reference(&row["output"], "image/png")),
         "missing tool image: {rows:?}"
     );
+}
+
+fn image_session() -> Vec<Envelope> {
+    vec![
+        event(
+            "pi",
+            "before_agent_start",
+            1,
+            json!({
+                "prompt":"describe","images":[{"type":"image","mimeType":"image/png","data":"aW1hZ2UgYnl0ZXM="}]
+            }),
+        ),
+        event("pi", "agent_end", 2, json!({})),
+    ]
+}
+
+#[tokio::test]
+async fn repeated_image_does_not_block_a_fresh_sink() {
+    let rows = upload_sessions("pi", image_session(), Some("done")).await;
+    let mut second = rows.iter().filter(|row| {
+        row["span_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("second-"))
+    });
+    assert!(second
+        .clone()
+        .any(|row| reference(&row["input"], "image/png")));
+    assert!(second.any(|row| row["metrics"]["end"].is_number()));
+}
+
+#[tokio::test]
+async fn reserved_key_without_completed_upload_is_not_reused() {
+    assert!(upload_sessions("pi", image_session(), Some("uploading"))
+        .await
+        .is_empty());
 }
