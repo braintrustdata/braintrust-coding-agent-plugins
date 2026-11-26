@@ -3017,7 +3017,10 @@ async fn managed_claude_budget_result_marks_the_finished_turn_and_session() {
         opts,
     ));
     wait_for(&socket).await;
-    let result = r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"managed-budget","is_error":true}"#;
+    let result = concat!(
+        r#"[{"type":"system","subtype":"init","session_id":"managed-budget"},"#,
+        r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"managed-budget","is_error":true}]"#,
+    );
     let agent = tmp.path().join("claude");
     std::fs::write(
         &agent,
@@ -3029,6 +3032,8 @@ printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"UserPromptSubm
 printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"SessionEnd","reason":"other"}}' |
   "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
 printf '%s\n' '{result}'
+# Leave the wrapper's stdout open after it exits, without retaining stderr.
+sleep 30 </dev/null 2>/dev/null &
 exit 1
 "#
         ),
@@ -3037,7 +3042,8 @@ exit 1
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let binary = env!("CARGO_BIN_EXE_bt-daemon");
-    let output = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    command
         .args([
             "run",
             "--project",
@@ -3048,6 +3054,7 @@ exit 1
             "--max-budget-usd=0.01",
             "--output-format",
             "json",
+            "--verbose",
             "hello",
         ])
         .env("CLAUDE_BIN", &agent)
@@ -3055,8 +3062,10 @@ exit 1
         .env("BRAINTRUST_DAEMON_SOCKET", &socket)
         .env("BRAINTRUST_DAEMON_DATA_DIR", &data_dir)
         .env_remove("BRAINTRUST_DESTINATION")
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
+        .expect("managed run must finish while the helper still holds stdout")
         .unwrap();
 
     shutdown(&socket).await;

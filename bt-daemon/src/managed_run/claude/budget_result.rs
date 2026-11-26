@@ -1,7 +1,10 @@
 use std::ffi::OsString;
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 #[derive(Deserialize)]
 struct ResultRecord {
@@ -51,24 +54,34 @@ pub(in crate::managed_run) fn observes_budget_result(args: &[OsString]) -> bool 
 }
 
 /// Mirror the child's original bytes and retain only the session ID from a
-/// budget-limited result. Claude emits one JSON record per line in both formats.
+/// budget-limited result. Claude emits JSON objects or a compact verbose array.
 pub(in crate::managed_run) async fn observe_budget_result(
     mut child_stdout: impl AsyncRead + Unpin,
     mut stdout: impl AsyncWrite + Unpin,
+    child_exited: oneshot::Receiver<Instant>,
 ) -> std::io::Result<Option<String>> {
     // Ignore unusually large individual records without buffering unbounded stdout.
     const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
     let mut bytes = [0; 8192];
     let mut record = Some(Vec::new());
     let mut budget_session = None;
+    // A wrapper's descendants may keep the inherited pipe open. Give bytes
+    // already in the pipe time to drain, and never wait for descendant EOF.
+    // Bound reads only so a deadline cannot cut off a write already in flight.
+    let drain_deadline = async {
+        if let Ok(exited) = child_exited.await {
+            tokio::time::sleep_until(exited + Duration::from_millis(250)).await;
+        }
+    };
+    tokio::pin!(drain_deadline);
     loop {
-        let read = child_stdout.read(&mut bytes).await?;
+        let read = tokio::select! {
+            biased;
+            () = &mut drain_deadline => break,
+            read = child_stdout.read(&mut bytes) => read?,
+        };
         if read == 0 {
-            if let Some(record) = record {
-                observe_record(&record, &mut budget_session);
-            }
-            stdout.flush().await?;
-            return Ok(budget_session);
+            break;
         }
         let chunk = &bytes[..read];
         stdout.write_all(chunk).await?;
@@ -90,14 +103,26 @@ pub(in crate::managed_run) async fn observe_budget_result(
             }
         }
     }
+    if let Some(record) = record {
+        observe_record(&record, &mut budget_session);
+    }
+    stdout.flush().await?;
+    Ok(budget_session)
 }
 
 fn observe_record(record: &[u8], budget_session: &mut Option<String>) {
-    if let Ok(ResultRecord {
+    let result = if record.trim_ascii_start().starts_with(b"[") {
+        serde_json::from_slice::<Vec<ResultRecord>>(record)
+            .ok()
+            .and_then(|mut messages| messages.pop())
+    } else {
+        serde_json::from_slice(record).ok()
+    };
+    if let Some(ResultRecord {
         kind: Some(RecordKind::Result),
         subtype,
         session_id,
-    }) = serde_json::from_slice(record)
+    }) = result
     {
         *budget_session = match subtype {
             Some(ResultSubtype::ErrorMaxBudgetUsd) => session_id.filter(|id| !id.is_empty()),
@@ -120,16 +145,18 @@ mod tests {
             r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"correct"}"#;
         let input = format!("{other_records}{budget_record}");
         let mut output = Vec::new();
+        let (_notify_exit, child_exited) = oneshot::channel();
         assert_eq!(
-            observe_budget_result(input.as_bytes(), &mut output)
+            observe_budget_result(input.as_bytes(), &mut output, child_exited)
                 .await
                 .unwrap()
                 .as_deref(),
             Some("correct")
         );
         assert_eq!(output, input.as_bytes());
+        let (_notify_exit, child_exited) = oneshot::channel();
         assert!(
-            observe_budget_result(other_records.as_bytes(), tokio::io::sink())
+            observe_budget_result(other_records.as_bytes(), tokio::io::sink(), child_exited)
                 .await
                 .unwrap()
                 .is_none()

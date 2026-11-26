@@ -248,9 +248,16 @@ async fn run_traced_inner(
     let child_stdout = child.stdout.take();
     let (status, budget_session) = tokio::select! {
         (status, budget_session) = async {
-            tokio::join!(child.wait(), async {
-                let child_stdout = child_stdout?;
-                match claude::observe_budget_result(child_stdout, tokio::io::stdout()).await {
+            let Some(child_stdout) = child_stdout else { return (child.wait().await, None) };
+            let (notify_exit, child_exited) = tokio::sync::oneshot::channel();
+            let wait = async {
+                let status = child.wait().await;
+                // The relay may already have reached EOF.
+                let _ = notify_exit.send(tokio::time::Instant::now());
+                status
+            };
+            tokio::join!(wait, async {
+                match claude::observe_budget_result(child_stdout, tokio::io::stdout(), child_exited).await {
                     Ok(session) => session,
                     Err(error) => {
                         if error.kind() != std::io::ErrorKind::BrokenPipe {
