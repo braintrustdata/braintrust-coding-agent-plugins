@@ -743,41 +743,19 @@ fn is_real_user(record: &Value) -> bool {
 }
 
 fn last_assistant_text(records: &[Value]) -> Option<Value> {
-    records.iter().rev().find_map(|record| {
-        if record.get("type").and_then(Value::as_str) != Some("assistant") {
-            return None;
-        }
-        let content = record.pointer("/message/content")?;
-        if let Some(text) = content.as_str() {
-            return Some(json!(text));
-        }
-        let text = content
-            .as_array()?
-            .iter()
-            .filter_map(|block| {
-                (block.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| block.get("text").and_then(Value::as_str))
-                    .flatten()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        (!text.is_empty()).then(|| json!(text))
-    })
+    records
+        .iter()
+        .rev()
+        .filter_map(|record| ClaudeTranscriptEnvelope::deserialize(record).ok())
+        .find_map(|record| record.assistant_text())
+        .map(Value::String)
 }
 
 fn last_assistant_error(records: &[Value]) -> Option<String> {
-    let record = records
+    records
         .iter()
         .rev()
-        .find(|record| record.get("type").and_then(Value::as_str) == Some("assistant"))?;
-    if record.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true) {
-        return None;
-    }
-    string_at(record, "/error")
-        .or_else(|| {
-            last_assistant_text(std::slice::from_ref(record))?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .or_else(|| Some("Claude API error".into()))
+        .filter_map(|record| ClaudeTranscriptEnvelope::deserialize(record).ok())
+        .find(ClaudeTranscriptEnvelope::is_assistant)?
+        .into_api_error()
 }
