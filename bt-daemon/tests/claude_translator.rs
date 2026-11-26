@@ -3347,3 +3347,36 @@ fn claude_preserves_reported_thinking_without_double_counting_tokens() {
         0
     );
 }
+
+#[test]
+fn claude_reports_a_native_turn_limit_on_live_and_imported_spans() {
+    let transcript_path = "main.jsonl";
+    let limit = json!({"type":"attachment","attachment":{"type":"max_turns_reached","maxTurns":1,"turnCount":2}});
+    let snapshot = json!({"path":transcript_path,"contents":format!("{limit}\n")});
+    for terminal in ["SessionEnd", "Stop"] {
+        let mut events = vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"read a file"})),
+            (
+                terminal,
+                20,
+                json!({"transcript_path":transcript_path,"_bt_transcript_snapshot":snapshot}),
+            ),
+        ];
+        if terminal == "Stop" {
+            events.push(("SessionEnd", 21, json!({})));
+        }
+        let rows = replay_continuation_events(events, false);
+        let turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+        let root = rows
+            .values()
+            .find(|row| row.parent_span_ids.is_empty())
+            .unwrap();
+        for (row, outcome_key) in [(turn, "outcome"), (root, "session_status")] {
+            let metadata = row.metadata.as_ref().unwrap();
+            assert_eq!(metadata[outcome_key], "interrupted");
+            assert_eq!(metadata["termination_reason"], "max_turns");
+            assert_eq!(metadata["max_turns"], 1);
+            assert_eq!(metadata["turn_count"], 2);
+        }
+    }
+}

@@ -20,6 +20,7 @@ mod transcript_content;
 mod transcript_envelope;
 mod transcript_tool;
 mod transcript_tool_outcome;
+mod turn_limit;
 mod user_prompt_hook;
 
 use activity_bounds::ActivityBounds;
@@ -39,6 +40,7 @@ pub(crate) use transcript_envelope::{
 };
 use transcript_tool::TranscriptTool;
 use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
+use turn_limit::TurnLimit;
 pub(crate) use user_prompt_hook::UserPromptHook;
 
 use super::git::GitMetadataCache;
@@ -189,6 +191,8 @@ struct ClaudeTranslator {
     last_turn_cwd: Option<String>,
     last_turn_output: Option<Value>,
     session_status: Option<String>,
+    #[serde(default)]
+    turn_limit: Option<TurnLimit>,
     last_ts_ms: i64,
 }
 
@@ -244,6 +248,7 @@ impl ClaudeTranslator {
             last_turn_cwd: None,
             last_turn_output: None,
             session_status: None,
+            turn_limit: None,
             last_ts_ms: 0,
         }
     }
@@ -260,6 +265,7 @@ impl ClaudeTranslator {
         }
         if self.root_end_ms.is_some() {
             self.root_generation = self.root_generation.saturating_add(1);
+            self.turn_limit = None;
             let root = ids::span_id(&self.session_id, &format!("root:{}", self.root_generation));
             self.session_span_id = root.clone();
             self.root_span_id = root;
@@ -380,6 +386,7 @@ impl ClaudeTranslator {
 
     fn open_turn(&mut self, event: &Envelope, prompt: UserPromptHook, ops: &mut Vec<SpanOp>) {
         self.session_status = Some("running".into());
+        self.turn_limit = None;
         if let Some(old) = self.turn.take() {
             self.close_pending_tools(
                 &old.id,
@@ -1246,11 +1253,32 @@ impl ClaudeTranslator {
         );
     }
 
+    fn observe_turn_limit(&mut self) {
+        self.turn_limit = self
+            .main_transcript
+            .as_ref()
+            .and_then(|path| self.transcripts.get(path))
+            .and_then(|cursor| TurnLimit::at_end(&cursor.buffered));
+    }
+
+    fn outcome_metadata(&self, field: &str, outcome: &str) -> Value {
+        let mut metadata = Map::new();
+        metadata.insert(field.to_owned(), outcome.into());
+        if let Some(limit) = &self.turn_limit {
+            limit.add_metadata(&mut metadata);
+        }
+        Value::Object(metadata)
+    }
+
     fn stop_turn(&mut self, event: &Envelope, error: Option<String>, ops: &mut Vec<SpanOp>) {
         let Some(turn_id) = self.turn.as_ref().map(|turn| turn.id.clone()) else {
             return;
         };
-        let interrupted = error.as_deref().is_some_and(is_interrupt_reason);
+        // Imported turns have a synthetic Stop and still carry the native
+        // limit marker in their bounded transcript prefix.
+        self.observe_turn_limit();
+        let interrupted =
+            self.turn_limit.is_some() || error.as_deref().is_some_and(is_interrupt_reason);
         let outcome = if interrupted {
             "interrupted"
         } else if error.is_some() {
@@ -1286,7 +1314,7 @@ impl ClaudeTranslator {
             late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
             output,
             error,
-            metadata: Some(json!({"outcome": outcome})),
+            metadata: Some(self.outcome_metadata("outcome", outcome)),
             ..Default::default()
         }));
         self.last_turn_cwd = turn.cwd;
@@ -1392,7 +1420,7 @@ impl ClaudeTranslator {
             metadata: self
                 .session_status
                 .as_ref()
-                .map(|status| json!({"session_status": status})),
+                .map(|status| self.outcome_metadata("session_status", status)),
             late_merge_key: Some(format!("session:stop:{end_ms}")),
             ..Default::default()
         }));
@@ -1412,6 +1440,7 @@ impl ClaudeTranslator {
             }
         }
         if self.turn.is_some() {
+            self.observe_turn_limit();
             self.session_status = Some("interrupted".into());
         } else if self.session_status.is_none() {
             self.session_status = Some("completed".into());
@@ -1438,7 +1467,7 @@ impl ClaudeTranslator {
                 parent_span_ids: vec![turn.parent_id],
                 end_ms: Some(end_ms),
                 late_merge_key: Some(format!("execution:stop:{}", event.ts_ms)),
-                metadata: Some(json!({"outcome":"interrupted"})),
+                metadata: Some(self.outcome_metadata("outcome", "interrupted")),
                 ..Default::default()
             }));
             self.last_turn_id = Some(turn.id);
