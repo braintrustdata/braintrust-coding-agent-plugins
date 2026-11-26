@@ -1930,4 +1930,27 @@ mod tests {
             .unwrap();
         assert_eq!(failure.payload["error"], "Request interrupted by user");
     }
+    #[test]
+    fn claude_import_reports_only_unrecovered_api_errors_as_turn_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let prompt = json!({"type":"user","sessionId":"session","message":{"content":"question"}});
+        let error = json!({"type":"assistant","isApiErrorMessage":true,"error":"server_error","message":{"content":"connection lost"}});
+        let answer = json!({"type":"assistant","message":{"content":"answer"}});
+        for (records, expected) in [
+            (vec![&prompt, &error, &answer], "Stop"),
+            (vec![&prompt, &answer, &error], "StopFailure"),
+        ] {
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(|row| format!("{row}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let events = transcript_envelopes(&path, ImportSource::Claude).unwrap();
+            assert_eq!(events[2].event, expected);
+        }
+    }
 }

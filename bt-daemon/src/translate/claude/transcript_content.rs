@@ -28,6 +28,22 @@ pub(super) struct TranscriptBlock {
 }
 
 impl TranscriptContent {
+    pub(super) fn joined_text(&self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text.clone()),
+            Self::Blocks(blocks) => {
+                let text = blocks
+                    .iter()
+                    .filter(|block| block.kind.as_deref() == Some("text"))
+                    .filter_map(|block| block.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then_some(text)
+            }
+            Self::Unknown(_) => None,
+        }
+    }
+
     pub(super) fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),

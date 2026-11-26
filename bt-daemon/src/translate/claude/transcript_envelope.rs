@@ -40,6 +40,9 @@ pub(crate) struct TranscriptEnvelope {
     is_meta: bool,
     #[serde(rename = "queueTranscriptOnly", default)]
     pub(super) queue_transcript_only: bool,
+    #[serde(rename = "isApiErrorMessage")]
+    is_api_error_message: Option<bool>,
+    error: Option<String>,
     message: Option<TranscriptMessage>,
     // Claude stores tool-specific data here, such as a Bash or Agent result.
     #[serde(rename = "toolUseResult")]
@@ -69,6 +72,25 @@ pub(super) struct TranscriptToolResult {
 }
 
 impl TranscriptEnvelope {
+    pub(crate) fn assistant_text(&self) -> Option<String> {
+        if !self.is_assistant() {
+            return None;
+        }
+        self.content()?.joined_text()
+    }
+
+    pub(crate) fn into_api_error(mut self) -> Option<String> {
+        if !self.is_assistant() || self.is_api_error_message != Some(true) {
+            return None;
+        }
+        Some(
+            self.error
+                .take()
+                .or_else(|| self.assistant_text())
+                .unwrap_or_else(|| "Claude API error".into()),
+        )
+    }
+
     pub(super) fn tool_results(&self) -> impl Iterator<Item = &TranscriptToolResult> {
         let blocks = match self
             .message
