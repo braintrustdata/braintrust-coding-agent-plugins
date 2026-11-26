@@ -16,7 +16,7 @@ pub(super) struct ToolCompletionHook {
 }
 
 impl ToolCompletionHook {
-    pub(super) fn into_output(self, preserve_denial_reason: bool) -> Option<Value> {
+    pub(super) fn into_output(self, failure_hook: bool, denied: bool) -> Option<Value> {
         let output = if self.tool_response.is_missing() {
             self.output
         } else {
@@ -25,7 +25,9 @@ impl ToolCompletionHook {
         match output {
             Field::Value(value) => Some(value),
             Field::Null => Some(Value::Null),
-            Field::Missing if preserve_denial_reason => self.error,
+            Field::Missing if failure_hook => self.error.filter(|error| {
+                denied || error.as_str().is_some_and(|text| !text.trim().is_empty())
+            }),
             Field::Missing => None,
         }
     }

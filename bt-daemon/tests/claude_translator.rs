@@ -1152,7 +1152,7 @@ fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
         ),
         event(
             "PostToolUseFailure",
-            json!({"session_id":"s","tool_name":"Read","tool_use_id":"failed","tool_input":{"file_path":"x"},"error":"missing","is_interrupt":true,"duration_ms":42}),
+            json!({"session_id":"s","tool_name":"Read","tool_use_id":"failed","tool_input":{"file_path":"x"},"error":"Exit code 1\nls: missing directory","is_interrupt":true,"duration_ms":42}),
         ),
         event(
             "PostToolUse",
@@ -1193,7 +1193,7 @@ fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
     assert_eq!(failed.start_ms, Some(1 - 42));
     for (call_id, error) in [
         ("denied", None),
-        ("failed", Some("missing")),
+        ("failed", Some("Exit code 1")),
         ("stderr-error", Some("disk full")),
         ("mcp-error", Some("Could not resolve issue 355")),
         ("stderr-success", None),
@@ -1201,6 +1201,10 @@ fn claude_tool_hook_outcomes_distinguish_denials_failures_and_successes() {
     ] {
         assert_eq!(tool(call_id).error.as_deref(), error, "{call_id}");
     }
+    assert_eq!(
+        tool("failed").output,
+        Some(json!("Exit code 1\nls: missing directory"))
+    );
     assert_eq!(
         tool("stderr-success").output.as_ref().unwrap()["stdout"],
         json!("/tmp")

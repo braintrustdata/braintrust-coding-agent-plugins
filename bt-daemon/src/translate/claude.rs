@@ -748,7 +748,7 @@ impl ClaudeTranslator {
         } else {
             failure.tool_error()
         };
-        let output = failure.into_output(denied);
+        let output = failure.into_output(failure_hook, denied);
         if approval == ToolApproval::Approved && error.is_none() && tool_name == "SubagentHandback"
         {
             if let (Some(agent_id), Some(message)) = (
