@@ -1772,50 +1772,125 @@ mod tests {
         );
     }
     #[test]
-    fn claude_attach_keeps_background_agent_open_until_its_final_records_arrive() {
+    fn claude_attach_releases_only_the_notified_background_agent() {
+        use crate::translate::{Registry, SessionCtx, SpanOp, SpanType};
+
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session-a.jsonl");
-        let child = temp.path().join("session-a/subagents/agent-child-a.jsonl");
-        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
-        let write = |path: &Path, records: &[Value]| {
-            std::fs::write(
-                path,
-                records
-                    .iter()
-                    .map(|record| format!("{record}\n"))
-                    .collect::<String>(),
-            )
-            .unwrap();
+        let child_dir = temp.path().join("session-a/subagents");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let child_a = child_dir.join("agent-child-a.jsonl");
+        let child_b = child_dir.join("agent-child-b.jsonl");
+        let append = |path: &Path, records: &[Value]| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            for record in records {
+                writeln!(file, "{record}").unwrap();
+            }
         };
-        write(
+        append(
             &path,
             &[
                 json!({"type":"user","sessionId":"session-a","timestamp":"2026-01-01T00:00:01Z","message":{"content":"delegate"}}),
-                json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer"}}]}}),
+                json!({"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"launch","content":[
+                    {"type":"tool_use","id":"call-a","name":"Agent","input":{"subagent_type":"reviewer"}},
+                    {"type":"tool_use","id":"call-b","name":"Agent","input":{"subagent_type":"reviewer"}}
+                ]}}),
                 json!({"type":"user","timestamp":"2026-01-01T00:00:03Z","toolUseResult":{"agentId":"child-a","status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-a","content":"launched"}]}}),
-                json!({"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"content":"next prompt"}}),
+                json!({"type":"user","timestamp":"2026-01-01T00:00:04Z","toolUseResult":{"agentId":"child-b","status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"call-b","content":"launched"}]}}),
+                json!({"type":"user","timestamp":"2026-01-01T00:00:05Z","message":{"content":"next prompt"}}),
             ],
         );
         let started = json!({"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":"review"}});
-        write(&child, std::slice::from_ref(&started));
+        for child in [&child_a, &child_b] {
+            append(child, std::slice::from_ref(&started));
+        }
 
-        let mut tail = TranscriptTail::new(path, ImportSource::Claude);
+        let mut tail = TranscriptTail::new(path.clone(), ImportSource::Claude);
+        let mut translator = Registry::default_agents().create("claude-code", "session-a");
+        let ctx = SessionCtx {
+            session_id: "session-a".into(),
+            config: None,
+        };
+        let mut translate = |events: &[Envelope]| {
+            let mut ops = Vec::new();
+            for event in events {
+                ops.extend(translator.handle(event, &ctx).unwrap());
+                while let Some(pending) = translator.drain_pending(&ctx).unwrap() {
+                    ops.extend(pending);
+                }
+            }
+            ops
+        };
+
         let initial = tail.poll(false).unwrap();
-        assert!(initial.iter().any(|event| event.event == "SubagentStart"));
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|event| event.event == "SubagentStart")
+                .count(),
+            2
+        );
         assert!(!initial.iter().any(|event| event.event == "SubagentStop"));
-        write(
-            &child,
+        let before = translate(&initial);
+        append(
+            &child_a,
             &[
-                started,
-                json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"late","content":[{"type":"text","text":"reviewed"}]}}),
+                json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"child-model","model":"claude-test","content":[{"type":"tool_use","id":"child-tool","name":"Read","input":{"file_path":"a.txt"}}]}}),
+                json!({"type":"user","timestamp":"2026-01-01T00:00:07Z","message":{"content":[{"type":"tool_result","tool_use_id":"child-tool","content":"file content"}]}}),
+                json!({"type":"assistant","timestamp":"2026-01-01T00:00:08Z","message":{"id":"child-final","model":"claude-test","content":[{"type":"text","text":"reviewed"}]}}),
             ],
         );
-        let terminal = tail.poll(true).unwrap();
-        let stop = terminal
+        append(
+            &path,
+            &[
+                json!({"type":"user","timestamp":"2026-01-01T00:00:09Z","message":{"content":[{"type":"text","text":"<task-notification><task-id>child-a</task-id><status>completed</status></task-notification>"}]}}),
+            ],
+        );
+        let completion = tail.poll(false).unwrap();
+        let completed = completion
             .iter()
-            .find(|event| event.event == "SubagentStop")
+            .filter(|event| event.event == "SubagentStop")
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].payload["agent_id"], "child-a");
+
+        let after = translate(&completion);
+        let launch = before
+            .iter()
+            .map(SpanOp::row)
+            .find(|row| row.name == "Turn 1")
             .unwrap();
-        assert_eq!(stop.payload["last_assistant_message"], "reviewed");
-        assert_eq!(stop.ts_ms, 1_767_225_606_000);
+        let child = after
+            .iter()
+            .map(SpanOp::row)
+            .find(|row| {
+                row.output.as_ref() == Some(&json!("reviewed"))
+                    && row.parent_span_ids == [launch.span_id.clone()]
+            })
+            .unwrap();
+        assert_eq!(child.end_ms, Some(1_767_225_608_000));
+        assert!(after.iter().any(|op| {
+            let row = op.row();
+            row.span_type == SpanType::Llm && row.parent_span_ids == [child.span_id.clone()]
+        }));
+        assert!(after.iter().any(|op| {
+            let row = op.row();
+            row.span_type == SpanType::Tool
+                && row.parent_span_ids == [child.span_id.clone()]
+                && row.output.as_ref() == Some(&json!("file content"))
+        }));
+
+        let terminal = tail.poll(true).unwrap();
+        let remaining = terminal
+            .iter()
+            .filter(|event| event.event == "SubagentStop")
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload["agent_id"], "child-b");
     }
 }

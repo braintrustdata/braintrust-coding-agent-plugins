@@ -30,7 +30,9 @@ use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use tool_completion_hook::ToolCompletionHook;
 use transcript_envelope::TranscriptEnvelope;
-pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
+pub(crate) use transcript_envelope::{
+    cli_fork_history, is_background_agent_launch, CliForkHistory,
+};
 use transcript_tool::TranscriptTool;
 use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
 pub(crate) use user_prompt_hook::UserPromptHook;

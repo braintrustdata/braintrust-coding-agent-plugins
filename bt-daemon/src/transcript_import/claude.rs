@@ -3,7 +3,10 @@ use super::{
     string_at, timestamp_bounds, timestamp_ms, validate_session_id, IncrementalRecords,
     TailSession, TranscriptImport, TranscriptLayout,
 };
-use crate::translate::{claude_task_notification_id, ClaudeSubagentHook, ClaudeUserPromptHook};
+use crate::translate::{
+    claude_task_notification_id, is_background_agent_launch, ClaudeSubagentHook,
+    ClaudeUserPromptHook,
+};
 use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
 use anyhow::bail;
@@ -575,10 +578,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: None,
                 parent_tool_id: None,
                 depth: 0,
-                background: records[record_index]
-                    .pointer("/toolUseResult/status")
-                    .and_then(Value::as_str)
-                    == Some("async_launched"),
+                background: is_background_agent_launch(&records[record_index]),
             })
         })
         .collect::<Vec<_>>();
@@ -695,10 +695,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: parent_id,
                 parent_tool_id,
                 depth,
-                background: records[record_index]
-                    .pointer("/toolUseResult/status")
-                    .and_then(Value::as_str)
-                    == Some("async_launched"),
+                background: is_background_agent_launch(&records[record_index]),
             });
             linked.insert(agent_id.clone());
             added = true;

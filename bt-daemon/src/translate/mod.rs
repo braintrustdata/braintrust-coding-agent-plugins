@@ -23,7 +23,7 @@ mod opencode;
 mod opencode_v2;
 mod pi;
 pub(crate) use claude::{
-    cli_fork_history, successful_subagent_handback_message,
+    cli_fork_history, is_background_agent_launch, successful_subagent_handback_message,
     task_notification_id as claude_task_notification_id, CliForkHistory,
     SubagentHook as ClaudeSubagentHook, UserPromptHook as ClaudeUserPromptHook,
 };
