@@ -4,8 +4,10 @@ use serde_json::Value;
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TurnLimit {
-    max_turns: u64,
-    turn_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_turns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -35,7 +37,11 @@ impl TurnLimit {
 
     pub(super) fn add_metadata(&self, metadata: &mut serde_json::Map<String, Value>) {
         metadata.insert("termination_reason".into(), "max_turns".into());
-        metadata.insert("max_turns".into(), self.max_turns.into());
-        metadata.insert("turn_count".into(), self.turn_count.into());
+        if let Some(max_turns) = self.max_turns {
+            metadata.insert("max_turns".into(), max_turns.into());
+        }
+        if let Some(turn_count) = self.turn_count {
+            metadata.insert("turn_count".into(), turn_count.into());
+        }
     }
 }

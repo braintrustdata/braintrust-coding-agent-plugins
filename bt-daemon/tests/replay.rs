@@ -982,6 +982,53 @@ async fn imports_native_claude_transcript_with_multiple_turns_and_tools() {
 }
 
 #[tokio::test]
+async fn importing_claude_preserves_the_turn_limit_with_a_missing_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("claude.jsonl");
+    write_jsonl(
+        &transcript,
+        &[
+            json!({"type":"user","sessionId":"claude-limit","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"run it"}}),
+            json!({"type":"assistant","sessionId":"claude-limit","timestamp":"2026-01-01T00:00:02Z","message":{"id":"message","model":"claude-test","content":[{"type":"text","text":"working"}]}}),
+            json!({"type":"attachment","sessionId":"claude-limit","timestamp":"2026-01-01T00:00:03Z","attachment":{"type":"max_turns_reached","maxTurns":1,"turnCount":null}}),
+        ],
+    );
+
+    let output = tmp.path().join("spans");
+    import_transcript(
+        &transcript,
+        ImportSource::Claude,
+        import_daemon::target(&output, None).await,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let rows = rows(&output.join("claude-limit.ndjson"));
+    let turn = rows
+        .iter()
+        .filter_map(|op| op.get("Insert"))
+        .find(|row| row["name"] == "Turn 1")
+        .unwrap();
+    for (id, field) in [
+        (&turn["span_id"], "outcome"),
+        (&turn["parent_span_ids"][0], "session_status"),
+    ] {
+        let metadata = rows
+            .iter()
+            .filter_map(|op| op.get("Merge"))
+            .filter(|row| &row["span_id"] == id)
+            .filter_map(|row| row.get("metadata"))
+            .rfind(|metadata| metadata.get(field).is_some())
+            .unwrap();
+        assert_eq!(metadata[field], "interrupted");
+        assert_eq!(metadata["termination_reason"], "max_turns");
+        assert_eq!(metadata["max_turns"], 1);
+        assert!(metadata.get("turn_count").is_none());
+    }
+}
+
+#[tokio::test]
 async fn imports_claude_followups_as_sequential_turns_after_a_compact_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("claude.jsonl");
