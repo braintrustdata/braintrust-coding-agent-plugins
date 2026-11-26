@@ -101,13 +101,15 @@ impl LlmCall {
                     Some("thinking") => {
                         #[derive(Deserialize)]
                         struct ThinkingBlock<'a> {
-                            thinking: &'a str,
+                            thinking: Option<&'a str>,
                         }
-                        if let Ok(block) = ThinkingBlock::deserialize(block) {
-                            if !block.thinking.is_empty()
-                                && !self.thinking.iter().any(|seen| seen == block.thinking)
-                            {
-                                self.thinking.push(block.thinking.to_owned());
+                        if let Some(text) = ThinkingBlock::deserialize(block)
+                            .ok()
+                            .and_then(|block| block.thinking)
+                            .filter(|text| !text.is_empty())
+                        {
+                            if !self.thinking.iter().any(|seen| seen == text) {
+                                self.thinking.push(text.to_owned());
                             }
                         }
                     }
