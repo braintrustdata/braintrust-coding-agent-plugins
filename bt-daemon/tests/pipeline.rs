@@ -613,6 +613,8 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     struct RejectOnce {
         flushes: AtomicUsize,
         emitted: AtomicUsize,
+        replay_started: tokio::sync::Notify,
+        allow_replay: tokio::sync::Notify,
     }
     struct RejectOnceSink(Arc<RejectOnce>);
     struct RejectOnceFactory(Arc<RejectOnce>);
@@ -628,8 +630,13 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
             Ok(ops.len() as u64)
         }
         async fn flush(&mut self) -> anyhow::Result<()> {
-            if self.0.flushes.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("backend rejected and consumed the batch");
+            match self.0.flushes.fetch_add(1, Ordering::SeqCst) {
+                0 => anyhow::bail!("backend rejected and consumed the batch"),
+                1 => {
+                    self.0.replay_started.notify_one();
+                    self.0.allow_replay.notified().await;
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -670,8 +677,17 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     )
     .await
     .unwrap();
-    flush_session(session, &socket, 5_000).await.unwrap();
-    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+    // The first flush can complete after recovery has already retried.
+    // Hold the retry so we can inspect progress while the batch is pending.
+    let (first_flush, ()) = tokio::join!(flush_session(session, &socket, 5_000), async {
+        tokio::time::timeout(Duration::from_secs(5), sink.replay_started.notified())
+            .await
+            .expect("the rejected batch must be resubmitted");
+        let (head, tail) = head_and_tail(&data_dir);
+        assert!(head < tail, "rejected rows must remain pending");
+        sink.allow_replay.notify_one();
+    });
+    first_flush.unwrap();
     forward_envelope(&envelope(session, "Stop", 2), &socket, &dummy_host(), false)
         .await
         .unwrap();
