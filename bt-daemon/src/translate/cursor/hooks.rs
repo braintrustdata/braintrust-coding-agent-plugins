@@ -12,6 +12,7 @@
 //! saved transcript records. The `_bt_` prefix is the daemon's reserved
 //! namespace, so these names cannot collide with a native Cursor hook.
 
+use crate::agents::usage::TokenMetrics;
 use crate::translate::decode::{decode, DecodeError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -54,6 +55,15 @@ impl Hook {
     pub fn model(&self) -> Option<&str> {
         let common = self.common.as_ref()?;
         Some(common.model_id.as_deref().unwrap_or(&common.model))
+    }
+
+    pub fn usage_model(&self) -> Option<&str> {
+        self.model().map(str::trim).filter(|model| {
+            !model.is_empty()
+                && !["auto", "default", "unknown"]
+                    .iter()
+                    .any(|placeholder| model.eq_ignore_ascii_case(placeholder))
+        })
     }
 
     pub fn model_params(&self) -> Option<&Value> {
@@ -278,6 +288,22 @@ pub(super) struct TurnUsage {
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    pub fn merge_into(&self, metrics: &mut TokenMetrics) {
+        // Response and stop can carry overlapping or partial snapshots.
+        metrics.prompt_tokens = self.input_tokens.or(metrics.prompt_tokens);
+        metrics.completion_tokens = self.output_tokens.or(metrics.completion_tokens);
+        metrics.prompt_cached_tokens = self.cache_read_tokens.or(metrics.prompt_cached_tokens);
+        metrics.prompt_cache_creation_tokens = self
+            .cache_write_tokens
+            .or(metrics.prompt_cache_creation_tokens);
+        metrics.tokens = metrics
+            .prompt_tokens
+            .zip(metrics.completion_tokens)
+            .and_then(|(prompt, completion)| prompt.checked_add(completion));
+    }
 }
 
 #[derive(Deserialize)]

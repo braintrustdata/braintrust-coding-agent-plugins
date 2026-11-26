@@ -195,6 +195,8 @@ fn real_interactive_error_capture_has_two_turns_one_read_and_turn_scoped_usage()
         assert_eq!(turn["metrics"]["prompt_tokens"], expected.0);
         assert_eq!(turn["metrics"]["completion_tokens"], expected.1);
         assert_eq!(turn["metadata"]["token_usage_scope"], "turn");
+        assert_eq!(turn["metadata"]["model"], "composer-2.5");
+        assert_eq!(turn["metadata"]["token_usage_model_status"], "single");
     }
     let tool = &rows[&h.inserted(SpanType::Tool)[0].span_id];
     assert_eq!(tool["parent_span_ids"], json!([h.turns()[1].span_id]));
@@ -1268,7 +1270,7 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
     h.handle(&event(
         "stop",
         110,
-        json!({"generation_id":"t1","status":"completed"}),
+        json!({"generation_id":"t1","status":"completed","model":"grok-4.7"}),
     ));
     h.handle(&event(
         "beforeSubmitPrompt",
@@ -1278,12 +1280,15 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
     h.handle(&event(
         "afterAgentThought",
         130,
-        json!({"generation_id":"t2","text":"second thinking"}),
+        json!({"generation_id":"t2","text":"second thinking","model":"gpt-4o"}),
     ));
     h.handle(&event(
         "afterAgentResponse",
         140,
-        json!({"generation_id":"t1","text":"first answer","input_tokens":20,"output_tokens":2}),
+        json!({
+            "generation_id":"t1","text":"first answer",
+            "model":"muse-wonder-1.0","input_tokens":20,"output_tokens":2
+        }),
     ));
     assert!(h.inserted(SpanType::Llm).is_empty());
     h.handle(&event(
@@ -1299,7 +1304,7 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
     h.handle(&event(
         "afterAgentResponse",
         150,
-        json!({"generation_id":"t2","text":"second answer"}),
+        json!({"generation_id":"t2","text":"second answer","input_tokens":15,"output_tokens":3}),
     ));
     h.handle(&event(
         "stop",
@@ -1309,8 +1314,14 @@ fn synthetic_late_old_turn_response_cannot_end_current_turn_model() {
     h.finish();
     assert_eq!(h.turns().len(), 2);
     let rows = h.rows();
-    assert_eq!(rows[&h.turns()[0].span_id]["output"], "first answer");
-    assert_eq!(rows[&h.turns()[1].span_id]["output"], "second answer");
+    let first_turn = &rows[&h.turns()[0].span_id];
+    assert_eq!(first_turn["output"], "first answer");
+    assert_eq!(first_turn["metadata"]["token_usage_model_status"], "mixed");
+    assert!(first_turn["metadata"]["model"].is_null());
+    let second_turn = &rows[&h.turns()[1].span_id];
+    assert_eq!(second_turn["output"], "second answer");
+    assert_eq!(second_turn["metadata"]["model"], "gpt-4o");
+    assert_eq!(second_turn["metrics"]["tokens"], 18);
     let second: Vec<_> = h
         .inserted(SpanType::Llm)
         .into_iter()
@@ -1512,6 +1523,8 @@ fn real_daemon_two_turn_capture_correlates_three_tools_and_keeps_native_usage_to
         assert!(row["metadata"].get("turn_boundary_source").is_none());
         assert!(row["metadata"].get("start_time_estimated").is_none());
         assert_eq!(row["metadata"]["token_usage_scope"], "turn");
+        assert!(row["metadata"]["model"].is_null());
+        assert_eq!(row["metadata"]["token_usage_model_status"], "unknown");
         assert_eq!(row["metadata"]["status"], "completed");
         assert_eq!(row["metrics"]["prompt_tokens"], input);
         assert_eq!(row["metrics"]["completion_tokens"], output);
@@ -1797,6 +1810,7 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
     ));
     let id = h.turns()[0].span_id.clone();
     let rows = h.rows();
+    assert!(rows[&id]["metadata"].get("model").is_none());
     assert!(rows[&id]["metrics"].get("completion_tokens").is_none());
     assert!(rows[&id]["metrics"].get("tokens").is_none());
     assert!(rows[&id]["metrics"]
@@ -1814,6 +1828,8 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
     h.handle(&stop);
     h.finish();
     let rows = h.rows();
+    assert_eq!(rows[&id]["metadata"]["model"], "composer-2.5");
+    assert_eq!(rows[&id]["metadata"]["token_usage_model_status"], "single");
     assert_eq!(
         rows[&id]["metrics"],
         json!({
@@ -1824,6 +1840,71 @@ fn synthetic_partial_usage_merges_known_counts_without_inventing_missing_values(
     assert!(llm.metrics.is_none());
     assert!(llm.metadata.as_ref().unwrap().get("provider").is_none());
     assert_eq!(llm.metadata.as_ref().unwrap()["model"], "composer-2.5");
+}
+
+#[test]
+fn turn_usage_tracks_models_across_completion_boundaries() {
+    for (final_model, status, model) in [
+        ("grok-4.7", "single", Some("grok-4.7")),
+        ("muse-wonder-1.0", "mixed", None),
+    ] {
+        let mut h = Harness::new("test-session");
+        h.handle(&event(
+            "beforeSubmitPrompt",
+            100,
+            json!({"generation_id":"t","prompt":"hello"}),
+        ));
+        h.handle(&event(
+            "afterAgentThought",
+            110,
+            json!({"text":"thinking","model":"Grok 4.7","model_id":"grok-4.7"}),
+        ));
+        h.handle(&event(
+            "preToolUse",
+            120,
+            json!({"tool_name":"Read","tool_use_id":"r1","tool_input":{}}),
+        ));
+        h.handle(&event(
+            "postToolUse",
+            130,
+            json!({"tool_name":"Read","tool_use_id":"r1","tool_input":{},"tool_output":"file","duration":10}),
+        ));
+        h.handle(&event(
+            "afterAgentResponse",
+            140,
+            json!({
+                "generation_id":"t","model":final_model,"text":"done",
+                "input_tokens":133244,"output_tokens":381
+            }),
+        ));
+        h.handle(&event(
+            "stop",
+            150,
+            json!({"generation_id":"t","status":"completed","model":final_model}),
+        ));
+        let rows = h.rows();
+        let turn = &rows[&h.turns()[0].span_id];
+        assert_eq!(turn["metadata"]["model"], json!(model));
+        assert_eq!(turn["metadata"]["token_usage_model_status"], status);
+        assert_eq!(
+            rows.values()
+                .filter_map(|row| row["metrics"]["tokens"].as_u64())
+                .sum::<u64>(),
+            133625
+        );
+        assert_eq!(turn["metrics"]["tokens"], 133625);
+        let completions = h.inserted(SpanType::Llm);
+        assert_eq!(completions.len(), 2);
+        assert_eq!(
+            completions[0].metadata.as_ref().unwrap()["model"],
+            "grok-4.7"
+        );
+        assert_eq!(
+            completions[1].metadata.as_ref().unwrap()["model"],
+            final_model
+        );
+        assert!(completions.iter().all(|row| row.metrics.is_none()));
+    }
 }
 
 #[test]

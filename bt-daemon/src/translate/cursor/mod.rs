@@ -51,6 +51,7 @@ const CURSOR_METADATA_FIELDS: &[&str] = &[
     "history_truncated",
     "output_truncated",
     "token_usage_scope",
+    "token_usage_model_status",
     "status",
     "result_completeness",
     "pre_read_content",
@@ -115,6 +116,35 @@ struct Turn {
     model_seq: u64,
     emitted_text: String,
     usage: TokenMetrics,
+    #[serde(default)]
+    usage_model: TurnModel,
+}
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+enum TurnModel {
+    #[default]
+    Unknown,
+    Single(String),
+    Mixed,
+}
+
+impl TurnModel {
+    fn observe(&mut self, model: &str) {
+        match self {
+            Self::Unknown => *self = Self::Single(model.to_owned()),
+            Self::Single(known) if known != model => *self = Self::Mixed,
+            _ => {}
+        }
+    }
+
+    fn metadata(&self) -> Value {
+        let (status, model) = match self {
+            Self::Unknown => ("unknown", None),
+            Self::Single(model) => ("single", Some(model)),
+            Self::Mixed => ("mixed", None),
+        };
+        json!({"token_usage_scope":"turn", "token_usage_model_status":status, "model":model})
+    }
 }
 #[derive(PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -401,6 +431,7 @@ impl CursorTranslator {
             model_seq: 0,
             emitted_text: String::new(),
             usage: TokenMetrics::default(),
+            usage_model: TurnModel::default(),
         };
         if let Some(g) = generation {
             self.prompt_generations.insert(g.into(), turn.clone());
@@ -629,6 +660,18 @@ impl CursorTranslator {
         };
         turn.end = Some(ts.max(turn.start));
         let copy = turn.clone();
+        let saved = self
+            .prompt_generations
+            .iter()
+            .find(|(_, saved)| saved.id == copy.id)
+            .map(|(generation, saved)| (generation.clone(), saved.clone()));
+        if let Some((generation, mut saved)) = saved {
+            saved.usage_model = copy.usage_model;
+            if saved.usage != TokenMetrics::default() {
+                ops.push(self.turn_usage_row(&saved, true));
+            }
+            self.prompt_generations.insert(generation, saved);
+        }
         let mut row = self.row(
             copy.id,
             self.root.clone(),
@@ -741,15 +784,15 @@ impl CursorTranslator {
             {
                 return;
             }
-            self.model_content(
-                ModelContent::ToolUse {
-                    id: call_id.to_owned(),
-                    name: tool.row.name.clone(),
-                    input: tool.row.input.clone(),
-                },
-                e.ts_ms,
-                ops,
-            );
+            let content = ModelContent::ToolUse {
+                id: call_id.to_owned(),
+                name: tool.row.name.clone(),
+                input: tool.row.input.clone(),
+            };
+            if tool_hook.parent_tool_call_id.is_none() {
+                self.observe_active_model(hook);
+            }
+            self.model_content(content, e.ts_ms, ops);
             self.close_model(e.ts_ms, ops);
             return;
         }
@@ -777,6 +820,9 @@ impl CursorTranslator {
                     })
             });
             if let Some((boundary, call_id, name, input)) = terminal_only {
+                if tool_hook.parent_tool_call_id.is_none() {
+                    self.observe_active_model(hook);
+                }
                 // Without preToolUse, the duration is the only available
                 // tool-request boundary. Tool execution is not model latency.
                 self.model_content(
@@ -1326,43 +1372,56 @@ impl CursorTranslator {
         row.error = error;
         ops.push(SpanOp::Insert(row));
     }
-    fn turn_usage(&mut self, generation: Option<&str>, usage: &TurnUsage, ops: &mut Vec<SpanOp>) {
+    fn observe_active_model(&mut self, hook: &Hook) {
+        // Only model activity contributes here. Session and prompt hooks
+        // describe selection, and subagent hooks can describe a different run.
+        let Some(turn) = self.turn.as_mut().filter(|turn| turn.end.is_none()) else {
+            return;
+        };
+        let owner = hook
+            .generation_id()
+            .and_then(|generation| self.prompt_generations.get(generation));
+        if let Some(model) = hook
+            .usage_model()
+            .filter(|_| owner.is_none_or(|owner| owner.id == turn.id))
+        {
+            turn.usage_model.observe(model);
+        }
+    }
+
+    fn turn_usage(&mut self, hook: &Hook, usage: &TurnUsage, ops: &mut Vec<SpanOp>) {
         // Verified interactive CLI/desktop emissions are totals for one user
         // generation, repeated on response and stop. Merge, never sum.
-        let Some((generation, mut turn)) =
-            generation.and_then(|g| Some((g, self.prompt_generations.get(g)?.clone())))
+        let Some((generation, mut turn)) = hook
+            .generation_id()
+            .and_then(|g| Some((g, self.prompt_generations.get(g)?.clone())))
         else {
             return;
         };
-        if usage.input_tokens.is_none()
-            && usage.output_tokens.is_none()
-            && usage.cache_read_tokens.is_none()
-            && usage.cache_write_tokens.is_none()
+        let previous_model = turn.usage_model.clone();
+        let current = self.turn.as_mut().filter(|current| current.id == turn.id);
+        let closed = current.as_ref().is_none_or(|current| current.end.is_some());
+        if let Some(current) = current {
+            if let Some(model) = hook.usage_model() {
+                current.usage_model.observe(model);
+            }
+            turn.usage_model = current.usage_model.clone();
+        } else if let Some(model) = hook.usage_model() {
+            turn.usage_model.observe(model);
+        }
+        let previous_usage = turn.usage.clone();
+        usage.merge_into(&mut turn.usage);
+        if turn.usage != previous_usage
+            || (closed
+                && turn.usage != TokenMetrics::default()
+                && turn.usage_model != previous_model)
         {
-            return;
+            ops.push(self.turn_usage_row(&turn, closed));
         }
-        // Response and stop carry partial snapshots. Replace known fields,
-        // never sum snapshots or fabricate counters missing from both.
-        if let Some(count) = usage.input_tokens {
-            turn.usage.prompt_tokens = Some(count);
-        }
-        if let Some(count) = usage.output_tokens {
-            turn.usage.completion_tokens = Some(count);
-        }
-        if let Some(count) = usage.cache_read_tokens {
-            turn.usage.prompt_cached_tokens = Some(count);
-        }
-        if let Some(count) = usage.cache_write_tokens {
-            turn.usage.prompt_cache_creation_tokens = Some(count);
-        }
-        if let Some(total) = turn
-            .usage
-            .prompt_tokens
-            .zip(turn.usage.completion_tokens)
-            .and_then(|(prompt, completion)| prompt.checked_add(completion))
-        {
-            turn.usage.tokens = Some(total);
-        }
+        self.prompt_generations.insert(generation.into(), turn);
+    }
+
+    fn turn_usage_row(&self, turn: &Turn, closed: bool) -> SpanOp {
         let mut row = self.row(
             turn.id.clone(),
             self.root.clone(),
@@ -1370,13 +1429,18 @@ impl CursorTranslator {
             SpanType::Task,
         );
         let metrics = json!(turn.usage);
-        let metrics_id = ids::span_id(&self.namespace, &metrics.to_string());
+        // While the turn is running, later work may report another model.
+        let metadata = if closed {
+            turn.usage_model.metadata()
+        } else {
+            json!({"token_usage_scope":"turn"})
+        };
+        let usage_id = ids::span_id(&self.namespace, &json!([metrics, metadata]).to_string());
         row.metrics = Some(metrics);
-        row.metadata = Some(json!({"token_usage_scope":"turn"}));
-        self.prompt_generations.insert(generation.into(), turn);
+        row.metadata = Some(metadata);
         // A stop/response can enrich a row already closed by a transcript boundary.
-        row.late_merge_key = Some(format!("cursor-turn-usage:{}:{}", row.span_id, metrics_id));
-        ops.push(SpanOp::Merge(row));
+        row.late_merge_key = Some(format!("cursor-turn-usage:{}:{usage_id}", row.span_id));
+        SpanOp::Merge(row)
     }
     fn reduce_hook(&mut self, e: &Envelope, hook: &Hook, ops: &mut Vec<SpanOp>) {
         // Deduplicate on the native payload as received, without daemon fields.
@@ -1427,11 +1491,12 @@ impl CursorTranslator {
                     e.ts_ms,
                     ops,
                 );
+                self.observe_active_model(hook);
             }
             CursorHook::AfterAgentResponse(response) => {
-                self.response(e, generation, response, &native, ops)
+                self.response(e, hook, response, &native, ops)
             }
-            CursorHook::Stop(stop) => self.stop(e, generation, stop, &native, ops),
+            CursorHook::Stop(stop) => self.stop(e, hook, stop, &native, ops),
             CursorHook::ImportStop(stop) => self.import_stop(e, stop, ops),
             CursorHook::SessionEnd(end) => self.session_end(e, end, ops),
             CursorHook::SubagentStart(start) => self.subagent_start(e, start, ops),
@@ -1447,16 +1512,20 @@ impl CursorTranslator {
     fn response(
         &mut self,
         e: &Envelope,
-        generation: Option<&str>,
+        hook: &Hook,
         response: &ResponseHook,
         native: &Value,
         ops: &mut Vec<SpanOp>,
     ) {
-        let owner = generation
+        let owner = hook
+            .generation_id()
             .and_then(|g| self.prompt_generations.get(g))
             .map(|t| t.id.clone());
-        if let Some(owner) = owner.filter(|id| self.turn.as_ref().is_none_or(|t| &t.id != id)) {
-            let mut row = self.row(owner, self.root.clone(), "", SpanType::Task);
+        if let Some(owner) = owner
+            .as_ref()
+            .filter(|id| self.turn.as_ref().is_none_or(|t| &t.id != *id))
+        {
+            let mut row = self.row(owner.clone(), self.root.clone(), "", SpanType::Task);
             row.output = Some(json!(response.text));
             row.metadata = Some(
                 json!({"late_output_enrichment":true,"historical_model_grouping_available":false}),
@@ -1467,7 +1536,7 @@ impl CursorTranslator {
             ));
             ops.push(SpanOp::Merge(row));
             self.mark_history_truncated();
-            self.turn_usage(generation, &response.usage, ops);
+            self.turn_usage(hook, &response.usage, ops);
             return;
         }
         let text = response.text.as_str();
@@ -1494,20 +1563,24 @@ impl CursorTranslator {
                 t.output = Some(text.into());
             }
         }
-        self.turn_usage(generation, &response.usage, ops);
+        if owner.is_none() {
+            self.observe_active_model(hook);
+        }
+        self.turn_usage(hook, &response.usage, ops);
         self.close_model(e.ts_ms, ops);
         self.merge_late_answer(ops);
     }
     fn stop(
         &mut self,
         e: &Envelope,
-        generation: Option<&str>,
+        hook: &Hook,
         stop: &StopHook,
         native: &Value,
         ops: &mut Vec<SpanOp>,
     ) {
-        self.turn_usage(generation, &stop.usage, ops);
-        let prior = generation
+        self.turn_usage(hook, &stop.usage, ops);
+        let prior = hook
+            .generation_id()
             .and_then(|g| self.prompt_generations.get(g))
             .filter(|t| self.turn.as_ref().is_none_or(|current| current.id != t.id))
             .cloned();
@@ -1601,7 +1674,9 @@ impl CursorTranslator {
                 // correlation/enrichment fields remain in the durable journal.
                 metadata.retain(|key, value| {
                     CURSOR_METADATA_FIELDS.contains(&key.as_str())
-                        && !value.is_null()
+                        // A delayed conflicting model observation clears the
+                        // model previously assigned to a turn's usage.
+                        && (!value.is_null() || (key == "model" && row.metrics.is_some()))
                         && !(matches!(
                             key.as_str(),
                             "start_time_estimated"
