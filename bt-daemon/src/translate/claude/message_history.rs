@@ -4,7 +4,7 @@ use super::llm_call::LlmCall;
 use super::parsed_transcript::ParsedTranscript;
 use super::transcript_envelope::TranscriptEnvelope;
 use super::transcript_tool::TranscriptTool;
-use super::{decode, parse_timestamp_ms, string_field};
+use super::{parse_timestamp_ms, string_field};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -68,7 +68,7 @@ impl MessageHistory {
         let mut tool_order = Vec::<String>::new();
 
         for record in records {
-            let Some(envelope) = decode::<TranscriptEnvelope>(record) else {
+            let Ok(envelope) = TranscriptEnvelope::deserialize(record) else {
                 continue;
             };
             match envelope.kind.as_deref() {
@@ -157,38 +157,35 @@ impl MessageHistory {
                         .pointer("/message/content")
                         .cloned()
                         .unwrap_or(Value::Null);
-                    if let Some(blocks) = content.as_array() {
-                        let mut had_tool_result = false;
-                        for block in blocks {
-                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                                continue;
-                            }
-                            had_tool_result = true;
-                            let call_id = string_field(block, "tool_use_id").unwrap_or_default();
-                            let result = block.get("content").cloned().unwrap_or(Value::Null);
-                            self.push(
-                                json!({
-                                    "role": "tool",
-                                    "tool_call_id": call_id,
-                                    "content": result
-                                }),
-                                string_field(record, "uuid"),
-                            );
-                            if let Some(tool) = tools.get_mut(&call_id) {
-                                tool.observe_result(result, block, record);
-                            }
-                        }
-                        if !had_tool_result {
+                    let mut results = envelope.tool_results().peekable();
+                    if results.peek().is_none() {
+                        if !content.is_null() {
                             self.push(
                                 json!({ "role": "user", "content": content }),
                                 string_field(record, "uuid"),
                             );
                         }
-                    } else if !content.is_null() {
-                        self.push(
-                            json!({ "role": "user", "content": content }),
-                            string_field(record, "uuid"),
-                        );
+                    } else {
+                        for result in results {
+                            let call_id = result.tool_use_id.as_deref().unwrap_or_default();
+                            let output = result.content().cloned().unwrap_or(Value::Null);
+                            self.push(
+                                json!({
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": output
+                                }),
+                                string_field(record, "uuid"),
+                            );
+                            if let Some(tool) = tools.get_mut(call_id) {
+                                tool.observe_result(
+                                    output,
+                                    result,
+                                    &envelope,
+                                    parse_timestamp_ms(record),
+                                );
+                            }
+                        }
                     }
                 }
                 Some("system") if envelope.subtype.as_deref() == Some("compact_boundary") => {

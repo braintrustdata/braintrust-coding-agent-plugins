@@ -14,6 +14,7 @@ mod native_field;
 mod parsed_transcript;
 mod subagent_hook;
 mod timestamp_envelope;
+mod tool_completion_hook;
 mod transcript_envelope;
 mod transcript_tool;
 mod transcript_tool_outcome;
@@ -26,15 +27,17 @@ use subagent_hook::SubagentHook;
 #[cfg(test)]
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
+use tool_completion_hook::ToolCompletionHook;
 use transcript_envelope::TranscriptEnvelope;
 pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
 use transcript_tool::TranscriptTool;
+use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
 use super::tool::{
-    add_tool_approval, explicit_skill_metadata, nonempty_error_text, prompt_skill_names,
-    push_unique, skill_file_load, skill_md_paths, SkillLoad, ToolApproval,
+    add_tool_approval, explicit_skill_metadata, prompt_skill_names, push_unique, skill_file_load,
+    skill_md_paths, SkillLoad, ToolApproval,
 };
 use super::{
     local_username, AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFactory,
@@ -721,23 +724,31 @@ impl ClaudeTranslator {
         );
     }
 
-    fn finish_tool(
-        &mut self,
-        event: &Envelope,
-        approval: ToolApproval,
-        forced_error: Option<String>,
-        ops: &mut Vec<SpanOp>,
-    ) {
+    fn finish_tool(&mut self, event: &Envelope, mut approval: ToolApproval, ops: &mut Vec<SpanOp>) {
         let Some(tool_name) = tool_name(&event.payload) else {
             return;
         };
         let call_id = self.call_id(event);
         self.pending_nested_spawns.remove(&call_id);
         let input = tool_input(&event.payload);
-        let output = tool_output(&event.payload);
-        let error = (approval != ToolApproval::Denied)
-            .then(|| forced_error.or_else(|| tool_error(&event.payload)))
-            .flatten();
+        let failure = ToolCompletionHook::deserialize(&event.payload).unwrap_or_default();
+        let failure_hook = event.event == "PostToolUseFailure";
+        let denied = failure_hook && failure.error.as_ref().is_some_and(is_permission_denial);
+        if denied {
+            approval = ToolApproval::Denied;
+        }
+        let error = if approval == ToolApproval::Denied {
+            None
+        } else if failure_hook {
+            Some(
+                failure
+                    .summary()
+                    .unwrap_or_else(|| "Tool execution failed".into()),
+            )
+        } else {
+            failure.tool_error()
+        };
+        let output = failure.into_output(denied);
         if approval == ToolApproval::Approved && error.is_none() && tool_name == "SubagentHandback"
         {
             if let (Some(agent_id), Some(message)) = (
@@ -1207,6 +1218,7 @@ impl ClaudeTranslator {
         };
         self.session_status = Some(outcome.to_string());
         let error = (!interrupted).then_some(error).flatten();
+        self.recover_pending_denials(&turn_id, event.ts_ms, ops);
         self.emit_main(&turn_id, ops);
         self.close_pending_tools(
             &turn_id,
@@ -1239,6 +1251,56 @@ impl ClaudeTranslator {
         self.last_user_turn_id = turn.user_turn_id;
         self.last_turn_id = Some(turn_id);
         self.requested_skills.clear();
+    }
+
+    fn recover_pending_denials(&mut self, turn_id: &str, end_ms: i64, ops: &mut Vec<SpanOp>) {
+        if self.pending_tools.is_empty() {
+            return;
+        }
+        let Some(cursor) = self
+            .main_transcript
+            .as_ref()
+            .and_then(|path| self.transcripts.get(path))
+        else {
+            return;
+        };
+        for record in &cursor.buffered {
+            let Ok(row) = TranscriptEnvelope::deserialize(record) else {
+                continue;
+            };
+            for result in row.tool_results() {
+                let Some(call_id) = result.tool_use_id.as_deref() else {
+                    continue;
+                };
+                if !self
+                    .pending_tools
+                    .get(call_id)
+                    .is_some_and(|tool| tool.parent_id == turn_id)
+                    || !matches!(
+                        TranscriptToolOutcome::from_result(result, row.tool_use_result.as_ref()),
+                        TranscriptToolOutcome::Denied
+                    )
+                {
+                    continue;
+                }
+                let Some(tool) = self.pending_tools.remove(call_id) else {
+                    continue;
+                };
+                self.pending_nested_spawns.remove(call_id);
+                self.emitted_tools.insert(call_id.to_owned());
+                let mut metadata = tool.metadata.as_object().cloned().unwrap_or_default();
+                add_tool_approval(&mut metadata, Some(ToolApproval::Denied));
+                ops.push(SpanOp::Merge(SpanRow {
+                    span_id: tool.span_id,
+                    root_span_id: self.root_span_id.clone(),
+                    parent_span_ids: vec![tool.parent_id],
+                    end_ms: Some(parse_timestamp_ms(record).unwrap_or(end_ms)),
+                    output: result.content().cloned(),
+                    metadata: Some(Value::Object(metadata)),
+                    ..Default::default()
+                }));
+            }
+        }
     }
 
     fn close_pending_tools(
@@ -1430,14 +1492,10 @@ impl AgentTranslator for ClaudeTranslator {
             }
             "UserPromptExpansion" => self.record_skill(event, &mut ops),
             "PreToolUse" => self.pre_tool(event, &mut ops),
-            "PostToolUse" => self.finish_tool(event, ToolApproval::Approved, None, &mut ops),
-            "PostToolUseFailure" => self.finish_tool(
-                event,
-                ToolApproval::Approved,
-                tool_failure_text(&event.payload).or_else(|| Some("Tool execution failed".into())),
-                &mut ops,
-            ),
-            "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, None, &mut ops),
+            "PostToolUse" | "PostToolUseFailure" => {
+                self.finish_tool(event, ToolApproval::Approved, &mut ops);
+            }
+            "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, &mut ops),
             "PostCompact" => {
                 let turn_span_id = self
                     .turn
@@ -1502,7 +1560,9 @@ impl AgentTranslator for ClaudeTranslator {
             "StopFailure" => {
                 self.stop_turn(
                     event,
-                    tool_failure_text(&event.payload)
+                    ToolCompletionHook::deserialize(&event.payload)
+                        .ok()
+                        .and_then(|failure| failure.summary())
                         .or_else(|| Some("Claude Code turn failed".into())),
                     &mut ops,
                 );
@@ -1940,14 +2000,6 @@ fn tool_input(payload: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn tool_output(payload: &Value) -> Option<Value> {
-    payload
-        .get("tool_response")
-        .or_else(|| payload.get("output"))
-        .cloned()
-        .or_else(|| payload.pointer("/tool_response/output").cloned())
-}
-
 fn tool_name(payload: &Value) -> Option<String> {
     string_field(payload, "tool_name").or_else(|| string_field(payload, "tool"))
 }
@@ -2046,52 +2098,6 @@ fn tool_span_name(tool: &str, input: &Value, skill: Option<&SkillLoad>) -> Strin
         }
         _ => tool.to_string(),
     }
-}
-
-fn tool_error(payload: &Value) -> Option<String> {
-    let response = payload.get("tool_response");
-    let explicit_error = [
-        payload.get("error"),
-        response.and_then(|response| response.get("error")),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(nonempty_error_text);
-    if let Some(error) = explicit_error {
-        return Some(error);
-    }
-    let failed = response.is_some_and(|response| {
-        response
-            .get("interrupted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || response
-                .get("is_error")
-                .or_else(|| response.get("isError"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || response
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|value| matches!(value, "error" | "failed"))
-    });
-    failed
-        .then(|| tool_failure_text(payload).unwrap_or_else(|| "Tool execution failed".to_string()))
-}
-
-fn tool_failure_text(payload: &Value) -> Option<String> {
-    [
-        payload.get("error"),
-        payload.get("message"),
-        payload.pointer("/tool_response/error"),
-        payload.pointer("/tool_response/stderr"),
-        payload.pointer("/tool_response/message"),
-        payload.pointer("/tool_response/output"),
-        payload.get("tool_response"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(nonempty_error_text)
 }
 
 fn is_interrupt_reason(reason: &str) -> bool {

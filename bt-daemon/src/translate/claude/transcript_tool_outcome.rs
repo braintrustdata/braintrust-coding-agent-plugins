@@ -1,4 +1,5 @@
 //! Interpret native tool completion without treating cancellation as failure.
+use super::transcript_envelope::TranscriptToolResult;
 use crate::translate::tool::nonempty_error_text;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,45 +13,26 @@ pub(super) enum TranscriptToolOutcome {
 }
 
 impl TranscriptToolOutcome {
-    pub(super) fn from_result(block: &Value, record: &Value) -> Self {
-        let native_result = record.get("toolUseResult");
-        let values = [block.get("content"), native_result]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+    pub(super) fn from_result(
+        result: &TranscriptToolResult,
+        native_result: Option<&Value>,
+    ) -> Self {
+        let values = [result.content(), native_result];
+        let values = || values.iter().copied().flatten();
 
-        let error_signalled = block.get("is_error").and_then(Value::as_bool) == Some(true)
-            || block.get("isError").and_then(Value::as_bool) == Some(true)
-            || values.iter().any(|value| has_structured_error(value));
-        let structured_denial = values
-            .iter()
+        let error_signalled = result.signals_error() || values().any(has_structured_error);
+        let structured_denial = values()
             .any(|value| has_structured_outcome(value, &["denied", "deny", "rejected", "reject"]));
-        let denial_text = values.iter().any(|value| {
-            (has_outcome_phrase(value, &["permission to use"])
-                && has_outcome_phrase(value, &["has been denied"]))
-                || has_outcome_phrase(
-                    value,
-                    &[
-                        "tool use was rejected",
-                        "tool use was denied",
-                        "user rejected",
-                        "user denied",
-                        "user doesn't want to proceed",
-                        "user does not want to proceed",
-                        "permission request was rejected",
-                        "permission request was denied",
-                    ],
-                )
-        });
+        let denial_text = values().any(is_permission_denial);
         if structured_denial || (error_signalled && denial_text) {
             return TranscriptToolOutcome::Denied;
         }
 
-        let structured_cancellation = values.iter().any(|value| {
+        let structured_cancellation = values().any(|value| {
             has_structured_outcome(value, &["cancelled", "canceled", "aborted", "interrupted"])
                 || has_structured_cancellation(value)
         });
-        let cancellation_text = values.iter().any(|value| {
+        let cancellation_text = values().any(|value| {
             has_outcome_phrase(
                 value,
                 &[
@@ -70,9 +52,8 @@ impl TranscriptToolOutcome {
         }
 
         if error_signalled {
-            let error = values
-                .iter()
-                .find_map(|value| nonempty_error_text(value))
+            let error = values()
+                .find_map(nonempty_error_text)
                 .unwrap_or_else(|| "Tool execution failed".into());
             TranscriptToolOutcome::Failed(error)
         } else {
@@ -124,4 +105,25 @@ fn has_outcome_phrase(value: &Value, phrases: &[&str]) -> bool {
             .any(|value| has_outcome_phrase(value, phrases)),
         _ => false,
     }
+}
+
+pub(super) fn is_permission_denial(value: &Value) -> bool {
+    (has_outcome_phrase(value, &["permission to use"])
+        && has_outcome_phrase(value, &["has been denied"]))
+        || has_outcome_phrase(
+            value,
+            &[
+                "tool use was rejected",
+                "tool use was denied",
+                "user rejected",
+                "user denied",
+                "user doesn't want to proceed",
+                "user does not want to proceed",
+                "permission request was rejected",
+                "permission request was denied",
+                "but you haven't granted it yet",
+                "denied by the claude code auto mode classifier",
+                "denied by a built-in claude code safety check",
+            ],
+        )
 }

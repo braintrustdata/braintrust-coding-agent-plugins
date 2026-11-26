@@ -1,4 +1,5 @@
 //! One transcript-recovered tool call and its terminal transitions.
+use super::transcript_envelope::{TranscriptEnvelope, TranscriptToolResult};
 use super::transcript_tool_outcome::TranscriptToolOutcome;
 use super::{parse_timestamp_ms, skill_load, string_field, tool_span_name};
 use crate::translate::tool::{add_tool_approval, ToolApproval};
@@ -36,11 +37,17 @@ impl TranscriptTool {
         }
     }
 
-    pub(super) fn observe_result(&mut self, result: Value, block: &Value, record: &Value) {
-        self.output = Some(result);
-        self.end_ms = parse_timestamp_ms(record).unwrap_or(self.start_ms);
+    pub(super) fn observe_result(
+        &mut self,
+        output: Value,
+        result: &TranscriptToolResult,
+        row: &TranscriptEnvelope,
+        timestamp_ms: Option<i64>,
+    ) {
+        self.output = Some(output);
+        self.end_ms = timestamp_ms.unwrap_or(self.start_ms);
         self.terminal = true;
-        match TranscriptToolOutcome::from_result(block, record) {
+        match TranscriptToolOutcome::from_result(result, row.tool_use_result.as_ref()) {
             TranscriptToolOutcome::Succeeded => self.approval = Some(ToolApproval::Approved),
             TranscriptToolOutcome::Failed(error) => {
                 self.approval = Some(ToolApproval::Approved);

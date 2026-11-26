@@ -3108,3 +3108,75 @@ fn claude_expansion_before_submit_reaches_the_incoming_turn_while_another_is_ope
     let skill = tool_span(&rows, "review").metadata.as_ref().unwrap();
     assert_eq!(skill["skill_load_trigger"], json!("explicit"));
 }
+
+#[test]
+fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook() {
+    let request =
+        "Claude requested permissions to write to out.txt, but you haven't granted it yet.";
+    let refusal = "denied by the Claude Code auto mode classifier";
+    let structured = json!({"content":[{"type":"text","text":refusal}]});
+    let records = [
+        json!({"type":"assistant","message":{"id":"tool-request","content":[{"type":"tool_use","id":"silent","name":"Write","input":{}}]}}),
+        json!({"type":"user","timestamp":"1970-01-01T00:00:00.025Z","message":{"content":[{"type":"tool_result","tool_use_id":"silent","is_error":true,"content":refusal}]}}),
+    ];
+    let contents = records
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect::<String>();
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"write"})),
+            (
+                "PreToolUse",
+                11,
+                json!({"tool_name":"Write","tool_use_id":"explicit"}),
+            ),
+            (
+                "PostToolUseFailure",
+                13,
+                json!({"tool_name":"Write","tool_use_id":"explicit","error":request}),
+            ),
+            (
+                "PreToolUse",
+                14,
+                json!({"tool_name":"Write","tool_use_id":"structured"}),
+            ),
+            (
+                "PostToolUseFailure",
+                15,
+                json!({"tool_name":"Write","tool_use_id":"structured","error":structured}),
+            ),
+            (
+                "PreToolUse",
+                20,
+                json!({"tool_name":"Write","tool_use_id":"silent"}),
+            ),
+            (
+                "Stop",
+                30,
+                json!({"transcript_path":"main.jsonl","_bt_transcript_snapshot":{"path":"main.jsonl","contents":contents}}),
+            ),
+        ],
+        false,
+    );
+    for (id, end, reason) in [
+        ("explicit", 13, json!(request)),
+        ("structured", 15, structured),
+        ("silent", 25, json!(refusal)),
+    ] {
+        let tool = rows
+            .values()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("tool_call_id"))
+                    == Some(&json!(id))
+            })
+            .unwrap();
+        let metadata = tool.metadata.as_ref().unwrap();
+        assert_eq!(metadata["tool_approval"], "denied");
+        assert_ne!(metadata["cancelled"], true);
+        assert_eq!(tool.end_ms, Some(end));
+        assert_eq!(tool.output, Some(reason));
+    }
+}
