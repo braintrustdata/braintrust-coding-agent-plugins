@@ -5,7 +5,7 @@ use super::{
 };
 use crate::translate::{
     claude_task_notification_id, is_background_agent_launch, ClaudeSubagentHook,
-    ClaudeUserPromptHook,
+    ClaudeTranscriptEnvelope, ClaudeUserPromptHook,
 };
 use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
@@ -108,7 +108,7 @@ impl TailSession for Tail {
             .iter()
             .filter_map(|&index| {
                 let hook = ClaudeUserPromptHook::deserialize(&middle[index].payload).ok()?;
-                claude_task_notification_id(hook.text()?)
+                claude_task_notification_id(hook.text()?).map(str::to_owned)
             })
             .collect::<HashSet<_>>();
         for event in middle.iter().filter(|event| event.event == "SubagentStop") {
@@ -357,7 +357,17 @@ pub(super) fn envelopes(
                 record_end_offsets[record_index],
             ));
         }
-        let error = last_assistant_error(segment);
+        let error = if segment
+            .iter()
+            .rev()
+            .filter_map(|record| ClaudeTranscriptEnvelope::deserialize(record).ok())
+            .take_while(|record| !record.is_assistant())
+            .any(|record| record.is_interrupt())
+        {
+            Some("Request interrupted by user".to_owned())
+        } else {
+            last_assistant_error(segment)
+        };
         let stop_event = if error.is_some() {
             "StopFailure"
         } else {
@@ -729,20 +739,7 @@ fn import_envelope(
 }
 
 fn is_real_user(record: &Value) -> bool {
-    if record.get("type").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
-        return false;
-    }
-    !record
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
+    ClaudeTranscriptEnvelope::deserialize(record).is_ok_and(|row| row.is_import_turn_start())
 }
 
 fn last_assistant_text(records: &[Value]) -> Option<Value> {

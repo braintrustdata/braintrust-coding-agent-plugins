@@ -1893,4 +1893,41 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].payload["agent_id"], "child-b");
     }
+    #[test]
+    fn claude_import_distinguishes_prompts_from_native_bookkeeping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let records = [
+            json!({"type":"user","sessionId":"session","message":{"content":"read the skill"}}),
+            json!({"type":"user","isMeta":true,"message":{"content":"injected skill body"}}),
+            json!({"type":"user","isMeta":true,"message":{"content":"[Image: source: image.png]"}}),
+            json!({"type":"assistant","message":{"content":"working"}}),
+            json!({"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}),
+            json!({"type":"user","message":{"content":"<local-command-caveat>local only</local-command-caveat>"}}),
+            json!({"type":"user","message":{"content":"<command-name>/context</command-name>"}}),
+            json!({"type":"user","message":{"content":"<local-command-stdout>result</local-command-stdout>"}}),
+            json!({"type":"user","message":{"content":"next question"}}),
+            json!({"type":"assistant","message":{"content":"answer"}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let events = transcript_envelopes(&path, ImportSource::Claude).unwrap();
+        let prompts = events
+            .iter()
+            .filter(|event| event.event == "UserPromptSubmit")
+            .map(|event| event.payload["prompt"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["read the skill", "next question"]);
+        let failure = events
+            .iter()
+            .find(|event| event.event == "StopFailure")
+            .unwrap();
+        assert_eq!(failure.payload["error"], "Request interrupted by user");
+    }
 }

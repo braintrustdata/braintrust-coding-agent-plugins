@@ -3244,3 +3244,59 @@ fn claude_background_agent_extends_a_closed_continuation_and_nested_parent() {
     assert_eq!(outer.end_ms, Some(50));
     assert_eq!(continuation.end_ms, Some(50));
 }
+
+#[test]
+fn claude_mid_turn_notification_keeps_buffered_calls_under_their_turn() {
+    let prompt = "<task-notification><task-id>worker</task-id><status>completed</status></task-notification>";
+    let launched = json!({"type":"assistant","message":{"id":"launch","content":[{"type":"text","text":"started"}]}});
+    let notification = json!({"type":"user","message":{"content":prompt}});
+    let reply = json!({"type":"assistant","message":{"id":"reply","content":[{"type":"text","text":"done"}]}});
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"delegate"})),
+            (
+                "SubagentStart",
+                15,
+                json!({"agent_id":"worker","agent_type":"Explore"}),
+            ),
+            (
+                "UserPromptSubmit",
+                20,
+                json!({
+                    "prompt":prompt,
+                    "transcript_path":"main.jsonl",
+                    "_bt_transcript_snapshot":{"path":"main.jsonl","contents":format!("{launched}\n{notification}\n")}
+                }),
+            ),
+            (
+                "Stop",
+                30,
+                json!({
+                    "transcript_path":"main.jsonl",
+                    "_bt_transcript_snapshot":{"path":"main.jsonl","contents":format!("{launched}\n{notification}\n{reply}\n")}
+                }),
+            ),
+        ],
+        false,
+    );
+    for (request, name) in [
+        ("launch", "Turn 1"),
+        ("reply", "Continuation: subagent result"),
+    ] {
+        let turn = rows.values().find(|row| row.name == name).unwrap();
+        let call = rows
+            .values()
+            .find(|row| {
+                row.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("request_id"))
+                    == Some(&json!(request))
+            })
+            .unwrap();
+        assert_eq!(
+            call.parent_span_ids,
+            vec![turn.span_id.clone()],
+            "{request}"
+        );
+    }
+}

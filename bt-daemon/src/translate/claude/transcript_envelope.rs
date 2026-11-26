@@ -1,5 +1,6 @@
 use super::native_field::deserialize_optional_string;
 use super::parse_timestamp_ms;
+use super::transcript_content::TranscriptContent;
 use crate::json::Field;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,7 +28,7 @@ pub(crate) fn is_background_agent_launch(record: &Value) -> bool {
 
 /// Stable routing fields from one Claude transcript row.
 #[derive(Deserialize)]
-pub(super) struct TranscriptEnvelope {
+pub(crate) struct TranscriptEnvelope {
     #[serde(rename = "type", default)]
     pub(super) kind: Option<String>,
     #[serde(default)]
@@ -35,6 +36,10 @@ pub(super) struct TranscriptEnvelope {
     pub(super) operation: Option<QueueOperation>,
     #[serde(rename = "isCompactSummary", default)]
     pub(super) is_compact_summary: bool,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    #[serde(rename = "queueTranscriptOnly", default)]
+    pub(super) queue_transcript_only: bool,
     message: Option<TranscriptMessage>,
     // Claude stores tool-specific data here, such as a Bash or Agent result.
     #[serde(rename = "toolUseResult")]
@@ -46,30 +51,20 @@ struct TranscriptMessage {
     content: Option<TranscriptContent>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TranscriptContent {
-    Blocks(Vec<TranscriptBlock>),
-    Other(serde::de::IgnoredAny),
-}
-
-#[derive(Deserialize)]
-struct TranscriptBlock {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    #[serde(flatten)]
-    result: TranscriptToolResult,
-}
-
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub(super) struct TranscriptToolResult {
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(super) tool_use_id: Option<String>,
     // The tool determines the shape of its result.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Field::is_missing")]
     content: Field<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     is_error: Option<bool>,
-    #[serde(rename = "isError")]
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     camel_case_is_error: Option<bool>,
 }
 
@@ -159,5 +154,54 @@ pub(crate) fn cli_fork_history(records: &[Value]) -> CliForkHistory {
         CliForkHistory::AwaitingPrompt
     } else {
         CliForkHistory::Absent
+    }
+}
+
+impl TranscriptEnvelope {
+    pub(super) fn content(&self) -> Option<&TranscriptContent> {
+        self.message.as_ref()?.content.as_ref()
+    }
+
+    pub(super) fn is_user_prompt(&self) -> bool {
+        self.kind.as_deref() == Some("user")
+            && !self.is_compact_summary
+            && !self
+                .content()
+                .is_some_and(TranscriptContent::has_tool_result)
+    }
+
+    pub(crate) fn is_assistant(&self) -> bool {
+        self.kind.as_deref() == Some("assistant")
+    }
+
+    pub(crate) fn is_import_turn_start(&self) -> bool {
+        self.is_user_prompt()
+            && !self.is_meta
+            && !self.queue_transcript_only
+            && !self.is_interrupt()
+            && !self.user_text().is_some_and(|text| {
+                [
+                    "<local-command-caveat>",
+                    "<command-name>",
+                    "<local-command-stdout>",
+                    "<local-command-stderr>",
+                ]
+                .iter()
+                .any(|tag| text.trim_start().starts_with(tag))
+            })
+    }
+
+    pub(crate) fn is_interrupt(&self) -> bool {
+        self.kind.as_deref() == Some("user")
+            && matches!(
+                self.user_text().map(str::trim),
+                Some(
+                    "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+                )
+            )
+    }
+
+    fn user_text(&self) -> Option<&str> {
+        self.content()?.single_text()
     }
 }
