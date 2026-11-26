@@ -592,7 +592,8 @@ async fn importing_claude_nested_and_workflow_agents_preserves_parentage() {
     write_jsonl(
         &workflow.join("agent-worker.jsonl"),
         &[
-            json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"worker-llm","model":"claude-test","content":[{"type":"text","text":"worker"}]}}),
+            json!({"type":"assistant","timestamp":"2026-01-01T00:00:06Z","message":{"id":"worker-llm","model":"claude-test","content":[{"type":"text","text":"working"},{"type":"tool_use","id":"return-value","name":"StructuredOutput","input":{"files":["src/a.txt"]}}]}}),
+            json!({"type":"user","timestamp":"2026-01-01T00:00:07Z","message":{"content":[{"type":"tool_result","tool_use_id":"return-value","content":"Structured output submitted"}]}}),
         ],
     );
     std::fs::write(
@@ -646,6 +647,9 @@ async fn importing_claude_nested_and_workflow_agents_preserves_parentage() {
         latest_end(&worker["span_id"])
     );
 
+    assert!(rows.iter().filter_map(|row| row.get("Merge")).any(|row| {
+        row["span_id"] == worker["span_id"] && row["output"] == json!({"files":["src/a.txt"]})
+    }));
     assert_eq!(inserted(&rows, "llm"), 6);
 }
 

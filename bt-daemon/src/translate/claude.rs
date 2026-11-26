@@ -1751,6 +1751,15 @@ pub(crate) fn successful_subagent_handback_message(records: &[Value]) -> Option<
         .and_then(|tool| tool.handback_message())
 }
 
+/// The final workflow tool can return its result as structured arguments.
+pub(crate) fn successful_workflow_output(records: &[Value]) -> Option<Value> {
+    MessageHistory::default()
+        .parse_records(records)
+        .tools
+        .pop()?
+        .into_structured_output()
+}
+
 fn continuation_origin<'a>(
     payload: &'a Value,
     prompt: Option<&'a str>,

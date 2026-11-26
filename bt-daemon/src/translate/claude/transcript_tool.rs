@@ -58,6 +58,14 @@ impl TranscriptTool {
         }
     }
 
+    pub(super) fn into_structured_output(self) -> Option<Value> {
+        (self.tool_name == "StructuredOutput"
+            && self.approval == Some(ToolApproval::Approved)
+            && self.error.is_none()
+            && !self.cancelled)
+            .then_some(self.input)
+    }
+
     pub(super) fn is_successful_handback(&self) -> bool {
         self.tool_name == "SubagentHandback"
             && self.approval == Some(ToolApproval::Approved)
