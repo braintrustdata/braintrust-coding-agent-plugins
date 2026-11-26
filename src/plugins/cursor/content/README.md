@@ -78,6 +78,33 @@ secrets. The plugin does not redact content locally. Configure Braintrust's
 content-redaction controls before enabling tracing, and don't trace content
 that must not be sent to Braintrust.
 
+## Usage and cost reporting
+
+Cursor reports aggregate token usage for each turn. The turn span holds that
+usage once. When the turn closes, the span includes `metadata.model` if its
+observed model activity identifies a single model. Turns with mixed or unknown
+models retain their token totals with `metadata.token_usage_model_status` set
+to `mixed` or `unknown`. Braintrust can estimate cost when its pricing
+recognizes the model.
+
+To report Cursor token usage and estimated cost by model, query the turn spans
+using `metadata.token_usage_scope`:
+
+```sql
+SELECT metadata.model AS model,
+       sum(metrics.prompt_tokens) AS prompt_tokens,
+       sum(metrics.completion_tokens) AS completion_tokens,
+       sum(metrics.tokens) AS tokens,
+       sum(estimated_cost()) AS estimated_cost
+FROM project_logs('my-coding-agent')
+WHERE created > now() - interval 7 day
+  AND metadata.token_usage_scope = 'turn'
+GROUP BY metadata.model
+```
+
+The null model group includes mixed-model turns and turns with unknown model
+attribution.
+
 ## Additional root metadata
 
 Add a JSON object to the root span of every Cursor session:

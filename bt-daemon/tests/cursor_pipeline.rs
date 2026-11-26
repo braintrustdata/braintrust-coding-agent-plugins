@@ -439,16 +439,42 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
         (
             "stop",
             2000,
-            json!({"generation_id":"g1","status":"completed"}),
-        ),
-        (
-            "afterAgentResponse",
-            2100,
-            json!({"generation_id":"g1","text":"late final answer"}),
+            json!({
+                "generation_id":"g1","status":"completed",
+                "model":"grok-4.7","input_tokens":20,"output_tokens":4
+            }),
         ),
     ] {
         send_with_flush_mode(&socket, event, ts_ms, payload, FlushMode::FlushOnTurnEnd).await;
     }
+    assert!(
+        flush_session("cursor-recovery", &socket, 5000)
+            .await
+            .unwrap()
+            .flushed
+    );
+    let turn_id = buffered
+        .lock()
+        .unwrap()
+        .delivered
+        .iter()
+        .find(|op| {
+            op.row().metadata.as_ref().is_some_and(|metadata| {
+                metadata["model"] == "grok-4.7" && metadata["token_usage_scope"] == "turn"
+            })
+        })
+        .expect("stop delivered model-attributed turn usage")
+        .row()
+        .span_id
+        .clone();
+    send_with_flush_mode(
+        &socket,
+        "afterAgentResponse",
+        2100,
+        json!({"generation_id":"g1","text":"late final answer","model":"muse-wonder-1.0"}),
+        FlushMode::FlushOnTurnEnd,
+    )
+    .await;
     // Ingress acknowledges capture before the out-of-band sink flush finishes.
     // Wait for delivery and its checkpoint without requesting an explicit flush.
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
@@ -468,6 +494,18 @@ async fn late_response_is_delivered_and_checkpointed_without_another_hook() {
     daemon.await.unwrap();
     completed
         .expect("late response was not delivered and checkpointed while the session stayed open");
+    let rows = buffered.lock().unwrap();
+    let updated_usage = rows
+        .delivered
+        .iter()
+        .rev()
+        .map(SpanOp::row)
+        .find(|row| row.span_id == turn_id && row.metrics.is_some())
+        .unwrap();
+    let metadata = updated_usage.metadata.as_ref().unwrap();
+    assert_eq!(metadata["token_usage_model_status"], "mixed");
+    assert_eq!(metadata.get("model"), Some(&Value::Null));
+    assert_eq!(updated_usage.metrics.as_ref().unwrap()["tokens"], 24);
 }
 
 #[tokio::test]
