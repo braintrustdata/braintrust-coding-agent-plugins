@@ -48,7 +48,7 @@ sysinfo = { version = "0.33.1", default-features = false, features = ["system"] 
 zstd = "0.13"
 thiserror = "2"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "v5"] }

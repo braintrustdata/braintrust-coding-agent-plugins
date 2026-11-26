@@ -2994,6 +2994,101 @@ printf '{"session_id":"managed-parent","hook_event_name":"SessionEnd"}\n' |
 
 #[cfg(all(feature = "cli", unix))]
 #[tokio::test]
+async fn managed_claude_budget_result_marks_the_finished_turn_and_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let mut opts = debug_serve_options(env!("CARGO_PKG_VERSION"), &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let handle = tokio::spawn(run_serve(
+        ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(data_dir.clone()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+            retention: None,
+        },
+        opts,
+    ));
+    wait_for(&socket).await;
+    let result = r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"managed-budget","is_error":true}"#;
+    let agent = tmp.path().join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"UserPromptSubmit","prompt":"hello"}}' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"SessionEnd","reason":"other"}}' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+printf '%s\n' '{result}'
+exit 1
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_bt-daemon");
+    let output = tokio::process::Command::new(binary)
+        .args([
+            "run",
+            "--project",
+            "test-project",
+            "claude",
+            "--",
+            "-p",
+            "--max-budget-usd=0.01",
+            "--output-format",
+            "json",
+            "hello",
+        ])
+        .env("CLAUDE_BIN", &agent)
+        .env("BT_DAEMON_TEST_BIN", binary)
+        .env("BRAINTRUST_DAEMON_SOCKET", &socket)
+        .env("BRAINTRUST_DAEMON_DATA_DIR", &data_dir)
+        .env_remove("BRAINTRUST_DESTINATION")
+        .output()
+        .await
+        .unwrap();
+
+    shutdown(&socket).await;
+    handle.await.unwrap().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("{result}\n").as_bytes(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/managed-budget.ndjson")).unwrap();
+    let ops = spans
+        .lines()
+        .map(|line| serde_json::from_str::<SpanOp>(line).unwrap())
+        .collect::<Vec<_>>();
+    for field in ["outcome", "session_status"] {
+        assert!(ops.iter().any(|op| matches!(op, SpanOp::Merge(row)
+            if row.end_ms.is_none() && row.metadata.as_ref().is_some_and(|metadata|
+                metadata["termination_reason"] == "max_budget_usd" && metadata[field] == "interrupted"
+            )
+        )), "missing budget limit on {field}: {ops:?}");
+    }
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
 async fn managed_run_flushes_and_preserves_agent_exit_status() {
     use std::os::unix::fs::PermissionsExt;
 

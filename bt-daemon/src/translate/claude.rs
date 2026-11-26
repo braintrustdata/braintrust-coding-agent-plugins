@@ -195,6 +195,8 @@ struct ClaudeTranslator {
     session_status: Option<String>,
     #[serde(default)]
     turn_limit: Option<TurnLimit>,
+    #[serde(default)]
+    last_turn_managed_run_id: Option<String>,
     last_ts_ms: i64,
 }
 
@@ -252,6 +254,7 @@ impl ClaudeTranslator {
             last_turn_output: None,
             session_status: None,
             turn_limit: None,
+            last_turn_managed_run_id: None,
             last_ts_ms: 0,
         }
     }
@@ -269,6 +272,7 @@ impl ClaudeTranslator {
         if self.root_end_ms.is_some() {
             self.root_generation = self.root_generation.saturating_add(1);
             self.turn_limit = None;
+            self.last_turn_managed_run_id = None;
             let root = ids::span_id(&self.session_id, &format!("root:{}", self.root_generation));
             self.session_span_id = root.clone();
             self.root_span_id = root;
@@ -394,6 +398,8 @@ impl ClaudeTranslator {
     fn open_turn(&mut self, event: &Envelope, prompt: UserPromptHook, ops: &mut Vec<SpanOp>) {
         self.session_status = Some("running".into());
         self.turn_limit = None;
+        self.last_turn_managed_run_id
+            .clone_from(&event.managed_run_id);
         if let Some(old) = self.turn.take() {
             self.close_pending_tools(
                 &old.id,
@@ -1433,6 +1439,50 @@ impl ClaudeTranslator {
         }));
     }
 
+    /// The CLI result can arrive after SessionEnd. Annotate the same spans
+    /// without moving their end times or reopening a finished trace.
+    fn record_budget_limit(&mut self, event: &Envelope) -> Vec<SpanOp> {
+        if event.managed_run_id.is_none() || event.managed_run_id != self.last_turn_managed_run_id {
+            return Vec::new();
+        }
+        let mut ops = Vec::new();
+        if self.root_open {
+            self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
+            self.end_session(event, &mut ops);
+            self.activity_bounds.extend_ancestors(&mut ops);
+        }
+        let Some(turn_id) = &self.last_turn_id else {
+            return ops;
+        };
+        let Some((root_id, parent_id)) = self.turn_identities.get(turn_id) else {
+            return ops;
+        };
+        if root_id != &self.root_span_id {
+            return ops;
+        }
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: turn_id.clone(),
+            root_span_id: root_id.clone(),
+            parent_span_ids: vec![parent_id.clone()],
+            metadata: Some(
+                json!({"outcome": "interrupted", "termination_reason": "max_budget_usd"}),
+            ),
+            ..Default::default()
+        }));
+        ops.push(SpanOp::Merge(SpanRow {
+            span_id: self.session_span_id.clone(),
+            root_span_id: root_id.clone(),
+            parent_span_ids: self.session_parent_span_ids.clone(),
+            metadata: Some(
+                json!({"session_status": "interrupted", "termination_reason": "max_budget_usd"}),
+            ),
+            ..Default::default()
+        }));
+        self.session_status = Some("interrupted".into());
+        self.last_turn_managed_run_id = None;
+        ops
+    }
+
     fn end_session(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
         self.pre_compact_ms = None;
         for agent in self.subagents.values_mut() {
@@ -1497,11 +1547,14 @@ impl ClaudeTranslator {
 
 impl AgentTranslator for ClaudeTranslator {
     fn handle(&mut self, event: &Envelope, ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
-        self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         anyhow::ensure!(
             self.pending_emission.is_none(),
             "Claude translator has pending catch-up work; drain it before handling another event"
         );
+        if event.event == crate::managed_run::CLAUDE_BUDGET_LIMIT_EVENT {
+            return Ok(self.record_budget_limit(event));
+        }
+        self.last_ts_ms = self.last_ts_ms.max(event.ts_ms);
         let mut ops = Vec::new();
         let hook = decode::<HookContext>(&event.payload).unwrap_or_default();
         if let Some(cwd) = &hook.cwd {
