@@ -6,6 +6,7 @@
 //! the hook timestamp; this is essential when replaying a journal against a
 //! transcript that already contains the completed session.
 
+mod activity_bounds;
 mod history_message;
 mod hook_context;
 mod llm_call;
@@ -18,20 +19,25 @@ mod tool_completion_hook;
 mod transcript_envelope;
 mod transcript_tool;
 mod transcript_tool_outcome;
+mod user_prompt_hook;
 
+use activity_bounds::ActivityBounds;
 use hook_context::HookContext;
 use llm_call::LlmCall;
 use message_history::MessageHistory;
 use parsed_transcript::ParsedTranscript;
-use subagent_hook::SubagentHook;
+pub(crate) use subagent_hook::SubagentHook;
 #[cfg(test)]
 use timestamp_envelope::parse_rfc3339_timestamp;
 use timestamp_envelope::parse_timestamp_ms;
 use tool_completion_hook::ToolCompletionHook;
 use transcript_envelope::TranscriptEnvelope;
-pub(crate) use transcript_envelope::{cli_fork_history, CliForkHistory};
+pub(crate) use transcript_envelope::{
+    cli_fork_history, is_background_agent_launch, CliForkHistory,
+};
 use transcript_tool::TranscriptTool;
 use transcript_tool_outcome::{is_permission_denial, TranscriptToolOutcome};
+pub(crate) use user_prompt_hook::UserPromptHook;
 
 use super::git::GitMetadataCache;
 use super::recent::{RecentMap, RecentSet, RECENT_ID_CAPACITY};
@@ -141,6 +147,8 @@ struct ClaudeTranslator {
     #[serde(default)]
     turn_identities: RecentMap<String, (String, String)>,
     user_turn_ends: RecentMap<String, i64>,
+    #[serde(default)]
+    activity_bounds: ActivityBounds,
     prompt_turns: RecentMap<String, Arc<String>>,
     pending_prompts: VecDeque<PendingPrompt>,
     record_turns: RecentMap<String, Arc<String>>,
@@ -202,6 +210,7 @@ impl ClaudeTranslator {
             span_owners: RecentMap::default(),
             turn_identities: RecentMap::default(),
             user_turn_ends: RecentMap::default(),
+            activity_bounds: ActivityBounds::default(),
             tool_seq: 0,
             prompt_turns: RecentMap::default(),
             pending_prompts: VecDeque::new(),
@@ -253,6 +262,7 @@ impl ClaudeTranslator {
             self.session_span_id = root.clone();
             self.root_span_id = root;
             self.root_end_ms = None;
+            self.activity_bounds = ActivityBounds::default();
             self.claude_version_logged = false;
         }
         self.root_open = true;
@@ -413,6 +423,9 @@ impl ClaudeTranslator {
                 format!("Turn {}", self.turn_count),
             )
         };
+        if continuation.is_some() {
+            self.activity_bounds.track(&id);
+        }
         // A prompt that points the model at a skill file ("Read the skill
         // instructions at docs/.agents/skills/x/SKILL.md") requests that skill
         // as directly as a `/x` slash command. Continuations are runtime
@@ -621,12 +634,14 @@ impl ClaudeTranslator {
                     .map(|turn| turn.user_turn_id.clone())
                     .unwrap_or_else(|| self.last_user_turn_id.clone()),
             });
+        let tool_parent = string_field(&event.payload, "_bt_import_parent_tool_id")
+            .map(|id| ids::span_id(&self.session_id, &format!("tool:{id}")));
+        if let Some(parent) = &tool_parent {
+            self.activity_bounds.track(parent);
+        }
         let parent_id = string_field(&event.payload, "_bt_import_parent_agent_id")
             .and_then(|id| self.subagents.get(&id).map(|agent| agent.span_id.clone()))
-            .or_else(|| {
-                string_field(&event.payload, "_bt_import_parent_tool_id")
-                    .map(|id| ids::span_id(&self.session_id, &format!("tool:{id}")))
-            })
+            .or(tool_parent)
             .unwrap_or_else(|| origin.parent_id.clone());
         let owner = origin
             .user_turn_id
@@ -635,6 +650,7 @@ impl ClaudeTranslator {
         self.agent_origins.insert(hook.agent_id.clone(), origin);
         let agent_type = hook.agent_type.clone().unwrap_or_else(|| "agent".into());
         let span_id = ids::span_id(&self.session_id, &format!("subagent:{}", hook.agent_id));
+        self.activity_bounds.track(&span_id);
         let row = SpanRow {
             span_id: span_id.clone(),
             root_span_id: self.root_span_id.clone(),
@@ -1572,6 +1588,7 @@ impl AgentTranslator for ClaudeTranslator {
         }
         self.git
             .enrich_rows(self.current_cwd.as_deref(), &mut ops[event_op_start..]);
+        self.activity_bounds.extend_ancestors(&mut ops);
         Ok(ops)
     }
 
@@ -1581,6 +1598,7 @@ impl AgentTranslator for ClaudeTranslator {
         };
         let mut ops = Vec::new();
         self.pending_emission = self.emit_next_pending(pending, &mut ops);
+        self.activity_bounds.extend_ancestors(&mut ops);
         Ok(Some(ops))
     }
 
@@ -1649,6 +1667,7 @@ impl AgentTranslator for ClaudeTranslator {
         } else {
             self.release_terminal_state();
         }
+        self.activity_bounds.extend_ancestors(&mut ops);
         Ok(ops)
     }
 }
@@ -1717,7 +1736,7 @@ fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
             return (!id.is_empty()).then_some(("agent_message", id));
         }
     }
-    let prompt = payload.get("prompt")?.as_str()?.trim();
+    let prompt = UserPromptHook::deserialize(payload).ok()?.text()?.trim();
     if let Some(id) = task_notification_id(prompt) {
         return Some(("task_notification", id));
     }
@@ -1729,7 +1748,7 @@ fn continuation_origin(payload: &Value) -> Option<(&'static str, &str)> {
     Some(("agent_message", id))
 }
 
-fn task_notification_id(prompt: &str) -> Option<&str> {
+pub(crate) fn task_notification_id(prompt: &str) -> Option<&str> {
     let body = prompt
         .trim()
         .strip_prefix("<task-notification>")?

@@ -4,6 +4,27 @@ use crate::json::Field;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Deserialize)]
+struct AgentLaunchResult {
+    status: Option<AgentLaunchStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentLaunchStatus {
+    AsyncLaunched,
+    #[serde(other)]
+    Other,
+}
+
+pub(crate) fn is_background_agent_launch(record: &Value) -> bool {
+    TranscriptEnvelope::deserialize(record)
+        .ok()
+        .and_then(|row| row.tool_use_result)
+        .and_then(|result| AgentLaunchResult::deserialize(result).ok())
+        .is_some_and(|result| matches!(result.status, Some(AgentLaunchStatus::AsyncLaunched)))
+}
+
 /// Stable routing fields from one Claude transcript row.
 #[derive(Deserialize)]
 pub(super) struct TranscriptEnvelope {

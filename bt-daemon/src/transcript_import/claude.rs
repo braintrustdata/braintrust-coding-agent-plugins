@@ -3,9 +3,14 @@ use super::{
     string_at, timestamp_bounds, timestamp_ms, validate_session_id, IncrementalRecords,
     TailSession, TranscriptImport, TranscriptLayout,
 };
+use crate::translate::{
+    claude_task_notification_id, is_background_agent_launch, ClaudeSubagentHook,
+    ClaudeUserPromptHook,
+};
 use crate::translate::{cli_fork_history, CliForkHistory};
 use crate::wire::Envelope;
 use anyhow::bail;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -31,6 +36,7 @@ pub(super) struct Tail {
     completed_turns: usize,
     active_turn: Option<usize>,
     last_len: u64,
+    pending_background_stops: HashSet<String>,
 }
 
 impl TailSession for Tail {
@@ -59,6 +65,9 @@ impl TailSession for Tail {
         if events.len() < 2 {
             bail!("Claude import did not produce session boundary events");
         }
+        // A cold historical import already has the complete child transcript.
+        // During attach, async launch results are links, not completion events.
+        let attaching = !finalize || self.started;
         let mut out = Vec::new();
         if !self.started {
             out.push(events[0].clone());
@@ -81,9 +90,36 @@ impl TailSession for Tail {
             let start = turn_starts[turn];
             let end = turn_starts.get(turn + 1).copied().unwrap_or(middle.len());
             let skip = usize::from(self.active_turn == Some(turn));
-            out.extend(middle[start + skip..end].iter().cloned());
+            for event in &middle[start + skip..end] {
+                if attaching && event.event == "SubagentStop" {
+                    if let Ok(hook) = ClaudeSubagentHook::deserialize(&event.payload) {
+                        if hook.import_background {
+                            self.pending_background_stops.insert(hook.agent_id);
+                            continue;
+                        }
+                    }
+                }
+                out.push(event.clone());
+            }
             self.completed_turns += 1;
             self.active_turn = None;
+        }
+        let notifications = turn_starts
+            .iter()
+            .filter_map(|&index| {
+                let hook = ClaudeUserPromptHook::deserialize(&middle[index].payload).ok()?;
+                claude_task_notification_id(hook.text()?)
+            })
+            .collect::<HashSet<_>>();
+        for event in middle.iter().filter(|event| event.event == "SubagentStop") {
+            let Ok(hook) = ClaudeSubagentHook::deserialize(&event.payload) else {
+                continue;
+            };
+            let id = hook.agent_id.as_str();
+            if (finalize || notifications.contains(id)) && self.pending_background_stops.remove(id)
+            {
+                out.push(event.clone());
+            }
         }
         if !finalize && turn_count > 0 {
             let active = turn_count - 1;
@@ -303,7 +339,8 @@ pub(super) fn envelopes(
                 "agent_type": subagent.agent_type,
                 "agent_transcript_path": subagent.path,
                 "_bt_import_parent_agent_id": subagent.parent_agent_id,
-                "_bt_import_parent_tool_id": subagent.parent_tool_id
+                "_bt_import_parent_tool_id": subagent.parent_tool_id,
+                "_bt_import_background": subagent.background
             });
             if !is_start {
                 payload["last_assistant_message"] = json!(subagent
@@ -372,6 +409,7 @@ struct Subagent {
     parent_agent_id: Option<String>,
     parent_tool_id: Option<String>,
     depth: usize,
+    background: bool,
 }
 
 fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
@@ -540,6 +578,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: None,
                 parent_tool_id: None,
                 depth: 0,
+                background: is_background_agent_launch(&records[record_index]),
             })
         })
         .collect::<Vec<_>>();
@@ -656,6 +695,7 @@ fn subagents(path: &Path, records: &[Value]) -> anyhow::Result<Vec<Subagent>> {
                 parent_agent_id: parent_id,
                 parent_tool_id,
                 depth,
+                background: is_background_agent_launch(&records[record_index]),
             });
             linked.insert(agent_id.clone());
             added = true;

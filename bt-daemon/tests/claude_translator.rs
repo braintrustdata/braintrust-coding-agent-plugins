@@ -3184,3 +3184,63 @@ fn claude_native_permission_refusals_are_denied_with_or_without_a_failure_hook()
         assert_eq!(tool.output, Some(reason));
     }
 }
+
+#[test]
+fn claude_background_agent_extends_a_closed_continuation_and_nested_parent() {
+    let prompt =
+        "<task-notification><task-id>first</task-id><status>completed</status></task-notification>";
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"start"})),
+            (
+                "SubagentStart",
+                12,
+                json!({"agent_id":"first","agent_type":"Explore"}),
+            ),
+            (
+                "SubagentStop",
+                15,
+                json!({"agent_id":"first","agent_type":"Explore"}),
+            ),
+            ("Stop", 17, json!({})),
+            ("UserPromptSubmit", 20, json!({"prompt":prompt})),
+            (
+                "SubagentStart",
+                22,
+                json!({"agent_id":"outer","agent_type":"Explore"}),
+            ),
+            (
+                "SubagentStart",
+                23,
+                json!({"agent_id":"inner","agent_type":"Explore","_bt_import_parent_agent_id":"outer"}),
+            ),
+            ("Stop", 30, json!({})),
+            (
+                "SubagentStop",
+                40,
+                json!({"agent_id":"outer","agent_type":"Explore"}),
+            ),
+            (
+                "SubagentStop",
+                50,
+                json!({"agent_id":"inner","agent_type":"Explore"}),
+            ),
+        ],
+        false,
+    );
+    let outer = rows
+        .values()
+        .find(|row| {
+            row.metadata
+                .as_ref()
+                .is_some_and(|meta| meta["agent_id"] == "outer")
+        })
+        .unwrap();
+    let continuation = rows
+        .values()
+        .find(|row| row.name == "Continuation: subagent result")
+        .unwrap();
+    assert_eq!(outer.parent_span_ids, vec![continuation.span_id.clone()]);
+    assert_eq!(outer.end_ms, Some(50));
+    assert_eq!(continuation.end_ms, Some(50));
+}
