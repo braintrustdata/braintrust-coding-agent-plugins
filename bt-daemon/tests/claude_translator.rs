@@ -3380,3 +3380,30 @@ fn claude_reports_a_native_turn_limit_on_live_and_imported_spans() {
         }
     }
 }
+
+#[test]
+fn claude_resumed_compaction_uses_both_hooks_and_the_new_root() {
+    let rows = replay_continuation_events(
+        vec![
+            ("UserPromptSubmit", 10, json!({"prompt":"first"})),
+            ("Stop", 20, json!({})),
+            ("SessionEnd", 30, json!({})),
+            ("SessionStart", 40, json!({"source":"resume"})),
+            ("PreCompact", 50, json!({})),
+            ("SessionStart", 60, json!({"source":"compact"})),
+            ("PostCompact", 70, json!({})),
+            ("SessionEnd", 80, json!({})),
+        ],
+        false,
+    );
+    let previous_turn = rows.values().find(|row| row.name == "Turn 1").unwrap();
+    let compaction = rows.values().find(|row| row.name == "Compaction").unwrap();
+    assert_ne!(compaction.root_span_id, previous_turn.root_span_id);
+    assert_eq!(
+        compaction.parent_span_ids,
+        vec![compaction.root_span_id.clone()]
+    );
+    assert_eq!(compaction.start_ms, Some(50));
+    assert_eq!(compaction.end_ms, Some(70));
+    assert_eq!(rows[&compaction.root_span_id].start_ms, Some(50));
+}

@@ -143,6 +143,8 @@ struct ClaudeTranslator {
     last_turn_id: Option<String>,
     turn_count: u32,
     continuation_count: u32,
+    #[serde(default)]
+    pre_compact_ms: Option<i64>,
     last_user_turn_id: Option<String>,
     agent_origins: RecentMap<String, AgentOrigin>,
     /// User turn owning each turn or subagent span that can parent other spans.
@@ -211,6 +213,7 @@ impl ClaudeTranslator {
             last_turn_id: None,
             turn_count: 0,
             continuation_count: 0,
+            pre_compact_ms: None,
             last_user_turn_id: None,
             agent_origins: RecentMap::default(),
             span_owners: RecentMap::default(),
@@ -314,7 +317,11 @@ impl ClaudeTranslator {
             parent_span_ids: self.session_parent_span_ids.clone(),
             name: format!("Claude Code: {workspace}"),
             span_type: SpanType::Task,
-            start_ms: Some(event.ts_ms),
+            start_ms: Some(if event.event == "PostCompact" {
+                self.pre_compact_ms.unwrap_or(event.ts_ms).min(event.ts_ms)
+            } else {
+                event.ts_ms
+            }),
             input: Some(json!(format!("Session: {workspace}"))),
             metadata: Some(Value::Object(metadata)),
             tags: None,
@@ -1427,6 +1434,7 @@ impl ClaudeTranslator {
     }
 
     fn end_session(&mut self, event: &Envelope, ops: &mut Vec<SpanOp>) {
+        self.pre_compact_ms = None;
         for agent in self.subagents.values_mut() {
             if let Some(row) = agent.deferred_insert.take() {
                 ops.push(SpanOp::Insert(row));
@@ -1568,12 +1576,23 @@ impl AgentTranslator for ClaudeTranslator {
                 self.finish_tool(event, ToolApproval::Approved, &mut ops);
             }
             "PermissionDenied" => self.finish_tool(event, ToolApproval::Denied, &mut ops),
+            "PreCompact" => self.pre_compact_ms = Some(event.ts_ms),
             "PostCompact" => {
-                let turn_span_id = self
-                    .turn
-                    .as_ref()
-                    .map(|turn| turn.id.clone())
-                    .or_else(|| self.last_turn_id.clone());
+                let start = self
+                    .pre_compact_ms
+                    .take()
+                    .unwrap_or(event.ts_ms)
+                    .min(event.ts_ms);
+                let turn_span_id = self.turn.as_ref().map(|turn| turn.id.clone()).or_else(|| {
+                    self.last_turn_id
+                        .as_ref()
+                        .filter(|id| {
+                            self.turn_identities
+                                .get(id.as_str())
+                                .is_some_and(|(root, _)| root == &self.root_span_id)
+                        })
+                        .cloned()
+                });
                 if let Some(parent) = &turn_span_id {
                     // PostCompact is the durable point at which Claude's
                     // synthetic compact-summary transcript record becomes the
@@ -1589,7 +1608,7 @@ impl AgentTranslator for ClaudeTranslator {
                     turn_span_id,
                     name: "Compaction".into(),
                     span_type: SpanType::Task,
-                    start_ms: Some(event.ts_ms),
+                    start_ms: Some(start),
                     end_ms: Some(event.ts_ms),
                     metadata: Some(json!({"event":"compaction"})),
                     tags: Some(vec!["compaction".into()]),
@@ -1659,6 +1678,7 @@ impl AgentTranslator for ClaudeTranslator {
     }
 
     fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        self.pre_compact_ms = None;
         let end_ms = self.last_ts_ms;
         if self.turn.is_some() && self.session_status.as_deref() == Some("running") {
             self.session_status = Some("interrupted".into());

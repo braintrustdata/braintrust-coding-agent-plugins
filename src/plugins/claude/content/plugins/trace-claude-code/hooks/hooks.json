@@ -76,6 +76,18 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bt",
+            "args": ["trace", "hook", "--source", "claude-code"],
+            "async": false
+          }
+        ]
+      }
+    ],
     "PostCompact": [
       {
         "hooks": [
