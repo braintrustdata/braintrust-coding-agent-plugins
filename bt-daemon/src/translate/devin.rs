@@ -8,6 +8,7 @@ use super::{AgentTranslator, SessionCtx, SpanOp, SpanRow, SpanType, TranslatorFa
 use crate::{agents::Devin, ids, wire::Envelope};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 impl TranslatorFactory for Devin {
     fn create(&self, session_namespace: &str) -> Box<dyn AgentTranslator> {
@@ -15,9 +16,13 @@ impl TranslatorFactory for Devin {
             namespace: session_namespace.to_owned(),
             root: ids::span_id(session_namespace, "root"),
             root_emitted: false,
+            root_end_ms: None,
             turns: RecentMap::default(),
             started_spans: RecentSet::default(),
             finished_tools: RecentSet::default(),
+            open: BTreeMap::new(),
+            incomplete: RecentSet::default(),
+            last_ts_ms: None,
         })
     }
 }
@@ -27,9 +32,17 @@ struct DevinTranslator {
     namespace: String,
     root: String,
     root_emitted: bool,
+    #[serde(default)]
+    root_end_ms: Option<i64>,
     turns: RecentMap<String, bool>,
     started_spans: RecentSet<String>,
     finished_tools: RecentSet<String>,
+    #[serde(default, with = "super::state::rows")]
+    open: BTreeMap<String, SpanRow>,
+    #[serde(default)]
+    incomplete: RecentSet<String>,
+    #[serde(default)]
+    last_ts_ms: Option<i64>,
 }
 
 impl DevinTranslator {
@@ -40,6 +53,13 @@ impl DevinTranslator {
             name,
             ..SpanRow::default()
         }
+    }
+
+    fn extend_root(&mut self, end_ms: i64) -> SpanOp {
+        self.root_end_ms = Some(end_ms);
+        let mut row = self.row(self.root.clone(), "Devin session".into());
+        row.end_ms = Some(end_ms);
+        SpanOp::Merge(row)
     }
 
     fn turn(&self, span_id: String) -> SpanRow {
@@ -78,6 +98,7 @@ impl DevinTranslator {
                 Some(if self.finished_tools.contains(&span_id) {
                     SpanOp::Merge(row)
                 } else {
+                    self.track_open(&row);
                     SpanOp::Insert(row)
                 })
             }
@@ -86,9 +107,10 @@ impl DevinTranslator {
                 row.output = response.output.map(Value::String);
                 // A successful exec hook result may still contain a nonzero shell
                 // exit code. Only report an error when Devin marks the tool failed.
-                if !response.success {
+                if response.success == Some(false) {
                     row.error = response.error.or_else(|| Some("Devin tool failed".into()));
                 }
+                self.record_completion(&mut row);
                 Some(if self.started_spans.contains(&span_id) {
                     SpanOp::Merge(row)
                 } else {
@@ -97,6 +119,39 @@ impl DevinTranslator {
             }
             _ => None,
         }
+    }
+
+    fn track_open(&mut self, row: &SpanRow) {
+        self.open.insert(
+            row.span_id.clone(),
+            SpanRow {
+                span_id: row.span_id.clone(),
+                root_span_id: row.root_span_id.clone(),
+                parent_span_ids: row.parent_span_ids.clone(),
+                span_type: row.span_type,
+                turn_span_id: row.turn_span_id.clone(),
+                ..SpanRow::default()
+            },
+        );
+    }
+
+    fn record_completion(&mut self, row: &mut SpanRow) {
+        self.open.remove(&row.span_id);
+        if self.incomplete.remove(&row.span_id) {
+            row.metadata = Some(json!({"incomplete": false}));
+        }
+    }
+
+    fn close_unfinished(&mut self, ts: i64) -> Vec<SpanOp> {
+        std::mem::take(&mut self.open)
+            .into_values()
+            .map(|mut row| {
+                self.incomplete.insert(row.span_id.clone());
+                row.end_ms = Some(ts);
+                row.metadata = Some(json!({"incomplete": true}));
+                SpanOp::Merge(row)
+            })
+            .collect()
     }
 
     fn permission_request(
@@ -136,6 +191,7 @@ impl AgentTranslator for DevinTranslator {
 
         let mut ops = Vec::new();
         let ts = event.ts_ms;
+        self.last_ts_ms = Some(self.last_ts_ms.map_or(ts, |last| last.max(ts)));
         if !self.root_emitted {
             let mut row = self.row(self.root.clone(), "Devin session".into());
             row.start_ms = Some(ts);
@@ -145,6 +201,11 @@ impl AgentTranslator for DevinTranslator {
             });
             ops.push(SpanOp::Insert(row));
             self.root_emitted = true;
+        } else if self.root_end_ms.is_some_and(|end| ts > end)
+            && !matches!(kind, HookKind::SessionEnd)
+        {
+            // Keep one root across resumes and extend its observed time range.
+            ops.push(self.extend_root(ts));
         }
 
         let turn = prompt_id
@@ -165,6 +226,7 @@ impl AgentTranslator for DevinTranslator {
                     row.input = Some(json!([{"role": "user", "content": prompt}]));
                 }
                 if submitted.is_none() {
+                    self.track_open(&row);
                     ops.push(SpanOp::Insert(row));
                 } else {
                     row.is_turn = false;
@@ -188,6 +250,7 @@ impl AgentTranslator for DevinTranslator {
                 row.end_ms = Some(ts);
                 row.output = last_assistant_message
                     .map(|content| json!([{"role": "assistant", "content": content}]));
+                self.record_completion(&mut row);
                 SpanOp::Merge(row)
             }),
             HookKind::PostCompaction { summary } => {
@@ -199,15 +262,21 @@ impl AgentTranslator for DevinTranslator {
                 Some(SpanOp::Insert(row))
             }
             HookKind::SessionEnd => {
-                let mut row = self.row(self.root.clone(), "Devin session".into());
-                row.end_ms = Some(ts);
-                Some(SpanOp::Merge(row))
+                let end = self.last_ts_ms.unwrap_or(ts);
+                ops.extend(self.close_unfinished(end));
+                Some(self.extend_root(end))
             }
             HookKind::SessionStart | HookKind::UserPromptSubmit { .. } | HookKind::Unknown => None,
         };
         ops.extend(op);
         GitMetadataCache::shared().enrich_rows(cwd.as_deref(), &mut ops);
         Ok(ops)
+    }
+
+    fn finalize(&mut self, _ctx: &SessionCtx) -> anyhow::Result<Vec<SpanOp>> {
+        Ok(self
+            .last_ts_ms
+            .map_or_else(Vec::new, |ts| self.close_unfinished(ts)))
     }
 }
 

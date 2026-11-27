@@ -118,23 +118,35 @@ fn correlates_overlapping_tools_and_captures_the_final_reply_after_restore() {
         60,
         json!({"prompt_id": "p", "reason": "other"}),
     );
-    assert_eq!(end[0].row().span_id, root.span_id);
-    assert_eq!(end[0].row().end_ms, Some(60));
-    assert!(send(
+    assert_eq!(end.len(), 2);
+    let incomplete = end[0].row();
+    assert_eq!(incomplete.span_id, first[0].row().span_id);
+    assert_eq!(
+        incomplete.turn_span_id.as_deref(),
+        Some(turn.span_id.as_str())
+    );
+    assert_eq!(incomplete.metadata.as_ref().unwrap()["incomplete"], true);
+    assert!(incomplete.error.is_none());
+    assert_eq!(end[1].row().span_id, root.span_id);
+    assert_eq!(end[1].row().end_ms, Some(60));
+    let resume = send(
         &mut *restored,
         "SessionStart",
         70,
-        json!({"source": "resume"})
-    )
-    .is_empty());
+        json!({"source": "resume"}),
+    );
+    assert_eq!(resume[0].row().span_id, root.span_id);
+    assert_eq!(resume[0].row().end_ms, Some(70));
     let resumed = send(
         &mut *restored,
         "UserPromptSubmit",
         80,
         json!({"prompt_id": "next", "prompt": "Try again"}),
     );
-    assert_eq!(resumed[0].row().parent_span_ids, [root.span_id.as_str()]);
-    assert_ne!(resumed[0].row().span_id, turn.span_id);
+    assert_eq!(resumed[0].row().span_id, root.span_id);
+    assert_eq!(resumed[0].row().end_ms, Some(80));
+    assert_eq!(resumed[1].row().parent_span_ids, [root.span_id.as_str()]);
+    assert_ne!(resumed[1].row().span_id, turn.span_id);
 }
 
 #[test]
@@ -163,4 +175,78 @@ fn preserves_permission_requests_and_missing_tool_boundaries() {
     )
     .is_empty());
     assert!(send(&mut *translator, "FutureEvent", 40, json!({})).is_empty());
+}
+
+#[test]
+fn closes_pending_turn_and_tool_on_shutdown_or_finalization() {
+    let registry = Registry::default_agents();
+    let ctx = SessionCtx {
+        session_id: "devin-fixture".into(),
+        config: None,
+    };
+    for explicit_end in [true, false] {
+        let mut translator = registry.create("devin", "devin-fixture");
+        let start = send(
+            &mut *translator,
+            "UserPromptSubmit",
+            10,
+            json!({"prompt_id": "p", "prompt": "Read a file"}),
+        );
+        let turn = start.last().unwrap().row();
+        let mut tool = json!({"prompt_id": "p", "tool_name": "read", "tool_use_id": "read:1"});
+        let pre = send(&mut *translator, "PreToolUse", 20, tool.clone());
+        let state = translator.save_state().unwrap();
+        let mut translator = registry.create("devin", "devin-fixture");
+        translator.restore_state(&state).unwrap();
+
+        let closed = if explicit_end {
+            send(
+                &mut *translator,
+                "SessionEnd",
+                30,
+                json!({"prompt_id": "p"}),
+            )
+        } else {
+            translator.finalize(&ctx).unwrap()
+        };
+        for opened in [turn, pre[0].row()] {
+            let row = closed
+                .iter()
+                .find(|op| op.row().span_id == opened.span_id)
+                .unwrap()
+                .row();
+            assert_eq!(row.end_ms, Some(if explicit_end { 30 } else { 20 }));
+            assert_eq!(row.metadata.as_ref().unwrap()["incomplete"], true);
+            assert_eq!(row.turn_span_id, opened.turn_span_id);
+            assert!(row.output.is_none());
+            assert!(row.error.is_none());
+        }
+        assert!(translator.finalize(&ctx).unwrap().is_empty());
+
+        tool["tool_response"] = json!({"output": "file contents"});
+        let late = send(&mut *translator, "PostToolUse", 35, tool);
+        let completed = late.last().unwrap().row();
+        assert_eq!(completed.span_id, pre[0].row().span_id);
+        assert_eq!(completed.output, Some(json!("file contents")));
+        assert_eq!(completed.metadata.as_ref().unwrap()["incomplete"], false);
+        assert!(completed.error.is_none());
+    }
+}
+
+#[test]
+fn accepts_null_tool_success() {
+    let mut translator = Registry::default_agents().create("devin", "devin-fixture");
+    let ops = send(
+        &mut *translator,
+        "PostToolUse",
+        20,
+        json!({
+            "tool_name": "read", "tool_use_id": "read:1",
+            "tool_response": {"success": null, "output": "file contents"}
+        }),
+    );
+    let tool = ops.last().unwrap().row();
+    assert_eq!(tool.output, Some(json!("file contents")));
+    assert_eq!(tool.end_ms, Some(20));
+    assert!(tool.error.is_none());
 }

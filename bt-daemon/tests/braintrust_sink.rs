@@ -502,6 +502,57 @@ async fn span_updates_preserve_name_linkage_and_origin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn devin_tool_start_arriving_after_completion_updates_braintrust_timing() {
+    let server = mock_backend().await;
+    let config = session_config(&server.uri());
+    let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+    let mut sink = factory.create("devin-session", "devin").unwrap();
+    sink.configure(&config);
+    let ctx = bt_daemon::SessionCtx {
+        session_id: "devin-session".into(),
+        config: Some(config),
+    };
+    let mut translator = bt_daemon::Registry::default_agents().create("devin", &ctx.session_id);
+    let mut span_id = None;
+    for (event, ts_ms, response) in [
+        (
+            "PostToolUse",
+            2_000,
+            Some(json!({"success": true, "output": "done"})),
+        ),
+        ("PreToolUse", 1_000, None),
+    ] {
+        let mut payload = json!({
+            "hook_event_name": event, "prompt_id": "prompt", "tool_name": "exec", "tool_use_id": "exec:1"
+        });
+        if let Some(response) = response {
+            payload["tool_response"] = response;
+        }
+        let envelope = serde_json::from_value(json!({
+            "source": "devin", "event": event, "session_id": ctx.session_id, "ts_ms": ts_ms, "payload": payload
+        })).unwrap();
+        let ops = translator.handle(&envelope, &ctx).unwrap();
+        let tool = ops.last().unwrap().row();
+        assert_eq!(tool.span_type, SpanType::Tool);
+        assert_eq!(
+            span_id.get_or_insert_with(|| tool.span_id.clone()),
+            &tool.span_id
+        );
+        sink.emit(&ops).await.unwrap();
+        sink.flush().await.unwrap();
+    }
+
+    let span_id = span_id.unwrap();
+    let rows = logs3_rows(&server).await;
+    assert!(rows.iter().any(|row| {
+        row["span_id"] == span_id && row["output"] == "done" && row["metrics"]["end"] == 2.0
+    }));
+    assert!(rows.iter().any(|row| {
+        row["span_id"] == span_id && row["_is_merge"] == true && row["metrics"]["start"] == 1.0
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_session_can_extend_an_already_ended_root() {
     let server = mock_backend().await;
     let base = server.uri();

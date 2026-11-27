@@ -45,7 +45,7 @@ pub(super) struct ToolCall {
 
 #[derive(Deserialize)]
 pub(super) struct ToolResponse {
-    pub success: bool,
+    pub success: Option<bool>,
     pub output: Option<String>,
     pub error: Option<String>,
 }
