@@ -272,7 +272,7 @@ dependencies = [
 [[package]]
 name = "braintrust-api-client"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cf50dc3b92c5702b470971c67cdb3b915030a381#cf50dc3b92c5702b470971c67cdb3b915030a381"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d#b29025a725125f56d97232464500f065d98dfe5d"
 dependencies = [
  "anyhow",
  "backoff",
@@ -298,7 +298,7 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=cf50dc3b92c5702b470971c67cdb3b915030a381#cf50dc3b92c5702b470971c67cdb3b915030a381"
+source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=b29025a725125f56d97232464500f065d98dfe5d#b29025a725125f56d97232464500f065d98dfe5d"
 dependencies = [
  "anyhow",
  "async-trait",
