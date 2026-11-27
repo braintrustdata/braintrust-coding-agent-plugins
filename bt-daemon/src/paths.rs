@@ -51,6 +51,7 @@ pub(crate) fn supports_project_settings(source: &str) -> bool {
             | "codex"
             | "muse"
             | "muse-code"
+            | "devin"
             | "grok"
             | "antigravity"
     )

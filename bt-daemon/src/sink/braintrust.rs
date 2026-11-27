@@ -842,6 +842,11 @@ fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<Span
                 .collect::<HashMap<String, f64>>()
         })
         .unwrap_or_default();
+    // A start observed after the row was created must update the timing on
+    // the existing span, including when its terminal event arrived first.
+    if let Some(start) = row.start_ms {
+        metrics.insert("start".into(), ms_to_secs(start));
+    }
     // Stateless updates do not have a SpanHandle on which to call `end`, so
     // carry terminal timing in the merge payload itself.
     if let Some(end) = row.end_ms {

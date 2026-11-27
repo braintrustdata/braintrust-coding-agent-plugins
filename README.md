@@ -18,9 +18,8 @@ Both Antigravity plugins ship from the existing Antigravity distribution reposit
 The [Braintrust MCP plugin](src/plugins/devin/content/plugins/braintrust/README.md)
 connects Devin to the hosted US MCP server through OAuth and requires no `bt`
 installation. The separate
-[`braintrust-trace-devin` scaffold](src/plugins/devin/content/plugins/braintrust-trace-devin/README.md)
-reserves the tracing package with an empty `hooks.json`; it does not capture
-events yet. Build and validate both packages with `make validate-devin`.
+[`braintrust-trace-devin` plugin](src/plugins/devin/content/plugins/braintrust-trace-devin/README.md)
+provides experimental local Devin CLI tracing through `bt`. Build and validate both packages with `make validate-devin`.
 
 Devin's marketplace references `src/plugins/devin/content/plugins/braintrust`
 at an exact source commit. It does not require a separate distribution repo.

@@ -46,7 +46,19 @@ assert not (mcp / "hooks.json").exists(), "MCP access must not register tracing 
 trace = packages / "braintrust-trace-devin"
 manifest = json.loads((trace / ".devin-plugin/plugin.json").read_text())
 assert "mcpServers" not in manifest, "tracing must not install MCP"
-assert json.loads((trace / "hooks.json").read_text()) == {}, "tracing hooks must remain inactive until implemented"
+assert manifest["platforms"] == ["local"], "tracing is limited to local sessions"
+hooks = json.loads((trace / "hooks.json").read_text())
+assert set(hooks) == {
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+    "PermissionRequest", "Stop", "PostCompaction", "SessionEnd",
+}
+for event, groups in hooks.items():
+    assert len(groups) == 1 and len(groups[0]["hooks"]) == 1, event
+    hook = groups[0]["hooks"][0]
+    assert hook["type"] == "command", event
+    assert hook["command"] == (
+        "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+    ), event
 
 for path in (".devin-plugin", "plugin.json", ".mcp.json", "mcp.json", "hooks.json"):
     assert not (root / path).exists(), f"install a plugin subdirectory, not the build root: {path}"

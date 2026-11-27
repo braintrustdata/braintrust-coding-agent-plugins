@@ -1,1 +1,82 @@
-{}
+{
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "PermissionRequest": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "PostCompaction": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bt trace hook --source devin --flush-on-turn-end > /dev/null 2>&1 || true"
+        }
+      ]
+    }
+  ]
+}

@@ -113,12 +113,11 @@ is unversioned.
 | grok | `braintrustdata/braintrust-grok-plugin` |
 
 Devin packages live under `src/plugins/devin/content/plugins/`: `braintrust`
-provides hosted MCP access, and `braintrust-trace-devin` is an inactive tracing
-scaffold with an empty `hooks.json`. Devin tracing and daemon support are not
-implemented yet. Submit the MCP package's subdirectory to the Devin marketplace;
-keep the tracing scaffold out of the marketplace until capture is implemented
-and verified. Neither package needs version stamping or a publishing workflow;
-the marketplace pins an exact source commit.
+provides hosted MCP access, and `braintrust-trace-devin` captures local Devin CLI
+sessions through the daemon. Submit the MCP package's subdirectory to the Devin
+marketplace. The experimental tracing package is installed locally. Neither
+package needs version stamping or a publishing workflow. The marketplace pins an
+exact source commit.
 
 A distribution repository is a generated artifact. Each deploy clones it,
 replaces the tracked tree with a fresh build, and pushes the result.
