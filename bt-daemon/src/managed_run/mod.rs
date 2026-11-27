@@ -253,7 +253,7 @@ async fn run_traced_inner(
             let wait = async {
                 let status = child.wait().await;
                 // The relay may already have reached EOF.
-                let _ = notify_exit.send(tokio::time::Instant::now());
+                let _ = notify_exit.send(());
                 status
             };
             tokio::join!(wait, async {

@@ -4,7 +4,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
-use tokio::time::Instant;
+
+const POST_EXIT_STDOUT_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Deserialize)]
 struct ResultRecord {
@@ -58,27 +59,32 @@ pub(in crate::managed_run) fn observes_budget_result(args: &[OsString]) -> bool 
 pub(in crate::managed_run) async fn observe_budget_result(
     mut child_stdout: impl AsyncRead + Unpin,
     mut stdout: impl AsyncWrite + Unpin,
-    child_exited: oneshot::Receiver<Instant>,
+    mut child_exited: oneshot::Receiver<()>,
 ) -> std::io::Result<Option<String>> {
     // Ignore unusually large individual records without buffering unbounded stdout.
     const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
     let mut bytes = [0; 8192];
     let mut record = Some(Vec::new());
     let mut budget_session = None;
-    // A wrapper's descendants may keep the inherited pipe open. Give bytes
-    // already in the pipe time to drain, and never wait for descendant EOF.
-    // Bound reads only so a deadline cannot cut off a write already in flight.
-    let drain_deadline = async {
-        if let Ok(exited) = child_exited.await {
-            tokio::time::sleep_until(exited + Duration::from_millis(250)).await;
-        }
-    };
-    tokio::pin!(drain_deadline);
+    let mut draining = false;
     loop {
-        let read = tokio::select! {
-            biased;
-            () = &mut drain_deadline => break,
-            read = child_stdout.read(&mut bytes) => read?,
+        let read = if draining {
+            // Descendants can hold the pipe open after Claude exits. Bound
+            // idle reads only, keeping queued bytes even if forwarding is slow.
+            tokio::select! {
+                biased;
+                read = child_stdout.read(&mut bytes) => read?,
+                () = tokio::time::sleep(POST_EXIT_STDOUT_IDLE_TIMEOUT) => break,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut child_exited => {
+                    draining = true;
+                    continue;
+                }
+                read = child_stdout.read(&mut bytes) => read?,
+            }
         };
         if read == 0 {
             break;
@@ -134,6 +140,28 @@ fn observe_record(record: &[u8], budget_session: &mut Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drains_queued_stdout_after_a_slow_write() {
+        let result = r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"budget"}"#;
+        let input = format!("{}\n{result}\n", " ".repeat(16 * 1024));
+        let (mut reader, writer) = tokio::io::duplex(64);
+        let (notify_exit, child_exited) = oneshot::channel();
+        let relay = observe_budget_result(input.as_bytes(), writer, child_exited);
+        let consume = async {
+            let first_byte = reader.read_u8().await.unwrap();
+            notify_exit.send(()).unwrap();
+            // The relay's first write is still blocked on our 64-byte pipe.
+            tokio::time::sleep(POST_EXIT_STDOUT_IDLE_TIMEOUT + Duration::from_millis(100)).await;
+            let mut output = vec![first_byte];
+            reader.read_to_end(&mut output).await.unwrap();
+            output
+        };
+        let (session, output) = tokio::join!(relay, consume);
+        assert_eq!(output.len(), input.len(), "stdout must be fully relayed");
+        assert!(output == input.as_bytes(), "stdout bytes must be preserved");
+        assert_eq!(session.unwrap().as_deref(), Some("budget"));
+    }
 
     #[tokio::test]
     async fn mirrors_stream_json_and_only_accepts_native_budget_results() {
