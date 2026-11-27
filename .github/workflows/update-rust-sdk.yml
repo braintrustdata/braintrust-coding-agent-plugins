@@ -1,0 +1,89 @@
+name: Update Rust SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-rust-sdk
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    env:
+      BRANCH: automation/update-rust-sdk
+      SDK_REPOSITORY: braintrustdata/braintrust-sdk-rust
+    steps:
+      # App-authenticated pushes and PRs trigger pull request CI.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BRAINTRUST_BOT_APP_ID }}
+          private-key: ${{ secrets.BRAINTRUST_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-rust
+
+      - name: Resolve SDK commit and update dependencies
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "https://github.com/${SDK_REPOSITORY}.git" refs/heads/main | awk 'NR == 1 { print $1 }')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve Rust SDK main to a commit." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          SDK_SHA="$sha" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = Path("bt-daemon/Cargo.toml")
+          text = manifest.read_text()
+          for name in ("braintrust-sdk-rust", "braintrust-api-client"):
+              pattern = rf'({name}\s*=\s*\{{\s*git\s*=\s*"https://github\.com/braintrustdata/braintrust-sdk-rust"\s*,\s*rev\s*=\s*")[0-9a-f]{{40}}("\s*\}})'
+              text, count = re.subn(pattern, rf'\g<1>{os.environ["SDK_SHA"]}\g<2>', text)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one {name} git dependency")
+          manifest.write_text(text)
+          PY
+          cargo update --manifest-path bt-daemon/Cargo.toml --workspace
+
+      - name: Commit and open pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SDK_SHA: ${{ steps.sdk.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- bt-daemon/Cargo.toml bt-daemon/Cargo.lock; then
+            echo "Rust SDK is already up to date."
+            exit 0
+          fi
+          git fetch origin "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" || true
+          git switch -C "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bt-daemon/Cargo.toml bt-daemon/Cargo.lock
+          git commit -m "chore: update Rust SDK"
+          git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+          body="Updates the Rust SDK to [${SDK_SHA}](https://github.com/${SDK_REPOSITORY}/commit/${SDK_SHA})."
+          pr_number="$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "${{ github.repository }}" --title "chore: update Rust SDK" --body "$body"
+          else
+            gh pr create --repo "${{ github.repository }}" --base main --head "$BRANCH" --title "chore: update Rust SDK" --body "$body"
+          fi
