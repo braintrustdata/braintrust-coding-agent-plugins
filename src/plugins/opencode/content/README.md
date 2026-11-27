@@ -41,10 +41,15 @@ Settings load from these files, with project settings overriding global settings
 
 - Global: `$XDG_CONFIG_HOME/opencode/braintrust.json`, or
   `~/.config/opencode/braintrust.json` if `XDG_CONFIG_HOME` is unset
-- Project: `.opencode/braintrust.json`
+- Project: `.braintrust.json` at the Git root, or in the working directory outside Git
 
-`bt trace run` overrides tracing settings for one invocation. Files are merged
-at the top level: a project `route` replaces the global `route`.
+An explicit `"trace_to_braintrust": false` in the legacy
+`.opencode/braintrust.json` still disables tracing, even if
+`.braintrust.json` enables it. The plugin checks the working directory and the
+Git root for legacy opt-outs and uses only the tracing flag from those files.
+To migrate an opt-out, set `"trace_to_braintrust": false` in
+`.braintrust.json`. `bt trace run` can override these settings for one
+invocation.
 
 ```json
 {

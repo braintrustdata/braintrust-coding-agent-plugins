@@ -149,6 +149,34 @@ describe("BraintrustPlugin", () => {
     expect((await BraintrustPlugin(createInput(directory))).event).toBeDefined();
   });
 
+  it("honors a legacy project opt-out without applying the legacy tool settings", async () => {
+    const global = join(directory, ".config", "opencode");
+    const legacy = join(directory, ".opencode");
+    const nested = join(directory, "src");
+    mkdirSync(global, { recursive: true });
+    mkdirSync(legacy);
+    mkdirSync(nested);
+    mkdirSync(join(directory, ".git"));
+    delete process.env.BRAINTRUST_OPENCODE_ENABLE_TOOLS;
+    writeFileSync(join(global, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(
+      join(legacy, "braintrust.json"),
+      JSON.stringify({ trace_to_braintrust: false, enable_tools: false }),
+    );
+    const { BraintrustPlugin } = await import("./index");
+    const paused = await BraintrustPlugin(createInput(directory));
+    expect(paused.event).toBeUndefined();
+    expect(paused.tool).toBeDefined();
+
+    const shared = join(directory, ".braintrust.json");
+    writeFileSync(shared, JSON.stringify({ trace_to_braintrust: true }));
+    expect((await BraintrustPlugin(createInput(nested))).event).toBeUndefined();
+
+    writeFileSync(join(legacy, "braintrust.json"), JSON.stringify({ trace_to_braintrust: true }));
+    writeFileSync(shared, JSON.stringify({ trace_to_braintrust: false }));
+    expect((await BraintrustPlugin(createInput(nested))).event).toBeUndefined();
+  });
+
   it("does not bypass a project opt-out when its plugin list is invalid", async () => {
     const global = join(directory, ".config", "opencode");
     mkdirSync(global, { recursive: true });

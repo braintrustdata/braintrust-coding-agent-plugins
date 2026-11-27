@@ -87,6 +87,93 @@ fn opencode_test_env(
     ]
 }
 
+const OPENCODE_TEST_PASSWORD: &str = "integration-test-password";
+
+struct OpenCodeV2Server {
+    child: tokio::process::Child,
+    binary: std::ffi::OsString,
+    url: String,
+}
+
+impl OpenCodeV2Server {
+    async fn start(
+        world: &AgentTestWorld,
+        workspace: &std::path::Path,
+        home: &std::path::Path,
+    ) -> Self {
+        let binary = std::env::var_os("OPENCODE_V2_BIN").expect("set OPENCODE_V2_BIN");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+        let mut command = support::agent_process::command(&binary);
+        command
+            .args([
+                "serve",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .current_dir(workspace)
+            .envs(opencode_test_env(workspace, home))
+            .env("OPENCODE_PASSWORD", OPENCODE_TEST_PASSWORD)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        world.configure(&mut command);
+        let child = command.spawn().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for _ in 0..100 {
+            if client
+                .get(format!("{url}/api/session"))
+                .basic_auth("opencode", Some(OPENCODE_TEST_PASSWORD))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return Self { child, binary, url };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("OpenCode 2 server did not start");
+    }
+
+    fn run(&self, workspace: &std::path::Path, home: &std::path::Path) -> tokio::process::Command {
+        let mut command = support::agent_process::command(&self.binary);
+        command
+            .args(["run", "--server", &self.url, "--model", "mock/mock-model"])
+            .current_dir(workspace)
+            .envs(opencode_test_env(workspace, home))
+            .env("OPENCODE_PASSWORD", OPENCODE_TEST_PASSWORD);
+        command
+    }
+
+    async fn stop(mut self) {
+        #[cfg(unix)]
+        self.child.kill().await.unwrap();
+        #[cfg(windows)]
+        {
+            // The npm .cmd launcher owns the native server as a child process.
+            let pid = self.child.id().expect("running OpenCode 2 server");
+            let output = support::agent_process::command("taskkill")
+                .args(["/pid", &pid.to_string(), "/t", "/f"])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stop OpenCode 2 server: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            self.child.wait().await.unwrap();
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn agent_output_does_not_wait_for_inherited_descendant_handles() {
@@ -922,19 +1009,11 @@ async fn opencode_v2_session_emits_traces() {
     let plugins = workspace.join(".opencode/plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     std::fs::write(plugins.join("reject.js"), r#"export default { id: 'test.reject', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'permission.asked') await ctx.permission.reply({sessionID:event.data.sessionID,requestID:event.data.id,decision:'reject',message:'test denied'}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
-    let mut rejected =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    rejected
-        .args([
-            "run",
-            "--standalone",
-            "--model",
-            "mock/mock-model",
-            "permission marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
-    world.configure(&mut rejected);
+    // Keep plugin subscriptions alive until ingest observes the terminal events.
+    // The foreground CLI can exit while the standalone host is still forwarding them.
+    let server = OpenCodeV2Server::start(&world, &workspace, &home).await;
+    let mut rejected = server.run(&workspace, &home);
+    rejected.arg("permission marker");
     // OpenCode 2.0 exits nonzero after a rejection; later releases continue.
     let _output = world.output(&mut rejected).await;
     world
@@ -949,6 +1028,7 @@ async fn opencode_v2_session_emits_traces() {
                 }),
         )
         .await;
+    server.stop().await;
 
     std::fs::remove_file(plugins.join("reject.js")).unwrap();
     std::fs::write(plugins.join("interrupt.js"), r#"export default { id: 'test.interrupt', setup(ctx) { const c = new AbortController(); void (async () => { for await (const event of ctx.event.subscribe({signal:c.signal})) { if (event.type === 'session.tool.called') await ctx.session.interrupt({sessionID:event.data.sessionID}); } })().catch(() => {}); return () => c.abort(); } };"#).unwrap();
@@ -961,20 +1041,9 @@ async fn opencode_v2_session_emits_traces() {
         serde_json::to_vec(&persistent_config).unwrap(),
     )
     .unwrap();
-    let mut interrupted =
-        support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    interrupted
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "interrupt marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
-    world.configure(&mut interrupted);
+    let server = OpenCodeV2Server::start(&world, &workspace, &home).await;
+    let mut interrupted = server.run(&workspace, &home);
+    interrupted.args(["--auto", "interrupt marker"]);
     let _output = world.output(&mut interrupted).await;
     world
         .wait_for_mock_ingest_scenario(&IngestScenario::new().expect("interrupted turn", |row| {
@@ -984,21 +1053,12 @@ async fn opencode_v2_session_emits_traces() {
             )
         }))
         .await;
+    server.stop().await;
 
     std::fs::remove_file(plugins.join("interrupt.js")).unwrap();
-    let mut failed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    failed
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "model failure marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
-    world.configure(&mut failed);
+    let server = OpenCodeV2Server::start(&world, &workspace, &home).await;
+    let mut failed = server.run(&workspace, &home);
+    failed.args(["--auto", "model failure marker"]);
     let _output = world.output(&mut failed).await;
     let failure_rows = world
         .wait_for_mock_ingest_scenario(
@@ -1026,21 +1086,15 @@ async fn opencode_v2_session_emits_traces() {
         .expect("failed native session root")["metadata"]["session_id"]
         .as_str()
         .unwrap();
-    let mut resumed = support::agent_process::command(std::env::var_os("OPENCODE_V2_BIN").unwrap());
-    resumed
-        .args([
-            "run",
-            "--standalone",
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "--session",
-            native_session,
-            "model recovery marker",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home));
-    world.configure(&mut resumed);
+    server.stop().await;
+    let server = OpenCodeV2Server::start(&world, &workspace, &home).await;
+    let mut resumed = server.run(&workspace, &home);
+    resumed.args([
+        "--auto",
+        "--session",
+        native_session,
+        "model recovery marker",
+    ]);
     let output = world.output(&mut resumed).await;
     assert!(
         output.status.success(),
@@ -1058,6 +1112,7 @@ async fn opencode_v2_session_emits_traces() {
         .iter()
         .any(|row| row["root_span_id"] == failed_root
             && row_contains(row, &["Turn 2", "model recovery marker"])));
+    server.stop().await;
 
     std::fs::write(plugins.join("image.js"), r#"export default { id:'test.image', async setup(ctx) { await ctx.tool.transform(editor => editor.add({name:'fixture_image',description:'Return an image',input:{type:'object',properties:{},additionalProperties:false},options:{codemode:false},async execute() { return {content:[{type:'file',mime:'image/png',uri:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg=='}]}; }})); } };"#).unwrap();
     let mut image_run = support::agent_process::daemon_command();
@@ -1287,60 +1342,11 @@ async fn run_v2_compaction_after_idle(native: bool) {
         "export default {id:'test.compact',async setup(ctx){await ctx.session.hook('compaction',e=>{e.result={summary:'LEGACY_COMPACTION_SUMMARY'}})}};"
     };
     std::fs::write(plugins.join("compact.js"), hook).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let url = format!("http://127.0.0.1:{port}");
-    let mut server = support::agent_process::command(&binary);
-    server
-        .args([
-            "serve",
-            "--hostname",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home))
-        .env("OPENCODE_PASSWORD", "integration-test-password")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    world.configure(&mut server);
-    let mut server = server.spawn().unwrap();
+    let server = OpenCodeV2Server::start(&world, &workspace, &home).await;
+    let url = &server.url;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let mut ready = false;
-    for _ in 0..100 {
-        if client
-            .get(format!("{url}/api/session"))
-            .basic_auth("opencode", Some("integration-test-password"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(ready, "OpenCode 2 server did not start");
-    let mut run = support::agent_process::command(&binary);
-    run.args([
-        "run",
-        "--server",
-        &url,
-        "--auto",
-        "--model",
-        "mock/mock-model",
-        "--format",
-        "json",
-        "legacy compaction",
-    ])
-    .current_dir(&workspace)
-    .envs(opencode_test_env(&workspace, &home))
-    .env("OPENCODE_PASSWORD", "integration-test-password");
+    let mut run = server.run(&workspace, &home);
+    run.args(["--auto", "--format", "json", "legacy compaction"]);
     let output = world.output(&mut run).await;
     assert!(
         output.status.success(),
@@ -1365,7 +1371,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
         .clone();
     let compact_request = client
         .post(format!("{url}/api/session/{session_id}/compact"))
-        .basic_auth("opencode", Some("integration-test-password"))
+        .basic_auth("opencode", Some(OPENCODE_TEST_PASSWORD))
         .json(&json!({"delivery":"queue"}))
         .build()
         .unwrap();
@@ -1384,22 +1390,13 @@ async fn run_v2_compaction_after_idle(native: bool) {
         .iter()
         .any(|row| row_contains(row, &[r#""type":"llm""#, summary])
             && row["root_span_id"] == root_id));
-    let mut resume = support::agent_process::command(&binary);
-    resume
-        .args([
-            "run",
-            "--server",
-            &url,
-            "--auto",
-            "--model",
-            "mock/mock-model",
-            "--session",
-            &session_id,
-            "legacy after compaction",
-        ])
-        .current_dir(&workspace)
-        .envs(opencode_test_env(&workspace, &home))
-        .env("OPENCODE_PASSWORD", "integration-test-password");
+    let mut resume = server.run(&workspace, &home);
+    resume.args([
+        "--auto",
+        "--session",
+        &session_id,
+        "legacy after compaction",
+    ]);
     let output = world.output(&mut resume).await;
     assert!(
         output.status.success(),
@@ -1459,8 +1456,7 @@ async fn run_v2_compaction_after_idle(native: bool) {
             .contains("NATIVE_COMPACTION_WINDOW"));
         assert!(!compact["input"].to_string().contains("legacy compaction"));
     }
-    server.kill().await.unwrap();
-    server.wait().await.unwrap();
+    server.stop().await;
 }
 
 #[cfg(unix)]

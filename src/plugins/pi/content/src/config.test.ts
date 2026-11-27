@@ -1,8 +1,11 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { loadConfig } from "./config.ts";
+import { runningPiPackage } from "./pi-package.ts";
+
+vi.mock("./pi-package.ts", () => ({ runningPiPackage: vi.fn() }));
 
 const ENVIRONMENT_KEYS = [
   "BRAINTRUST_PROFILE",
@@ -28,6 +31,7 @@ function writeJson(path: string, value: unknown): void {
 }
 
 beforeEach(() => {
+  vi.mocked(runningPiPackage).mockReturnValue({ configDir: ".pi" });
   home = mkdtempSync(join(tmpdir(), "pi-config-home-"));
   cwd = mkdtempSync(join(tmpdir(), "pi-config-project-"));
   for (const key of HOME_KEYS) {
@@ -130,6 +134,46 @@ describe("loadConfig", () => {
     mkdirSync(nested, { recursive: true });
     writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: true, project: "repo" });
     expect(loadConfig(nested)).toMatchObject({ enabled: true, projectName: "repo" });
+  });
+
+  it("honors a legacy project opt-out without applying the legacy route", () => {
+    mkdirSync(join(cwd, ".git"));
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), {
+      trace_to_braintrust: true,
+      project: "global",
+    });
+    writeJson(join(cwd, ".pi", "braintrust.json"), {
+      trace_to_braintrust: false,
+      project: "legacy",
+    });
+    expect(loadConfig(cwd)).toMatchObject({ enabled: false, projectName: "global" });
+
+    const nested = join(cwd, "src");
+    mkdirSync(nested);
+    writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: true, project: "shared" });
+    expect(loadConfig(nested)).toMatchObject({ enabled: false, projectName: "shared" });
+
+    writeJson(join(cwd, ".pi", "braintrust.json"), {
+      trace_to_braintrust: true,
+      project: "legacy",
+    });
+    writeJson(join(cwd, ".braintrust.json"), { trace_to_braintrust: false, project: "shared" });
+    expect(loadConfig(nested)).toMatchObject({ enabled: false, projectName: "shared" });
+  });
+
+  it("honors the host's legacy config directory and permits a managed run", () => {
+    vi.mocked(runningPiPackage).mockReturnValue({ configDir: ".custom" });
+    mkdirSync(join(cwd, ".git"));
+    const nested = join(cwd, "src");
+    writeJson(join(home, ".pi", "agent", "braintrust.json"), { trace_to_braintrust: true });
+    writeJson(join(nested, ".custom", "braintrust.json"), { trace_to_braintrust: "off" });
+    expect(loadConfig(nested).enabled).toBe(false);
+
+    process.env.BT_TRACE_INVOCATION_SETTINGS = JSON.stringify({
+      trace_to_braintrust: true,
+      route: { destination: { type: "project_logs", project_name: "run" } },
+    });
+    expect(loadConfig(nested)).toMatchObject({ enabled: true });
   });
 
   it("appends repository plugins relative to the shared configuration and can replace user plugins", () => {

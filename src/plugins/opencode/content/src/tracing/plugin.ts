@@ -17,10 +17,8 @@ export async function readPluginConfig(input: {
     const path = await import("node:path");
     const os = await import("node:os");
     const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-    const configPaths = [
-      path.join(configHome, "opencode", "braintrust.json"),
-      projectSettingsPath(input.directory),
-    ];
+    const projectPath = projectSettingsPath(input.directory);
+    const configPaths = [path.join(configHome, "opencode", "braintrust.json"), projectPath];
     for (const [index, configPath] of configPaths.entries()) {
       try {
         if (fs.existsSync(configPath)) {
@@ -92,6 +90,25 @@ export async function readPluginConfig(input: {
       } catch {
         // Do not bypass a project opt-out when its settings cannot be read.
         if (index === 1) pluginConfig = { ...pluginConfig, trace_to_braintrust: false };
+      }
+    }
+
+    if (pluginConfig?.trace_to_braintrust !== true) return pluginConfig;
+
+    const legacyDirectories = new Set([input.directory, path.dirname(projectPath)]);
+    for (const directory of legacyDirectories) {
+      const configPath = path.join(directory, ".opencode", "braintrust.json");
+      try {
+        if (!fs.existsSync(configPath)) continue;
+        const legacy = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Pick<
+          PluginConfig,
+          "trace_to_braintrust"
+        > | null;
+        if (legacy?.trace_to_braintrust === false) {
+          return { ...pluginConfig, trace_to_braintrust: false };
+        }
+      } catch {
+        // Preserve the legacy loader's handling of unreadable project files.
       }
     }
   } catch {
