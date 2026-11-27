@@ -64,7 +64,10 @@ impl Failure {
         } else {
             cause
         };
-        let retry = match cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>() {
+        let sdk_error = cause
+            .chain()
+            .find_map(|error| error.downcast_ref::<braintrust_sdk_rust::BraintrustError>());
+        let retry = match sdk_error {
             Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. }) => {
                 RetryCondition::Credentials
             }

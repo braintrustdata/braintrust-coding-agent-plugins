@@ -1,9 +1,8 @@
 //! Sinks consume [`SpanOp`]s. Phase 1 shipped the debug sink (dumps ops to
 //! NDJSON); Phase 2 adds the Braintrust sink over `braintrust-sdk-rust`.
 //!
-//! The trait is async so the Braintrust sink can drive the SDK's async
-//! `flush`. `emit` is called on the per-session hot path; the SDK's `log`/`end`
-//! are synchronous fire-and-forget (queue-backed), so `emit` rarely awaits.
+//! The Braintrust sink queues writes during `emit` and observes their delivery
+//! during `flush`. It can also wait during `emit` to bound the amount queued.
 
 mod braintrust;
 mod debug;
