@@ -1,5 +1,9 @@
 //! Claude Code managed runs pass their hooks through `--settings`.
 
+mod budget_result;
+
+pub(super) use budget_result::{observe_budget_result, observes_budget_result};
+
 use std::ffi::OsString;
 
 use super::{Injection, ManagedRun};

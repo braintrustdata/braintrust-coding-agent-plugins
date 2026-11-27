@@ -469,7 +469,14 @@ pub async fn flush_managed_run(
     socket: &std::path::Path,
     timeout_ms: u64,
 ) -> anyhow::Result<wire::FlushResult> {
-    flush_managed_run_in(managed_run_id, socket, timeout_ms, &paths::data_dir(None)).await
+    flush_managed_run_in(
+        managed_run_id,
+        socket,
+        timeout_ms,
+        &paths::data_dir(None),
+        None,
+    )
+    .await
 }
 
 /// The daemon spends at most `timeout_ms` finalizing a managed run and then
@@ -486,12 +493,16 @@ pub(crate) async fn flush_managed_run_in(
     socket: &std::path::Path,
     timeout_ms: u64,
     data_dir: &std::path::Path,
+    terminal_event: Option<&Envelope>,
 ) -> anyhow::Result<wire::FlushResult> {
     let client_timeout = managed_run_flush_client_timeout(timeout_ms);
     tokio::time::timeout(client_timeout, async {
         let stream = match connect(socket).await {
             Ok(stream) => stream,
-            Err(_) => {
+            Err(error) => {
+                if terminal_event.is_some() {
+                    tracing::warn!(%error, managed_run_id, "could not capture managed run result");
+                }
                 let accepted_sessions = journal::read_managed_run_keys(data_dir, managed_run_id)
                     .await
                     .len() as u64;
@@ -504,6 +515,18 @@ pub(crate) async fn flush_managed_run_in(
         };
         let mut conn = Conn::new(stream);
         conn.initialize("managed-run-flush").await?;
+        if let Some(event) = terminal_event {
+            match conn
+                .call::<wire::EventLogResult>(method::EVENT_LOG, event)
+                .await
+            {
+                Ok(result) if result.accepted => {}
+                Ok(_) => tracing::warn!(managed_run_id, "daemon did not accept managed run result"),
+                Err(error) => {
+                    tracing::warn!(%error, managed_run_id, "could not capture managed run result")
+                }
+            }
+        }
         let params = ManagedRunFlushParams {
             managed_run_id: managed_run_id.to_string(),
             timeout_ms,

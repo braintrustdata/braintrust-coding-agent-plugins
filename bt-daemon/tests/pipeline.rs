@@ -613,6 +613,8 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     struct RejectOnce {
         flushes: AtomicUsize,
         emitted: AtomicUsize,
+        replay_started: tokio::sync::Notify,
+        allow_replay: tokio::sync::Notify,
     }
     struct RejectOnceSink(Arc<RejectOnce>);
     struct RejectOnceFactory(Arc<RejectOnce>);
@@ -628,8 +630,13 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
             Ok(ops.len() as u64)
         }
         async fn flush(&mut self) -> anyhow::Result<()> {
-            if self.0.flushes.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("backend rejected and consumed the batch");
+            match self.0.flushes.fetch_add(1, Ordering::SeqCst) {
+                0 => anyhow::bail!("backend rejected and consumed the batch"),
+                1 => {
+                    self.0.replay_started.notify_one();
+                    self.0.allow_replay.notified().await;
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -670,8 +677,17 @@ async fn rejected_flush_retries_the_span_journal_before_checkpointing() {
     )
     .await
     .unwrap();
-    flush_session(session, &socket, 5_000).await.unwrap();
-    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+    // The first flush can complete after recovery has already retried.
+    // Hold the retry so we can inspect progress while the batch is pending.
+    let (first_flush, ()) = tokio::join!(flush_session(session, &socket, 5_000), async {
+        tokio::time::timeout(Duration::from_secs(5), sink.replay_started.notified())
+            .await
+            .expect("the rejected batch must be resubmitted");
+        let (head, tail) = head_and_tail(&data_dir);
+        assert!(head < tail, "rejected rows must remain pending");
+        sink.allow_replay.notify_one();
+    });
+    first_flush.unwrap();
     forward_envelope(&envelope(session, "Stop", 2), &socket, &dummy_host(), false)
         .await
         .unwrap();
@@ -2990,6 +3006,110 @@ printf '{"session_id":"managed-parent","hook_event_name":"SessionEnd"}\n' |
     assert!(rows
         .iter()
         .any(|row| row.parent_span_ids == [session.span_id.clone()]));
+}
+
+#[cfg(all(feature = "cli", unix))]
+#[tokio::test]
+async fn managed_claude_budget_result_marks_the_finished_turn_and_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let socket = test_endpoint(tmp.path());
+    let mut opts = debug_serve_options(env!("CARGO_PKG_VERSION"), &data_dir);
+    opts.auth_provider = Some(Arc::new(TestAuthProvider {
+        calls: Mutex::new(Vec::new()),
+        fail: false,
+        first_lease_expired: false,
+    }));
+    let handle = tokio::spawn(run_serve(
+        ServeArgs {
+            socket: Some(socket.clone()),
+            data_dir: Some(data_dir.clone()),
+            idle_timeout_secs: 0,
+            session_idle_timeout_secs: 0,
+            retention: None,
+        },
+        opts,
+    ));
+    wait_for(&socket).await;
+    let result = concat!(
+        r#"[{"type":"system","subtype":"init","session_id":"managed-budget"},"#,
+        r#"{"type":"result","subtype":"error_max_budget_usd","session_id":"managed-budget","is_error":true}]"#,
+    );
+    let agent = tmp.path().join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"UserPromptSubmit","prompt":"hello"}}' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+printf '%s\n' '{{"session_id":"managed-budget","hook_event_name":"SessionEnd","reason":"other"}}' |
+  "$BT_DAEMON_TEST_BIN" hook --source claude --managed-run-hook --no-spawn
+printf '%s\n' '{result}'
+# Leave the wrapper's stdout open after it exits, without retaining stderr.
+sleep 30 </dev/null 2>/dev/null &
+exit 1
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_bt-daemon");
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args([
+            "run",
+            "--project",
+            "test-project",
+            "claude",
+            "--",
+            "-p",
+            "--max-budget-usd=0.01",
+            "--output-format",
+            "json",
+            "--verbose",
+            "hello",
+        ])
+        .env("CLAUDE_BIN", &agent)
+        .env("BT_DAEMON_TEST_BIN", binary)
+        .env("BRAINTRUST_DAEMON_SOCKET", &socket)
+        .env("BRAINTRUST_DAEMON_DATA_DIR", &data_dir)
+        .env_remove("BRAINTRUST_DESTINATION")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .expect("managed run must finish while the helper still holds stdout")
+        .unwrap();
+
+    shutdown(&socket).await;
+    handle.await.unwrap().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("{result}\n").as_bytes(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spans = std::fs::read_to_string(data_dir.join("spans/managed-budget.ndjson")).unwrap();
+    let ops = spans
+        .lines()
+        .map(|line| serde_json::from_str::<SpanOp>(line).unwrap())
+        .collect::<Vec<_>>();
+    for field in ["outcome", "session_status"] {
+        assert!(ops.iter().any(|op| matches!(op, SpanOp::Merge(row)
+            if row.end_ms.is_none() && row.metadata.as_ref().is_some_and(|metadata|
+                metadata["termination_reason"] == "max_budget_usd" && metadata[field] == "interrupted"
+            )
+        )), "missing budget limit on {field}: {ops:?}");
+    }
 }
 
 #[cfg(all(feature = "cli", unix))]

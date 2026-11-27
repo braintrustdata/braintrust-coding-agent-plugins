@@ -11,6 +11,7 @@ mod pi;
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use crate::agents::{registrar, Agent};
 use crate::args::{RunArgs, RunHookCommand, RunSource};
@@ -21,6 +22,7 @@ use crate::wire::{self, SessionRoute};
 use crate::{env, paths, settings, subprocess};
 
 const MANAGED_RUN_FLUSH_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const CLAUDE_BUDGET_LIMIT_EVENT: &str = "ManagedBudgetLimit";
 
 /// The agent-specific parts of a managed run. Implemented in each agent's
 /// module here and registered in [`crate::agents`].
@@ -208,6 +210,9 @@ async fn run_traced_inner(
             })?);
         }
     }
+    let budget_route = (args.source == RunSource::Claude
+        && claude::observes_budget_result(&args.agent_args))
+    .then(|| route.clone());
     let invocation_settings = serde_json::to_string(&settings::InvocationSettings::enabled(route))?;
     let mut command: tokio::process::Command = subprocess::interactive_command(&executable).into();
     command
@@ -221,6 +226,9 @@ async fn run_traced_inner(
         env::set_with_alias(&mut command, paths::DATA_DIR_ENV, runtime.temp_dir.path());
     }
     command.envs(injection.env);
+    if budget_route.is_some() {
+        command.stdout(Stdio::piped());
+    }
     let _guards = injection.guards;
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -237,10 +245,31 @@ async fn run_traced_inner(
     let interrupt = tokio::signal::ctrl_c();
     tokio::pin!(interrupt);
 
-    let status = tokio::select! {
-        status = child.wait() => status.map_err(anyhow::Error::from),
+    let child_stdout = child.stdout.take();
+    let (status, budget_session) = tokio::select! {
+        (status, budget_session) = async {
+            let Some(child_stdout) = child_stdout else { return (child.wait().await, None) };
+            let (notify_exit, child_exited) = tokio::sync::oneshot::channel();
+            let wait = async {
+                let status = child.wait().await;
+                // The relay may already have reached EOF.
+                let _ = notify_exit.send(());
+                status
+            };
+            tokio::join!(wait, async {
+                match claude::observe_budget_result(child_stdout, tokio::io::stdout(), child_exited).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::BrokenPipe {
+                            tracing::warn!(%error, "could not relay Claude's stdout");
+                        }
+                        None
+                    }
+                }
+            })
+        } => (status.map_err(anyhow::Error::from), budget_session),
         result = &mut interrupt => {
-            match result {
+            let status = match result {
                 Ok(()) => {
                     let kill_result = child.start_kill();
                     let wait_result = child.wait().await;
@@ -249,9 +278,25 @@ async fn run_traced_inner(
                         .and_then(|()| wait_result.map_err(anyhow::Error::from))
                 }
                 Err(error) => Err(error.into()),
-            }
+            };
+            (status, None)
         }
     };
+    let budget_event = budget_session
+        .zip(budget_route)
+        .map(|(session_id, route)| wire::Envelope {
+            source: name.into(),
+            source_version: None,
+            plugin_version: None,
+            session_id,
+            event: CLAUDE_BUDGET_LIMIT_EVENT.into(),
+            ts_ms: crate::pipeline::recovery::now_ms(),
+            managed_run_id: Some(managed_run_id.clone()),
+            capture: None,
+            payload: serde_json::Value::Null,
+            route: Some(route),
+            config: None,
+        });
     let socket = isolated_runtime
         .as_ref()
         .map(|runtime| runtime.socket.clone())
@@ -265,6 +310,7 @@ async fn run_traced_inner(
         &socket,
         MANAGED_RUN_FLUSH_TIMEOUT_MS,
         &data_dir,
+        budget_event.as_ref(),
     )
     .await
     {
