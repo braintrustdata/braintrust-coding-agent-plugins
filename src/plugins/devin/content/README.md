@@ -5,15 +5,15 @@ This tree contains two independent Devin plugins:
 | Package | Purpose | Status |
 | --- | --- | --- |
 | [`braintrust`](plugins/braintrust/README.md) | Hosted Braintrust MCP access through OAuth | Awaiting authenticated Devin verification |
-| [`braintrust-trace-devin`](plugins/braintrust-trace-devin/README.md) | Devin session tracing | Inactive scaffold; hooks and daemon support are not implemented |
+| [`braintrust-trace-devin`](plugins/braintrust-trace-devin/README.md) | Local Devin CLI session tracing | Experimental |
 
 Install the individual plugin subdirectory. This root is a build output container,
 not an installable plugin or a bundle that installs both packages.
 
 The Devin marketplace should reference
 `src/plugins/devin/content/plugins/braintrust` in this monorepo using a
-`git-subdir` source pinned to the merged commit. Keep the tracing scaffold out of
-the marketplace until tracing is implemented and verified.
+`git-subdir` source pinned to the merged commit. Install the experimental
+tracing package locally.
 
 From the monorepo root:
 

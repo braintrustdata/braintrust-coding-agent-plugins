@@ -55,6 +55,18 @@ pub fn native_streams() -> Vec<NativeStream> {
         })
         .collect();
     cases.push(("muse".to_owned(), events, None));
+    let events = include_str!("../fixtures/devin-hooks-3000.15.14.jsonl")
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let payload: Value = serde_json::from_str(line).unwrap();
+            let name = payload["hook_event_name"].as_str().unwrap().to_owned();
+            let mut envelope = event("devin", &name, i as i64 + 1, payload);
+            envelope.source_version = Some("3000.15.14".into());
+            envelope
+        })
+        .collect();
+    cases.push(("devin".into(), events, None));
     let events =
         include_str!("../fixtures/cursor/real-cli/interactive-multi-turn-success/hooks.ndjson")
             .lines()

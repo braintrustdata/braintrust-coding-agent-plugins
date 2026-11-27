@@ -1,0 +1,10 @@
+{"hook_event_name":"SessionStart","source":"startup","session_id":"checkpoint"}
+{"hook_event_name":"UserPromptSubmit","prompt":"Run cat a.txt and cat b.txt in parallel, then run cat missing.txt.","source":"user","session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PreToolUse","tool_name":"exec","tool_input":{"command":"cat a.txt"},"tool_use_id":"exec:0#fixture","session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PreToolUse","tool_name":"exec","tool_input":{"command":"cat b.txt"},"tool_use_id":"exec:1#fixture","session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PostToolUse","tool_name":"exec","tool_input":{"command":"cat a.txt"},"tool_use_id":"exec:0#fixture","tool_response":{"success":true,"output":"Output from command in shell fixture:\nalpha\n\n\nExit code: 0","error":null},"session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PostToolUse","tool_name":"exec","tool_input":{"command":"cat b.txt"},"tool_use_id":"exec:1#fixture","tool_response":{"success":true,"output":"Output from command in shell fixture:\nbeta\n\n\nExit code: 0","error":null},"session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PreToolUse","tool_name":"exec","tool_input":{"command":"cat missing.txt"},"tool_use_id":"exec:2#fixture","session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"PostToolUse","tool_name":"exec","tool_input":{"command":"cat missing.txt"},"tool_use_id":"exec:2#fixture","tool_response":{"success":true,"output":"Output from command in shell fixture:\ncat: missing.txt: No such file or directory\n\n\nExit code: 1","error":null},"session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"a.txt contains alpha, b.txt contains beta, and missing.txt was not found.","session_id":"checkpoint","prompt_id":"prompt-1"}
+{"hook_event_name":"SessionEnd","reason":"other","session_id":"checkpoint","prompt_id":"prompt-1"}

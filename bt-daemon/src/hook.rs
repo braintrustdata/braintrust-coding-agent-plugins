@@ -195,10 +195,17 @@ pub(crate) fn read_project_hook_payload(
         if raw.trim().is_empty() {
             return Ok(None);
         }
-        Ok(Some(parse_hook_payload(
-            &raw,
-            args.transcript_path_field.as_deref(),
-        )?))
+        let mut payload = parse_hook_payload(&raw, args.transcript_path_field.as_deref())?;
+        // Devin supplies the workspace separately from its JSON hook payload.
+        if args.source == "devin" {
+            if let Some((cwd, object)) = crate::env::var("DEVIN_PROJECT_DIR")
+                .filter(|cwd| !cwd.is_empty())
+                .zip(payload.as_object_mut())
+            {
+                object.insert("cwd".into(), serde_json::Value::String(cwd));
+            }
+        }
+        Ok(Some(payload))
     } else {
         Ok(None)
     }

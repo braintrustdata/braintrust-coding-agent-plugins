@@ -16,6 +16,7 @@ mod codex;
 pub(crate) mod cursor;
 mod debug;
 mod decode;
+mod devin;
 mod git;
 mod grok;
 mod muse;
@@ -355,6 +356,7 @@ mod tests {
                 "codex",
                 "cursor",
                 "debug",
+                "devin",
                 "grok",
                 "muse",
                 "opencode",

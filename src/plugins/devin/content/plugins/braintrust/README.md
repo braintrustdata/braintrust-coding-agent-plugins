@@ -37,5 +37,5 @@ MCP URL from **Settings → Data plane**, preserving any path prefix.
 Plugin-owned URLs are read-only in Customize, so these alternatives require a
 customized plugin copy or a separately configured custom MCP server.
 
-The separate `braintrust-trace-devin` package is an inactive scaffold. It does not
-need to be installed for MCP access.
+The separate [Braintrust Trace Devin plugin](../braintrust-trace-devin/README.md)
+captures local Devin CLI sessions.
