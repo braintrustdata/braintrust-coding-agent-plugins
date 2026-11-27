@@ -336,25 +336,25 @@ async fn claude_uploads_prompt_documents_and_tool_images() {
         ],
     )
     .await;
+    // A late attachment can arrive as a separate merge with no span attributes.
+    let has_reference = |attribute: &str, value: &str, field: &str, mime: &str| {
+        rows.iter()
+            .filter(|row| row["span_attributes"][attribute] == value)
+            .any(|span| {
+                rows.iter()
+                    .any(|row| row["span_id"] == span["span_id"] && reference(&row[field], mime))
+            })
+    };
     for kind in ["task", "llm"] {
         assert!(
-            rows.iter().any(|row| row["span_attributes"]["type"] == kind
-                && reference(&row["input"], "application/pdf")),
+            has_reference("type", kind, "input", "application/pdf"),
             "missing {kind} PDF: {rows:?}"
         );
     }
-    assert!(rows
-        .iter()
-        .any(|row| row["span_attributes"]["name"] == "Turn 1"
-            && reference(&row["input"], "application/pdf")));
-    assert!(!rows
-        .iter()
-        .any(|row| row["span_attributes"]["name"] == "Turn 2"
-            && reference(&row["input"], "application/pdf")));
+    assert!(has_reference("name", "Turn 1", "input", "application/pdf"));
+    assert!(!has_reference("name", "Turn 2", "input", "application/pdf"));
     assert!(
-        rows.iter()
-            .any(|row| row["span_attributes"]["type"] == "tool"
-                && reference(&row["output"], "image/png")),
+        has_reference("type", "tool", "output", "image/png"),
         "missing tool image: {rows:?}"
     );
 }

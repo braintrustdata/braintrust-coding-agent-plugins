@@ -1,12 +1,8 @@
 //! The Braintrust sink: maps sink-neutral [`SpanOp`]s onto `braintrust-sdk-rust`.
 //!
-//! Each routing branch owns its checked SDK queue. Clients are built lazily
-//! using its configured backend URLs; flush results cannot include another
-//! branch's rejected operations. Within a client, each
-//! session's token/org travel per span (`span_builder_with_credentials`) and
-//! never leak across sessions. Span ids are the translator's deterministic
-//! UUIDv5 strings, reused as the SDK `row_id` merge key so journal replay
-//! re-emits idempotently.
+//! Each routing branch tracks its own writes on the shared SDK delivery service.
+//! Credentials travel with each span, and deterministic row IDs make journal
+//! replay idempotent.
 
 use super::{Sink, SinkFactory};
 use crate::translate::{SpanOp, SpanRow, SpanType};
@@ -16,15 +12,13 @@ use braintrust_api_client::backend::{
     BackendClient, HttpError,
 };
 use braintrust_sdk_rust::{
-    BraintrustClient, ParentSpanInfo, SpanComponents, SpanHandle, SpanLog, SpanObjectType,
-    SpanType as SdkSpanType, DEFAULT_API_URL, DEFAULT_APP_URL,
+    BraintrustClient, Completion, DeliveryReceipt, ParentSpanInfo, SpanComponents, SpanHandle,
+    SpanLog, SpanObjectType, SpanType as SdkSpanType, WriteError, DEFAULT_API_URL, DEFAULT_APP_URL,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
 
 /// Daemon-level Braintrust settings. `api_url`/`app_url` are *fallbacks* used
 /// when a session's config doesn't carry its own (e.g. the standalone binary's
@@ -35,109 +29,23 @@ pub struct BraintrustSinkConfig {
     pub app_url: Option<String>,
 }
 
-/// Lazily-built, shared-by-URL client pool.
-struct ClientCache {
-    state: AsyncMutex<ClientCacheState>,
-}
-
-const CLIENT_CACHE_CAPACITY: usize = 16;
 const QUEUE_FLUSH_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+type SpanWrite = Completion<DeliveryReceipt, WriteError>;
 
-#[derive(Default)]
-struct ClientCacheState {
-    clients: HashMap<(String, String), Arc<CachedClient>>,
-    order: VecDeque<(String, String)>,
+#[cfg(any(test, feature = "test-support"))]
+fn configure_test_sdk_runtime() -> braintrust_sdk_rust::Result<()> {
+    use braintrust_sdk_rust::{configure_service, ServiceConfig, ServiceRuntime};
+
+    // Test cases have independent Tokio runtimes. Give the process-wide SDK
+    // service a runtime that survives the first test to finish.
+    configure_service(
+        ServiceConfig::builder()
+            .runtime(ServiceRuntime::Dedicated)
+            .build(),
+    )
 }
 
-struct CachedClient {
-    client: BraintrustClient,
-    queued_bytes: AsyncMutex<usize>,
-}
-
-impl CachedClient {
-    async fn account_and_flush(&self, bytes: usize) -> anyhow::Result<()> {
-        let mut queued_bytes = self.queued_bytes.lock().await;
-        *queued_bytes = queued_bytes.saturating_add(bytes);
-        if *queued_bytes < QUEUE_FLUSH_BYTE_BUDGET {
-            return Ok(());
-        }
-        self.client.flush().await.map_err(anyhow::Error::new)?;
-        *queued_bytes = 0;
-        Ok(())
-    }
-
-    async fn flush(&self) -> anyhow::Result<()> {
-        let mut queued_bytes = self.queued_bytes.lock().await;
-        self.client.flush().await.map_err(anyhow::Error::new)?;
-        *queued_bytes = 0;
-        Ok(())
-    }
-}
-
-impl ClientCacheState {
-    fn touch(&mut self, key: &(String, String)) {
-        self.order.retain(|candidate| candidate != key);
-        self.order.push_back(key.clone());
-    }
-
-    fn trim_inactive(&mut self) {
-        while self.clients.len() >= CLIENT_CACHE_CAPACITY {
-            let Some(index) = self.order.iter().position(|key| {
-                self.clients
-                    .get(key)
-                    .is_some_and(|client| Arc::strong_count(client) == 1)
-            }) else {
-                // Every client is still referenced by a live session; those are
-                // active working state and cannot be evicted safely.
-                break;
-            };
-            if let Some(key) = self.order.remove(index) {
-                self.clients.remove(&key);
-            }
-        }
-    }
-}
-
-impl ClientCache {
-    fn new() -> Self {
-        Self {
-            state: AsyncMutex::new(ClientCacheState::default()),
-        }
-    }
-
-    async fn get_or_build(
-        &self,
-        api_url: &str,
-        app_url: &str,
-    ) -> anyhow::Result<Arc<CachedClient>> {
-        let key = (api_url.to_string(), app_url.to_string());
-        // Hold the lock across build so two sessions on a new URL don't build
-        // duplicate clients. Build is cheap (skip_login: no network).
-        let mut state = self.state.lock().await;
-        if let Some(c) = state.clients.get(&key).cloned() {
-            state.touch(&key);
-            return Ok(c);
-        }
-        let client = BraintrustClient::builder()
-            .skip_login(true)
-            .checked_delivery(true)
-            .api_url(api_url.to_string())
-            .app_url(app_url.to_string())
-            .build()
-            .await
-            .map_err(|e| anyhow::anyhow!("braintrust client build failed: {e}"))?;
-        let arc = Arc::new(CachedClient {
-            client,
-            queued_bytes: AsyncMutex::new(0),
-        });
-        state.trim_inactive();
-        state.clients.insert(key.clone(), arc.clone());
-        state.touch(&key);
-        Ok(arc)
-    }
-}
-
-/// Hands out a per-session sink over the shared client pool.
+/// Hands out a sink for each routing branch.
 pub struct BraintrustSinkFactory {
     default_api_url: Option<String>,
     default_app_url: Option<String>,
@@ -150,25 +58,28 @@ impl BraintrustSinkFactory {
             default_app_url: cfg.app_url,
         }
     }
-}
-
-impl SinkFactory for BraintrustSinkFactory {
-    fn create(&self, _session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
-        Ok(Box::new(BraintrustSink {
-            // Acceptance belongs to this routing branch. A shared SDK queue can
-            // attribute another branch's rejected batch to this branch's flush.
-            cache: Arc::new(ClientCache::new()),
+    fn create_sink(&self, source: &str) -> BraintrustSink {
+        BraintrustSink {
             default_api_url: self.default_api_url.clone(),
             default_app_url: self.default_app_url.clone(),
             source: source.to_string(),
             creds: None,
             urls: None,
             client: None,
+            pending_writes: VecDeque::new(),
+            write_failure: None,
+            queued_bytes: 0,
             attachment_uploads: None,
             open: HashMap::new(),
             pending_roots: HashMap::new(),
             delivered_root: None,
-        }))
+        }
+    }
+}
+
+impl SinkFactory for BraintrustSinkFactory {
+    fn create(&self, _session_id: &str, source: &str) -> anyhow::Result<Box<dyn Sink>> {
+        Ok(Box::new(self.create_sink(source)))
     }
 }
 
@@ -230,15 +141,17 @@ impl AttachmentUploads {
 }
 
 struct BraintrustSink {
-    cache: Arc<ClientCache>,
     default_api_url: Option<String>,
     default_app_url: Option<String>,
     source: String,
     creds: Option<Creds>,
     /// Resolved `(api_url, app_url)` for this session, from its config.
     urls: Option<(String, String)>,
-    /// The client for `urls`, obtained from the cache on first emit.
-    client: Option<Arc<CachedClient>>,
+    /// The SDK client bound to `urls`, built on first emit.
+    client: Option<BraintrustClient>,
+    pending_writes: VecDeque<SpanWrite>,
+    write_failure: Option<WriteError>,
+    queued_bytes: usize,
     attachment_uploads: Option<AttachmentUploads>,
     /// Live span handles keyed by deterministic span id, so a later op (e.g.
     /// setting `end`) merges onto the same row the SDK already knows.
@@ -286,7 +199,7 @@ impl BraintrustSink {
         }
     }
 
-    async fn ensure_client(&mut self) -> anyhow::Result<Arc<CachedClient>> {
+    fn ensure_client(&mut self) -> anyhow::Result<BraintrustClient> {
         if let Some(c) = &self.client {
             return Ok(c.clone());
         }
@@ -294,7 +207,12 @@ impl BraintrustSink {
             .urls
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("session has no config/URLs yet"))?;
-        let client = self.cache.get_or_build(&urls.0, &urls.1).await?;
+        #[cfg(any(test, feature = "test-support"))]
+        configure_test_sdk_runtime()?;
+        let client = BraintrustClient::builder()
+            .api_url(urls.0.clone())
+            .app_url(urls.1.clone())
+            .build_without_login()?;
         self.client = Some(client.clone());
         Ok(client)
     }
@@ -326,23 +244,26 @@ impl BraintrustSink {
         Ok(())
     }
 
-    fn update_open(&mut self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn update_open(
+        &mut self,
+        client: &BraintrustClient,
+        row: &SpanRow,
+    ) -> anyhow::Result<SpanWrite> {
         self.ensure_handle(client, row)?;
         let handle = self.open.get(&row.span_id).ok_or_else(|| {
             anyhow::anyhow!("span handle was not initialized for {}", row.span_id)
         })?;
-        handle.log(build_log(row, &self.source, false)?);
-        if let Some(end) = row.end_ms {
-            handle.end_with_time(ms_to_secs(end));
+        let write = handle.log(build_log(row, &self.source, false)?);
+        if row.end_ms.is_some() && write.submission().is_ok() {
             // SpanHandle retains the complete accumulated input/output. Once a
             // span is terminal, use stateless SDK merges for any unusually late
             // update instead of pinning that payload for the session lifetime.
             self.open.remove(&row.span_id);
         }
-        Ok(())
+        Ok(write)
     }
 
-    fn merge_closed(&self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<()> {
+    fn merge_closed(&self, client: &BraintrustClient, row: &SpanRow) -> anyhow::Result<SpanWrite> {
         let creds = self
             .creds
             .as_ref()
@@ -362,13 +283,13 @@ impl BraintrustSink {
             }
         }
         client
-            .update_span_with_credentials(
+            .update_span_with_credentials_tracked(
                 creds.token.clone(),
                 creds.org_id.clone(),
                 &components.to_str(),
                 build_log(row, &self.source, true)?,
             )
-            .map_err(|error| anyhow::anyhow!("braintrust span merge failed: {error}"))
+            .map_err(anyhow::Error::new)
     }
 
     fn span_components(&self, row: &SpanRow, creds: &Creds, project: &str) -> SpanComponents {
@@ -471,17 +392,38 @@ impl BraintrustSink {
             };
             &prepared
         };
-        let client = self.ensure_client().await?;
-        match op {
-            SpanOp::Insert(row) => self.update_open(&client.client, row)?,
+        let bytes = serialized_len(op)?;
+        let client = self.ensure_client()?;
+        let write = match op {
+            SpanOp::Insert(row) => self.update_open(&client, row)?,
             SpanOp::Merge(row) if self.open.contains_key(&row.span_id) => {
-                self.update_open(&client.client, row)?
+                self.update_open(&client, row)?
             }
-            SpanOp::Merge(row) => self.merge_closed(&client.client, row)?,
+            SpanOp::Merge(row) => self.merge_closed(&client, row)?,
+        };
+        write.submission().as_ref().map_err(Clone::clone)?;
+        self.pending_writes.push_back(write);
+        self.queued_bytes = self.queued_bytes.saturating_add(bytes);
+        if self.queued_bytes >= QUEUE_FLUSH_BYTE_BUDGET {
+            self.flush_writes().await?;
         }
-        client
-            .account_and_flush(serialized_len(op).unwrap_or(0))
-            .await
+        Ok(())
+    }
+
+    async fn flush_writes(&mut self) -> anyhow::Result<()> {
+        // A client flush only sees writes still in flight at its cutoff. A
+        // receipt also reports failures that finished before the daemon flush.
+        while let Some(write) = self.pending_writes.front_mut() {
+            if let Err(error) = write.await {
+                self.write_failure.get_or_insert(error);
+            }
+            self.pending_writes.pop_front();
+        }
+        self.queued_bytes = 0;
+        match self.write_failure.take() {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -503,9 +445,8 @@ impl Sink for BraintrustSink {
         let new_urls = (api, app);
         let urls_changed = self.urls.as_ref() != Some(&new_urls);
         if urls_changed {
-            // A session shouldn't change backend URLs mid-flight; if it does,
-            // rebind the client on the next emit. Pre-change open handles stay
-            // bound to the old client (pathological; just noted).
+            // Rebind the client on the next emit. Pending receipts still
+            // report writes submitted to the previous backend.
             if self.client.is_some() {
                 tracing::warn!(
                     source = %self.source,
@@ -570,10 +511,7 @@ impl Sink for BraintrustSink {
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
-        match &self.client {
-            Some(client) => client.flush().await,
-            None => Ok(()),
-        }
+        self.flush_writes().await
     }
 
     fn has_pending_delivery(&self) -> bool {
@@ -842,8 +780,7 @@ fn build_log(row: &SpanRow, source: &str, is_merge: bool) -> anyhow::Result<Span
                 .collect::<HashMap<String, f64>>()
         })
         .unwrap_or_default();
-    // Stateless updates do not have a SpanHandle on which to call `end`, so
-    // carry terminal timing in the merge payload itself.
+    // Submit terminal timing with the same tracked write as the span data.
     if let Some(end) = row.end_ms {
         metrics.insert("end".into(), ms_to_secs(end));
     }
@@ -891,6 +828,61 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
+    async fn flush_reports_a_merge_rejected_before_the_flush() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/logs3"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let factory = BraintrustSinkFactory::new(BraintrustSinkConfig::default());
+        let mut sink = factory.create_sink("codex");
+        sink.configure(&SessionConfig {
+            auth: crate::wire::BackendAuth {
+                token: "sk-test".into(),
+                api_url: Some(server.uri()),
+                app_url: Some(server.uri()),
+                org_id: Some("org-test".into()),
+                ..Default::default()
+            },
+            destination: Some(TraceDestination::ProjectLogs {
+                project_id: Some("proj-test".into()),
+                project_name: None,
+            }),
+            flush_mode: Default::default(),
+            additional_metadata: None,
+            tags: Default::default(),
+            span_plugins: Vec::new(),
+        });
+        sink.emit(&[SpanOp::Merge(SpanRow {
+            span_id: "root".into(),
+            root_span_id: "root".into(),
+            end_ms: Some(2_000),
+            ..Default::default()
+        })])
+        .await
+        .unwrap();
+
+        // Wait for delivery through the SDK. Its first flush can return the
+        // rejection if the write is still in flight when it captures its cutoff.
+        let client = sink.ensure_client().unwrap();
+        let _delivery_barrier = client.flush().await;
+        assert_eq!(client.flush().await.unwrap().delivered(), 0);
+
+        let error = sink.flush().await.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<braintrust_sdk_rust::BraintrustError>(),
+            Some(braintrust_sdk_rust::BraintrustError::Api { status: 401, .. })
+        )));
+    }
+
+    #[tokio::test]
     async fn root_context_retains_sdk_environment_on_insert_and_stateless_merge() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -903,9 +895,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&server)
             .await;
+        configure_test_sdk_runtime().unwrap();
         let client = BraintrustClient::builder()
             .skip_login(true)
-            .checked_delivery(true)
             .api_url(server.uri())
             .app_url(server.uri())
             .environment("test", Some("sink-test"))
@@ -933,9 +925,10 @@ mod tests {
                 object_id: "proj-test".into(),
             })
             .build();
-        handle.log(build_log(&row, "codex", false).unwrap());
-        handle.end_with_time(2.0);
-        client.flush().await.unwrap();
+        handle
+            .log(build_log(&row, "codex", false).unwrap())
+            .await
+            .unwrap();
 
         let mut components = SpanComponents::new(SpanObjectType::ProjectLogs);
         components.object_id = Some("proj-test".into());
@@ -943,14 +936,15 @@ mod tests {
         components.span_id = Some(row.span_id.clone());
         components.root_span_id = Some(row.root_span_id.clone());
         client
-            .update_span_with_credentials(
+            .update_span_with_credentials_tracked(
                 "sk-test",
                 "org-test",
                 &components.to_str(),
                 build_log(&row, "codex", true).unwrap(),
             )
+            .unwrap()
+            .await
             .unwrap();
-        client.flush().await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let rows: Vec<Value> = requests
